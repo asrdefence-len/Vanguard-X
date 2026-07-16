@@ -6,6 +6,10 @@ The Linux PC builds the complete 28-bit Shinewave control word. The STM32 only
 receives PING, STATUS and WORD commands, then clocks the word to the TRM.
 
 Fast T and R switching remains under Ettus GPIO/ATR control.
+
+to test: (with the STM32 connected)
+python3 TRMInterface.py --port /dev/ttyACM0 --debug --rx-att 0.0 --tx-att 31.5 --force
+
 """
 
 from __future__ import annotations
