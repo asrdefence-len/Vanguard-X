@@ -628,6 +628,53 @@ def Main():
     LastRadarDwellTimeSec = 0.0
     LastPrintedBoresightDeg = None
 
+    # -------------------------------------------------------------------------
+    # Radar operating-system architecture
+    #
+    # Stage 2A:
+    # Create the navigation, pointing, task, scheduler and executor objects.
+    # They are not yet used to execute the operational dwell path, so this
+    # stage must not change radar behaviour.
+    # -------------------------------------------------------------------------
+
+    Navigation = SimulatedNavigationSource(
+        initial_heading_deg=0.0,
+    )
+
+    Pointing = PointingManager(
+        ptz=Ptz,
+        left_limit_deg=float(Config.get("PTZLeftLimitDeg", 10.0)),
+        right_limit_deg=float(Config.get("PTZRightLimitDeg", 300.0)),
+        endpoint_margin_deg=float(
+            Config.get("PTZScanEndpointMarginDeg", 1.0)
+        ),
+        position_tolerance_deg=float(
+            Config.get("PTZPositionToleranceDeg", 0.75)
+        ),
+    )
+
+    SearchTask = MakeSearchTask(
+        TaskId=1,
+        SectorStartDeg=float(ScanStartDeg),
+        SectorStopDeg=float(ScanStopDeg),
+        ScanRateDegPerSec=float(
+            Config.get("PTZScanSlewRateDegPerSec", 14.0)
+        ),
+        SectorFrame=AngleFrame.PLATFORM,
+    )
+
+    Scheduler = RadarScheduler(
+        search_task=SearchTask,
+        debug=False,
+    )
+
+    Executor = RadarExecutor(
+        source=Source,
+        pointing_manager=Pointing,
+        config=Config,
+        debug=False,
+    )
+    
     try:
         while not ExitRequested:
 
