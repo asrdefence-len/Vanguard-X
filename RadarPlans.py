@@ -1,0 +1,141 @@
+"""
+===============================================================================
+Vanguard X Radar Pulse and Dwell Plans
+RadarPlans.py
+===============================================================================
+
+This module introduces pulse-by-pulse radar scheduling while preserving the
+current fixed-waveform, fixed-PRI behaviour.
+
+The first supported processing mode is UNIFORM_PRI_FFT.  Later processing modes
+can add Golay complementary pairs, staggered or jittered PRI, frequency agility,
+and passive receive-only pulses without changing the source/processor API.
+===============================================================================
+"""
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+@dataclass(frozen=True)
+class PulsePlan:
+    """Definition of one transmitted pulse and its receive window."""
+
+    PulseIndex: int
+    WaveformId: str
+    PriSec: float
+    TxEnabled: bool = True
+    FrequencyOffsetHz: float = 0.0
+    PhaseOffsetRad: float = 0.0
+    AmplitudeScale: float = 1.0
+    RxStartDelaySec: float = 0.0
+    NumRxSamples: Optional[int] = None
+    GroupId: Optional[int] = None
+    GroupRole: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ProcessingPlan:
+    """Instructions telling RadarProcessor how to interpret a dwell."""
+
+    Mode: str = "UNIFORM_PRI_FFT"
+    ProcessorId: str = "STANDARD_RANGE_DOPPLER"
+    NominalPriSec: Optional[float] = None
+    CombineGroupsBeforeDoppler: bool = False
+    DopplerCompensationEnabled: bool = False
+
+
+@dataclass
+class DwellPlan:
+    """Complete pulse-by-pulse description of one radar dwell."""
+
+    DwellId: int
+    TaskId: int
+    TaskType: str
+    SampleRate: float
+    NumSamples: int
+    PulsePlans: List[PulsePlan]
+    Processing: ProcessingPlan
+    AzimuthDeg: float = 0.0
+    ElevationDeg: float = 0.0
+    RxAttenuationDb: float = 0.0
+    TxAttenuationDb: float = 31.5
+    Metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def NumPulses(self) -> int:
+        return len(self.PulsePlans)
+
+    # Compatibility properties used by older modules during the transition.
+    @property
+    def WaveformName(self) -> str:
+        if not self.PulsePlans:
+            raise ValueError("DwellPlan contains no pulses")
+        return self.PulsePlans[0].WaveformId
+
+    @property
+    def PRI(self) -> float:
+        if self.Processing.NominalPriSec is not None:
+            return float(self.Processing.NominalPriSec)
+        if not self.PulsePlans:
+            raise ValueError("DwellPlan contains no pulses")
+        return float(self.PulsePlans[0].PriSec)
+
+
+def make_uniform_dwell_plan(
+    dwell_id: int,
+    task_id: int,
+    task_type: str,
+    waveform_id: str,
+    sample_rate: float,
+    num_samples: int,
+    num_pulses: int,
+    pri_sec: float,
+    azimuth_deg: float = 0.0,
+    elevation_deg: float = 0.0,
+    rx_attenuation_db: float = 0.0,
+    tx_attenuation_db: float = 31.5,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> DwellPlan:
+    """Create a fixed-waveform, fixed-PRI dwell matching legacy behaviour."""
+
+    if num_pulses <= 0:
+        raise ValueError("num_pulses must be greater than zero")
+    if pri_sec <= 0.0:
+        raise ValueError("pri_sec must be greater than zero")
+    if sample_rate <= 0.0:
+        raise ValueError("sample_rate must be greater than zero")
+    if num_samples <= 0:
+        raise ValueError("num_samples must be greater than zero")
+
+    pulses = [
+        PulsePlan(
+            PulseIndex=index,
+            WaveformId=str(waveform_id),
+            PriSec=float(pri_sec),
+            TxEnabled=True,
+            NumRxSamples=int(num_samples),
+        )
+        for index in range(int(num_pulses))
+    ]
+
+    processing = ProcessingPlan(
+        Mode="UNIFORM_PRI_FFT",
+        ProcessorId="STANDARD_RANGE_DOPPLER",
+        NominalPriSec=float(pri_sec),
+    )
+
+    return DwellPlan(
+        DwellId=int(dwell_id),
+        TaskId=int(task_id),
+        TaskType=str(task_type).upper(),
+        SampleRate=float(sample_rate),
+        NumSamples=int(num_samples),
+        PulsePlans=pulses,
+        Processing=processing,
+        AzimuthDeg=float(azimuth_deg),
+        ElevationDeg=float(elevation_deg),
+        RxAttenuationDb=float(rx_attenuation_db),
+        TxAttenuationDb=float(tx_attenuation_db),
+        Metadata=dict(metadata or {}),
+    )

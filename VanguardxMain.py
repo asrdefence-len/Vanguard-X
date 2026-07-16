@@ -1,0 +1,978 @@
+"""
+===============================================================================
+ASR Defence X-Band Radar
+VanguardxMain.py
+===============================================================================
+
+Foreword
+--------
+This is the main entry point for the ASR X-band radar prototype software.
+
+The purpose of this file is to connect the major radar software modules together
+in a simple, readable, top-level loop.
+
+At this stage, the radar is Python-first and simulation-first. The Ettus hardware
+backend will be added later, but it should eventually use the same interface as
+the simulated source.
+
+The intended radar processing chain is:
+
+    Dwell definition
+        ↓
+    Source executes dwell
+        ↓
+    Raw IQ data returned
+        ↓
+    Pulse compression / radar processing
+        ↓
+    Detection
+        ↓
+    Tracking
+        ↓
+    Display / logging
+
+Current status
+--------------
+This version adds the first scene-based scanning simulation:
+    - multiple x/y scene objects
+    - moving targets are supported
+    - 0 to 90 degree search scan
+    - 5 degree sinc-squared antenna beam pattern
+    - all scene objects contribute through main beam and sidelobes
+    - scene returns are passed into SimulatedSource for each dwell
+===============================================================================
+"""
+
+from RadarPlans import make_uniform_dwell_plan
+from SimulatedSource import SimulatedSource
+from WaveformLibrary import WaveformLibrary
+from RadarProcessor import RadarProcessor
+from CfarDetector import CfarDetector
+from RadarTracker import RadarTracker
+from SimpleDisplay import SimpleDisplay
+from RadarDisplayQt5 import RadarDisplay
+from DataLogger import DataLogger
+import time
+
+try:
+    from ReadIMU import IMUReader
+except Exception:
+    IMUReader = None
+
+try:
+    from PTZController import CreatePTZController
+except Exception:
+    CreatePTZController = None
+
+from TargetScenario import (
+    create_default_scene,
+    update_scene_objects,
+    create_ping_pong_scan_angles,
+    build_scene_returns_for_boresight,
+    print_scene_returns,
+)
+
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def BuildRadarParamsForScenario(Config):
+    """
+    Convert the main Config dictionary into the lower-case keys used by
+    TargetScenario.py.
+    """
+
+    return {
+        "carrier_frequency_hz": Config["RfFrequency"],
+        "radar_x_m": Config.get("RadarXM", 0.0),
+        "radar_y_m": Config.get("RadarYM", 0.0),
+        "boresight_deg": Config["BoresightDeg"],
+        "beamwidth_deg": Config["BeamwidthDeg"],
+        "reference_range_m": Config.get("ReferenceRangeM", 8000.0),
+        "target_amplitude_scale": Config.get("TargetAmplitudeScale", 1.0),
+        "sidelobe_floor_db": Config.get("SidelobeFloorDb", -50.0),
+    }
+
+
+def SelectDisplay(Config):
+    """
+    Create the selected display.
+
+    RadarDisplay is the new operator-style display with SCAN/STARE controls.
+    SimpleDisplay is kept as a fallback engineering display.
+    """
+
+    if Config.get("DisplayType", "SimpleDisplay") == "RadarDisplay":
+        return RadarDisplay(Config)
+
+    return SimpleDisplay(Config)
+
+
+def ClampDeg(Value, MinValue, MaxValue):
+    return max(float(MinValue), min(float(MaxValue), float(Value)))
+
+
+def EndpointDirectionDeg(TargetDeg, CurrentDeg):
+    """
+    Return direction to move from CurrentDeg to TargetDeg for non-wrapping
+    Vanguard PTZ physical angles.
+    """
+    Delta = float(TargetDeg) - float(CurrentDeg)
+
+    if abs(Delta) < 0.05:
+        return 0
+
+    return 1 if Delta > 0.0 else -1
+
+
+def ReachedEndpoint(CurrentDeg, TargetDeg, ToleranceDeg):
+    return abs(float(CurrentDeg) - float(TargetDeg)) <= float(ToleranceDeg)
+
+
+def GetControlledBoresightDeg(Display, ScanBoresightDeg, ControlState=None):
+    """
+    Decide which boresight angle to use for this dwell.
+
+    SCAN mode:
+        Use the current angle from the ping-pong scan sequence.
+
+    STARE mode or STOP:
+        Hold the beam angle selected by the display.
+    """
+
+    if ControlState is None:
+        ControlState = (
+            Display.GetControlState()
+            if hasattr(Display, "GetControlState")
+            else None
+        )
+
+    if ControlState is None:
+        return float(ScanBoresightDeg)
+
+    DisplayMode = ControlState.get("DisplayMode", "SCAN")
+    ScanEnabled = bool(ControlState.get("ScanEnabled", True))
+
+    if DisplayMode == "SCAN" and ScanEnabled:
+        BoresightDeg = float(ScanBoresightDeg)
+
+        if hasattr(Display, "BeamAngleDeg"):
+            Display.BeamAngleDeg = BoresightDeg
+
+        return BoresightDeg
+
+    return float(ControlState.get("BeamAngleDeg", ScanBoresightDeg))
+
+
+
+def InitialisePTZToStartupPose(Ptz, Config, Display=None):
+    """Command the PTZ to the configured safe startup AZ/EL pose.
+
+    Default startup pose is reported EL=55 deg and AZ=200 deg.  This runs before the
+    radar dwell loop so the antenna starts from a known mechanical attitude.
+    """
+    if Ptz is None or not bool(Config.get("PTZStartupEnabled", True)):
+        return
+
+    TargetAzDeg = ClampDeg(
+        float(Config.get("PTZStartupAzimuthDeg", 200.0)),
+        float(Config.get("PTZLeftLimitDeg", 10.0)),
+        float(Config.get("PTZRightLimitDeg", 300.0)),
+    )
+    TargetElDeg = ClampDeg(float(Config.get("PTZStartupElevationDeg", 45.0)), -90.0, 90.0)
+    TimeoutSec = float(Config.get("PTZStartupTimeoutSec", 20.0))
+    ToleranceDeg = float(Config.get("PTZStartupPositionToleranceDeg", Config.get("PTZPositionToleranceDeg", 1.0)))
+
+    print(f"PTZ startup initialise: AZ={TargetAzDeg:.2f} deg, EL={TargetElDeg:.2f} deg")
+
+    if hasattr(Ptz, "CommandPosition"):
+        Ptz.CommandPosition(TargetAzDeg, TargetElDeg)
+    else:
+        if hasattr(Ptz, "SetPanPositionNative"):
+            Ptz.SetPanPositionNative(TargetAzDeg)
+        if hasattr(Ptz, "SetTiltPositionNative"):
+            Ptz.SetTiltPositionNative(TargetElDeg)
+
+    StartSec = time.time()
+    LastPrintSec = 0.0
+
+    while (time.time() - StartSec) < TimeoutSec:
+        try:
+            State = Ptz.Update() if hasattr(Ptz, "Update") else Ptz.GetState()
+            AzDeg = float(getattr(State, "AzimuthDeg", TargetAzDeg))
+            ElDeg = float(getattr(State, "ElevationDeg", TargetElDeg))
+        except Exception as exc:
+            print(f"PTZ startup initialise warning: {exc}")
+            break
+
+        if hasattr(Display, "App"):
+            Display.App.processEvents()
+
+        AzOk = abs(AzDeg - TargetAzDeg) <= ToleranceDeg
+        ElOk = abs(ElDeg - TargetElDeg) <= ToleranceDeg
+
+        NowSec = time.time()
+        if NowSec - LastPrintSec > 1.0:
+            print(f"PTZ startup position: AZ={AzDeg:.2f} deg, EL={ElDeg:.2f} deg")
+            LastPrintSec = NowSec
+
+        if AzOk and ElOk:
+            break
+
+        time.sleep(0.05)
+
+    try:
+        Ptz.Stop()
+    except Exception:
+        pass
+
+    Config["InitialBeamAngleDeg"] = TargetAzDeg
+    Config["BoresightDeg"] = TargetAzDeg
+    Config["AntennaElDeg"] = TargetElDeg
+    if hasattr(Display, "BeamAngleDeg"):
+        Display.BeamAngleDeg = TargetAzDeg
+
+
+def Main():
+    """
+    Main radar program.
+
+    This function creates the configuration, initialises the radar modules,
+    creates a target scene, scans the radar across a sector, executes a dwell at
+    each scan angle, processes the result, detects targets, and displays output.
+    """
+
+    # -------------------------------------------------------------------------
+    # Configuration dictionary
+    # -------------------------------------------------------------------------
+
+    Config = {
+        "SampleRate": 40e6,
+        "NumSamples": 4096,
+        "NumPulses": 32,
+        "PRI": 200e-6,
+
+        # Initial pulse-plan architecture. Search and track waveform selectors
+        # are separate even though only SEARCH is scheduled in this version.
+        "SearchWaveformId": "Frank10",
+        "TrackWaveformId": "Barker13",
+
+        # RF parameters
+        "RfFrequency": 9.4e9,
+        "TransmitPowerW": 50.0,
+        "AntennaGainDb": 23.0,
+        "SystemLossDb": 6.0,
+
+        # Backwards-compatible single target fields.
+        # These are still used if Config["SceneReturns"] is not provided.
+        "TargetRangeM": 8000.0,
+        "TargetVelocityMps": 5.0,
+        "TargetRcsSqm": 1000,
+
+        # Receiver / simulation noise
+        "NoisePowerW": 1e-13,
+
+        # Detection
+        "ThresholdDb": -80.0,
+
+        # ---------------------------------------------------------------------
+        # Scene / scanning parameters
+        # ---------------------------------------------------------------------
+        "RadarXM": 0.0,
+        "RadarYM": 0.0,
+        "ScanStartDeg": 120.0,
+        "ScanStopDeg": 10.0,
+        "ScanStepDeg": 1,
+        "BoresightDeg": 0.0,
+        "BeamwidthDeg": 5.0,
+        "SidelobeFloorDb": -50.0,
+        "ReferenceRangeM": 8000.0,
+        "TargetAmplitudeScale": 1.0,
+
+        # CFAR parameters
+        "TrainingCellsRange": 12,
+        "TrainingCellsDoppler": 4,
+        "GuardCellsRange": 4,
+        "GuardCellsDoppler": 1,
+        "CfarThresholdDb": 12.3,
+        "MaxDetections": 200,
+        "MinRangeM": 100.0,
+        "MaxRangeM": 15000.0,
+
+        # Tracker / plot extraction parameters
+        "TrackerEnabled": True,
+        "ReturnBlobsForDebug": True,
+        "InitiationWindow": 3,
+        "InitiationRequiredHits": 2,
+        "InitiationRangeGateM": 300.0,
+        "InitiationAzimuthGateDeg": 6.0,
+        "AssociationRangeGateM": 300.0,
+        "AssociationAzimuthGateDeg": 6.0,
+        "ClusterRangeGapBins": 2,
+        "ClusterDopplerGapBins": 2,
+        "ClusterRangeGapM": 200.0,
+        "ClusterDopplerGapHz": 120.0,
+        "ClusterAzimuthGapDeg": 3.0,
+        "TrackGateRangeM": 150.0,
+        "TrackGateAzimuthDeg": 5.0,
+        "TrackGateVelocityMps": 12.0,
+        "TrackGateDopplerHz": 300.0,
+        "TrackConfirmHits": 2,
+        "TrackConfirmWindow": 3,
+        "DeleteAfterMissesTentative": 2,
+        "DeleteAfterMissesConfirmed": 5,
+
+        # Debug controls
+        "PrintSceneTruthTable": False,
+        "LogoPath": "ASRDefenceLOGO.png",
+
+        # ---------------------------------------------------------------------
+        # Data logging controls
+        # ---------------------------------------------------------------------
+        # The display has a Save checkbox and File box. The main loop reads
+        # those controls and opens/closes the HDF5 logger accordingly.
+        "DataLoggingEnabled": False,
+        "DataLogDirectory": "DataLogs",
+        "DataLogFilename": "datafile1.h5",
+        "DataLogOverwrite": True,
+        "DataLogPrefix": "VanguardLog",
+        "DataLogFlushEveryNDwells": 25,
+        "LogDetections": True,
+        "LogRangeDoppler": True,
+        "LogRangeDopplerEveryNDwells": 10,
+        "LogRangeDopplerMaxRangeM": 15000.0,
+        "LogRangeDopplerFloat32": True,
+        # ---------------------------------------------------------------------
+        # Display controls
+        # ---------------------------------------------------------------------
+        "DisplayType": "RadarDisplay",
+
+        "UpdatePlots": True,
+        "ShowRangeProfile": True,
+        "ShowRangeDopplerMap": False,
+        "ShowPolarDetections": True,
+        "ShowRawDetections": True,
+        "ShowTrackerPlots": True,
+        "ShowRangeDetectionMarkers": True,
+        "ShowTracks": True,
+
+        "PrintEveryNDwells": 1,
+        "DetailPlotEveryNDwells": 1,
+        "PolarPlotEveryNDwells": 1,
+
+        "PlotPauseS": 0.001,
+        "MaxDisplayRangeM": 15000.0,
+        "PolarMaxRangeM": 15000.0,
+        "MaxDetectionsPlottedPerDwell": 50,
+        "MaxPolarDetections": 500,
+        "RangeRingStepM": 2000.0,
+
+        "RangeDopplerUpdateEveryNDwells": 0,
+        "PolarUpdateEveryNDwells": 1,
+        "PolarDetectionsUpdateEveryNDwells": 1,
+        "RangeProfileUpdateEveryNDwells": 1,
+        "StatusUpdateEveryNDwells": 1,
+        "QtProcessEventsEveryNDwells": 1,
+        "QtRangeProfileDecimation": 1,
+
+        # ---------------------------------------------------------------------
+        # Operator display / scan controls
+        # ---------------------------------------------------------------------
+        "InitialDisplayMode": "STOP",
+        "InitialScanEnabled": False,
+        "InitialBeamAngleDeg": 200.0,
+        "ManualBeamStepDeg": 1.0,
+
+        # PTZ controls "pelco" or "sim"
+        "EnablePTZ": True,
+        "PTZMode": "sim", #"pelco"
+        "PTZPort": "/dev/ttyACM0",
+        "PTZBaudRate": 9600,
+        "PTZAddress": 1,
+        "PTZPanSpeed": 0x5F,
+        "PTZTiltSpeed": 0x3F,
+        "PTZLeftLimitDeg": 10.0,
+        "PTZRightLimitDeg": 300.0,
+        "PTZLimitMarginDeg": 1.0,
+        "PTZTimeoutSec": 0.3,
+        "PTZQueryIntervalSec": 0.10,
+        "PTZQueryTiltInUpdate": False,
+        "PTZDebug": False,
+        "PTZPositionToleranceDeg": 0.75,
+        "PTZScanReverseLockoutSec": 0.8,
+        "PTZScanEndpointMarginDeg": 1.0,
+        "PTZScanSlewRateDegPerSec": 14.0,
+        "PTZSimPanRateDegPerSec": 14.0,
+        "PTZSimWrapMode": False,
+        "RadarDwellIntervalSec": 0.10,
+        "PTZScanContinuousToEndpoint": True,
+        "PTZStartupEnabled": True,
+        "PTZStartupAzimuthDeg": 200.0,
+        "PTZStartupElevationDeg": 60.0,
+        "PTZStartupTimeoutSec": 20.0,
+        "PTZStartupPositionToleranceDeg": 1.0,
+
+        # Antenna attitude / IMU controls
+        "EnableIMU": False,
+        "UseIMUForBeamAngle": False,
+        "IMUDummyMode": True,
+        "IMUAzimuthOffsetDeg": 0.0,
+        "IMUElevationOffsetDeg": 0.0,
+        "IMUInvertAzimuth": False,
+        "IMUInvertElevation": False,
+    }
+
+    # -------------------------------------------------------------------------
+    # Waveform library
+    # -------------------------------------------------------------------------
+
+    TheWaveformLibrary = WaveformLibrary(Config)
+    TheWaveformLibrary.LoadDefaultWaveforms()
+
+    # -------------------------------------------------------------------------
+    # Source, processor, detector and display
+    # -------------------------------------------------------------------------
+
+    Source = SimulatedSource(Config, TheWaveformLibrary)
+    Processor = RadarProcessor(Config, TheWaveformLibrary)
+    Detector = CfarDetector(Config)
+    Tracker = RadarTracker(Config)
+    Display = SelectDisplay(Config)
+    Logger = DataLogger(Config)
+
+    # IMU / antenna attitude reader. Read once per dwell in the main loop.
+    if Config.get("EnableIMU", False) and IMUReader is not None:
+        Imu = IMUReader(
+            dummy=bool(Config.get("IMUDummyMode", True)),
+            az_offset_deg=float(Config.get("IMUAzimuthOffsetDeg", 0.0)),
+            el_offset_deg=float(Config.get("IMUElevationOffsetDeg", 0.0)),
+            invert_az=bool(Config.get("IMUInvertAzimuth", False)),
+            invert_el=bool(Config.get("IMUInvertElevation", False)),
+        )
+        print("IMU reader enabled.")
+    else:
+        Imu = None
+        if Config.get("EnableIMU", False):
+            print("IMU requested, but ReadIMU.py / IMUReader could not be imported.")
+
+    # PTZ controller. In hardware mode this opens /dev/ttyACM0 and uses
+    # native Pelco-D pan position commands.
+    if Config.get("EnablePTZ", False) and CreatePTZController is not None:
+        try:
+            Ptz = CreatePTZController(Config)
+            Ptz.Open()
+            print(f"PTZ controller enabled. Mode={Config.get('PTZMode', 'pelco')}")
+            InitialisePTZToStartupPose(Ptz, Config, Display)
+        except Exception as exc:
+            Ptz = None
+            print(f"PTZ requested but failed to open: {exc}")
+    else:
+        Ptz = None
+        if Config.get("EnablePTZ", False):
+            print("PTZ requested, but PTZController.py could not be imported.")
+
+    Source.Initialise()
+
+    # -------------------------------------------------------------------------
+    # Create the 2D target / reflector scene
+    # -------------------------------------------------------------------------
+
+    SceneObjects = create_default_scene()
+
+    # -------------------------------------------------------------------------
+    # Execute continuous scan
+    # -------------------------------------------------------------------------
+    #
+    # The scan angle is held as explicit state rather than by iterating over a
+    # fixed list. This is important for operator Stop/Start behaviour:
+    #   - Stop holds the current antenna angle.
+    #   - Start resumes from that same angle.
+    #   - The dummy IMU follows this commanded angle, rather than free-running.
+    # -------------------------------------------------------------------------
+
+    DwellId = 1
+    ScanCycle = 1
+
+    ExitRequested = False
+
+    ScanStartDeg = float(Config.get("ScanStartDeg", -60.0))
+    ScanStopDeg = float(Config.get("ScanStopDeg", 60.0))
+    ScanStepDeg = abs(float(Config.get("ScanStepDeg", 1.0)))
+
+    CurrentScanBoresightDeg = float(Config.get("InitialBeamAngleDeg", Config.get("BoresightDeg", 0.0)))
+    CurrentScanBoresightDeg = max(min(CurrentScanBoresightDeg, ScanStopDeg), ScanStartDeg)
+    ScanDirection = 1.0
+
+    # PTZ scan state. These must be initialised before the main loop.
+    ActivePtzScanTargetDeg = None
+    ActivePtzScanTargetName = None  # 'start' or 'stop'
+    LastPtzScanReverseTimeSec = 0.0
+
+    LastManualNudgeCommandId = 0
+    LastStopCommandId = 0
+    PtzStopped = False
+    LastScanEnabled = False
+    LastDisplayMode = "STOP"
+    LastRadarDwellTimeSec = 0.0
+    LastPrintedBoresightDeg = None
+
+    try:
+        while not ExitRequested:
+
+                # -------------------------------------------------------------
+                # Read display/operator controls.
+                # -------------------------------------------------------------
+
+                ControlState = (
+                    Display.GetControlState()
+                    if hasattr(Display, "GetControlState")
+                    else None
+                )
+
+                # -------------------------------------------------------------
+                # Apply operator data-logging controls from the display.
+                # Save checkbox ON  -> open/log to the requested HDF5 file.
+                # Save checkbox OFF -> close file and stop logging.
+                # -------------------------------------------------------------
+
+                Logger.update_control_state(ControlState)
+
+                # -------------------------------------------------------------
+                # Exit cleanly if requested from the display.
+                # -------------------------------------------------------------
+
+                if ControlState is not None and ControlState.get("ExitRequested", False):
+                    print("")
+                    print("Exit requested from display.")
+                    ExitRequested = True
+                    break
+
+                # -------------------------------------------------------------
+                # Select commanded scan/stare target.
+                # -------------------------------------------------------------
+
+                CommandedBoresightDeg = GetControlledBoresightDeg(
+                    Display=Display,
+                    ScanBoresightDeg=CurrentScanBoresightDeg,
+                    ControlState=ControlState,
+                )
+
+                PreviousScanEnabled = bool(LastScanEnabled)
+
+                if ControlState is not None:
+                    DisplayMode = str(ControlState.get("DisplayMode", "STOP"))
+                    ScanEnabled = bool(ControlState.get("ScanEnabled", False))
+                    ScanStartDeg = float(ControlState.get("ScanStartDeg", ScanStartDeg))
+                    ScanStopDeg = float(ControlState.get("ScanStopDeg", ScanStopDeg))
+                    ScanStepDeg = abs(float(ControlState.get("ScanStepDeg", ScanStepDeg)))
+
+                    Config["ScanStartDeg"] = ScanStartDeg
+                    Config["ScanStopDeg"] = ScanStopDeg
+                    Config["ScanStepDeg"] = ScanStepDeg
+                else:
+                    DisplayMode = "STOP"
+                    ScanEnabled = False
+
+                ScanJustStarted = bool(ScanEnabled and not PreviousScanEnabled)
+
+                # Defensive PTZ scan-state initialisation.
+                if 'ActivePtzScanTargetDeg' not in locals():
+                    ActivePtzScanTargetDeg = None
+                if 'ActivePtzScanTargetName' not in locals():
+                    ActivePtzScanTargetName = None
+                if 'LastPtzScanReverseTimeSec' not in locals():
+                    LastPtzScanReverseTimeSec = 0.0
+
+                # -------------------------------------------------------------
+                # Timed radar dwell scheduler.
+                #
+                # IMPORTANT:
+                # This gate is deliberately BEFORE the PTZ serial query/update.
+                # The Pelco-D query can block on serial timeout, so putting the
+                # gate after Ptz.Update() makes the radar dwell rate depend on
+                # PTZ serial latency.  Gate first, then do one PTZ update and
+                # one radar dwell when a dwell is actually due.
+                # -------------------------------------------------------------
+
+                NowDwellSec = time.time()
+                RadarDwellIntervalSec = float(Config.get("RadarDwellIntervalSec", 0.10))
+                DwellWallDtSec = NowDwellSec - LastRadarDwellTimeSec if LastRadarDwellTimeSec > 0.0 else 0.0
+
+                TransmitEnabled = True if ControlState is None else bool(ControlState.get("TransmitEnabled", True))
+
+                if DisplayMode == "STOP" or not TransmitEnabled:
+                    # If the operator stops the radar, stop the PTZ immediately;
+                    # do not wait for the next dwell slot.
+                    if Ptz is not None and (LastDisplayMode != "STOP" or LastScanEnabled):
+                        try:
+                            Ptz.Stop()
+                        except Exception:
+                            pass
+                        ActivePtzScanTargetDeg = None
+                        ActivePtzScanTargetName = None
+
+                    LastScanEnabled = bool(ScanEnabled)
+                    LastDisplayMode = str(DisplayMode)
+
+                    if hasattr(Display, "App"):
+                        Display.App.processEvents()
+                    time.sleep(0.005)
+                    continue
+
+                if LastRadarDwellTimeSec > 0.0 and DwellWallDtSec < RadarDwellIntervalSec:
+                    # Between dwell instants, keep the GUI responsive but do not
+                    # spend time on PTZ serial queries.  The PTZ continues slewing
+                    # from the last command.
+                    if hasattr(Display, "App"):
+                        Display.App.processEvents()
+                    time.sleep(0.002)
+                    continue
+
+                LastRadarDwellTimeSec = NowDwellSec
+
+                # -------------------------------------------------------------
+                # PTZ control: simple proven scan state machine.
+                #
+                # SCAN:
+                #   - Determine active endpoint.
+                #   - Send one Pelco slew command toward that endpoint.
+                #   - Query PTZ position at PTZQueryIntervalSec inside Ptz.Update().
+                #   - Reverse when measured position crosses endpoint margin.
+                #
+                # STARE:
+                #   - No scan slew. Radar dwells continue at current/latest PTZ
+                #     angle.
+                #
+                # STOP:
+                #   - Send Stop once on transition and skip radar dwells.
+                # -------------------------------------------------------------
+
+                PtzValid = False
+                PtzSource = "DISABLED"
+                PtzAzDeg = float(CommandedBoresightDeg)
+                PtzRateDegPerSec = 0.0
+                PtzAtTarget = False
+
+                if Ptz is not None:
+                    try:
+                        EndpointMarginDeg = float(Config.get("PTZScanEndpointMarginDeg", 1.0))
+                        ScanSlewRateDegPerSec = float(Config.get("PTZScanSlewRateDegPerSec", 14.0))
+
+                        # Query/update position. This is throttled inside PTZController.
+                        PtzState = Ptz.Update()
+                        PtzAzDeg = float(PtzState.AzimuthDeg)
+                        PtzRateDegPerSec = float(PtzState.PanRateDegPerSec)
+                        PtzValid = bool(PtzState.Valid)
+                        PtzSource = str(PtzState.Source)
+
+                        # Manual nudge event, if the display generated one.
+                        ManualNudgeCommandId = None
+                        ManualNudgeDeltaDeg = 0.0
+                        if ControlState is not None:
+                            ManualNudgeCommandId = ControlState.get("ManualNudgeCommandId", None)
+                            ManualNudgeDeltaDeg = float(ControlState.get("ManualNudgeDeltaDeg", 0.0))
+
+                        if not hasattr(Main, "_LastConsumedNudgeId"):
+                            Main._LastConsumedNudgeId = None
+
+                        if (
+                            ManualNudgeCommandId is not None
+                            and ManualNudgeCommandId != Main._LastConsumedNudgeId
+                            and abs(ManualNudgeDeltaDeg) > 0.0
+                        ):
+                            ActivePtzScanTargetDeg = None
+                            ActivePtzScanTargetName = None
+                            Main._LastConsumedNudgeId = ManualNudgeCommandId
+
+                            TargetDeg = ClampDeg(
+                                PtzAzDeg + ManualNudgeDeltaDeg,
+                                float(Config.get("PTZLeftLimitDeg", 10.0)),
+                                float(Config.get("PTZRightLimitDeg", 300.0)),
+                            )
+
+                            Ptz.SetPanPositionNative(TargetDeg)
+
+                        elif DisplayMode == "SCAN" and ScanEnabled:
+                            if ScanJustStarted or ActivePtzScanTargetName is None:
+                                ActivePtzScanTargetName = "stop"
+                                ActivePtzScanTargetDeg = float(ScanStopDeg)
+                                print(f"PTZ scan start: {ScanStartDeg:.2f} -> {ScanStopDeg:.2f}")
+
+                            if PtzValid:
+                                if ActivePtzScanTargetName == "stop":
+                                    if ScanStopDeg >= ScanStartDeg:
+                                        Reached = PtzAzDeg >= (ScanStopDeg - EndpointMarginDeg)
+                                    else:
+                                        Reached = PtzAzDeg <= (ScanStopDeg + EndpointMarginDeg)
+
+                                    if Reached:
+                                        ActivePtzScanTargetName = "start"
+                                        ActivePtzScanTargetDeg = float(ScanStartDeg)
+                                        ScanCycle += 1
+                                        print(f"PTZ scan reverse: target=start {ScanStartDeg:.2f}, cycle={ScanCycle}")
+
+                                elif ActivePtzScanTargetName == "start":
+                                    if ScanStartDeg >= ScanStopDeg:
+                                        Reached = PtzAzDeg >= (ScanStartDeg - EndpointMarginDeg)
+                                    else:
+                                        Reached = PtzAzDeg <= (ScanStartDeg + EndpointMarginDeg)
+
+                                    if Reached:
+                                        ActivePtzScanTargetName = "stop"
+                                        ActivePtzScanTargetDeg = float(ScanStopDeg)
+                                        ScanCycle += 1
+                                        print(f"PTZ scan reverse: target=stop {ScanStopDeg:.2f}, cycle={ScanCycle}")
+
+                            DirectionToTarget = EndpointDirectionDeg(ActivePtzScanTargetDeg, PtzAzDeg)
+
+                            if DirectionToTarget > 0:
+                                Ptz.CommandSlew(+ScanSlewRateDegPerSec, 0.0)
+                                ScanDirection = 1.0
+                            elif DirectionToTarget < 0:
+                                Ptz.CommandSlew(-ScanSlewRateDegPerSec, 0.0)
+                                ScanDirection = -1.0
+
+                        else:
+                            # STOP or idle. Send stop only on transition into idle.
+                            ActivePtzScanTargetDeg = None
+                            ActivePtzScanTargetName = None
+
+                            if LastDisplayMode != "STOP" or LastScanEnabled:
+                                Ptz.Stop()
+
+                        if PtzValid:
+                            CurrentScanBoresightDeg = float(PtzAzDeg)
+                            if hasattr(Display, "BeamAngleDeg"):
+                                Display.BeamAngleDeg = float(PtzAzDeg)
+
+                    except Exception as exc:
+                        PtzValid = False
+                        PtzSource = f"ERROR: {exc}"
+
+                LastScanEnabled = bool(ScanEnabled)
+                LastDisplayMode = str(DisplayMode)
+
+                # -------------------------------------------------------------
+                # Read actual antenna AZ/EL from the IMU once per dwell.
+                # -------------------------------------------------------------
+
+                MeasuredAntennaAzDeg = float(CommandedBoresightDeg)
+                MeasuredAntennaElDeg = 0.0
+                ImuValid = False
+                ImuSource = "DISABLED"
+
+                if Imu is not None:
+                    try:
+                        if hasattr(Imu, "SetSimulatedAntennaPosition"):
+                            Imu.SetSimulatedAntennaPosition(
+                                AzimuthDeg=float(PtzAzDeg if PtzValid else CommandedBoresightDeg),
+                                ElevationDeg=float(Config.get("AntennaElDeg", Config.get("PTZStartupElevationDeg", 55.0))),
+                            )
+
+                        ImuData = Imu.Read()
+                        MeasuredAntennaAzDeg = float(ImuData.AzimuthDeg)
+                        MeasuredAntennaElDeg = float(ImuData.ElevationDeg)
+                        ImuValid = bool(ImuData.Valid)
+                        ImuSource = str(ImuData.Source)
+                    except Exception as exc:
+                        ImuValid = False
+                        ImuSource = f"ERROR: {exc}"
+
+                # Boresight source priority:
+                #   IMU if explicitly enabled and valid,
+                #   else PTZ measured position,
+                #   else commanded fallback.
+                if Config.get("UseIMUForBeamAngle", False) and ImuValid:
+                    BoresightDeg = float(MeasuredAntennaAzDeg)
+                elif PtzValid:
+                    BoresightDeg = float(PtzAzDeg)
+                else:
+                    BoresightDeg = float(CommandedBoresightDeg)
+
+                Config["BoresightDeg"] = float(BoresightDeg)
+                Config["CommandedBoresightDeg"] = float(CommandedBoresightDeg)
+                Config["AntennaAzDeg"] = float(MeasuredAntennaAzDeg)
+                Config["AntennaElDeg"] = float(MeasuredAntennaElDeg)
+                Config["IMUValid"] = bool(ImuValid)
+                Config["IMUSource"] = str(ImuSource)
+                Config["PTZAzDeg"] = float(PtzAzDeg)
+                Config["PTZRateDegPerSec"] = float(PtzRateDegPerSec)
+                Config["PTZValid"] = bool(PtzValid)
+                Config["PTZSource"] = str(PtzSource)
+                Config["PTZAtTarget"] = bool(PtzAtTarget)
+                Config["ScanCycle"] = int(ScanCycle)
+
+                # -------------------------------------------------------------
+                # Build the scene returns for this beam position.
+                # -------------------------------------------------------------
+
+                RadarParams = BuildRadarParamsForScenario(Config)
+
+                SceneReturns = build_scene_returns_for_boresight(
+                    SceneObjects,
+                    RadarParams,
+                )
+
+                # Pass the current boresight scene returns into the simulated
+                # source. SimulatedSource will insert all of these returns into
+                # the received IQ.
+                Config["SceneReturns"] = SceneReturns
+
+                if Config["PrintSceneTruthTable"]:
+                    print_scene_returns(SceneReturns, BoresightDeg)
+
+                # -------------------------------------------------------------
+                # Create dwell and execute radar chain.
+                # -------------------------------------------------------------
+
+                ThisDwell = make_uniform_dwell_plan(
+                    dwell_id=DwellId,
+                    task_id=DwellId,
+                    task_type="SEARCH",
+                    waveform_id=Config.get("SearchWaveformId", "Frank10"),
+                    sample_rate=Config["SampleRate"],
+                    num_samples=Config["NumSamples"],
+                    num_pulses=Config["NumPulses"],
+                    pri_sec=Config["PRI"],
+                    azimuth_deg=BoresightDeg,
+                    elevation_deg=Config.get("AntennaElDeg", 0.0),
+                    rx_attenuation_db=Config.get("TRMRxAttenuationDb", 0.0),
+                    tx_attenuation_db=Config.get("TRMTxAttenuationDb", 31.5),
+                    metadata={
+                        "ScanCycle": int(ScanCycle),
+                        "DisplayMode": str(DisplayMode),
+                    },
+                )
+                T0 = time.perf_counter()
+
+                Raw = Source.ExecuteDwell(ThisDwell)
+
+                T1 = time.perf_counter()
+
+                Processed = Processor.Process(Raw, ThisDwell)
+
+                T2 = time.perf_counter()
+
+                TrackerDebug = {}
+
+                Processed.Diagnostics["BoresightDeg"] = float(BoresightDeg)
+                Processed.Diagnostics["BeamAngleDeg"] = float(BoresightDeg)
+                Processed.Diagnostics["CommandedBoresightDeg"] = float(CommandedBoresightDeg)
+                Processed.Diagnostics["AntennaAzDeg"] = float(MeasuredAntennaAzDeg)
+                Processed.Diagnostics["AntennaElDeg"] = float(MeasuredAntennaElDeg)
+                Processed.Diagnostics["IMUValid"] = bool(ImuValid)
+                Processed.Diagnostics["IMUSource"] = str(ImuSource)
+                Processed.Diagnostics["PTZAzDeg"] = float(PtzAzDeg)
+                Processed.Diagnostics["PTZRateDegPerSec"] = float(PtzRateDegPerSec)
+                Processed.Diagnostics["PTZValid"] = bool(PtzValid)
+                Processed.Diagnostics["PTZSource"] = str(PtzSource)
+                Processed.Diagnostics["PTZAtTarget"] = bool(PtzAtTarget)
+                Processed.Diagnostics["ScanCycle"] = ScanCycle
+
+                Detections = Detector.Detect(Processed, ThisDwell)
+
+                if Config.get("TrackerEnabled", True):
+                    Tracks, Plots = Tracker.Update(Detections, Processed, ThisDwell)
+                    TrackerDebug = Tracker.GetDebugInfo() if hasattr(Tracker, "GetDebugInfo") else {}
+                else:
+                    Tracks, Plots = [], []
+                    TrackerDebug = {}
+
+                Processed.Diagnostics["TrackerCurrentScanPoints"] = int(TrackerDebug.get("CurrentScanPoints", 0))
+                Processed.Diagnostics["TrackerLastCompletedBlobs"] = int(TrackerDebug.get("LastCompletedBlobs", 0))
+                Processed.Diagnostics["TrackerTentativeTracks"] = int(TrackerDebug.get("TentativeTracks", 0))
+                Processed.Diagnostics["TrackerConfirmedTracks"] = int(TrackerDebug.get("ConfirmedTracks", 0))
+
+                T3 = time.perf_counter()
+
+                Logger.log_dwell(Processed, Detections)
+
+                T4 = time.perf_counter()
+
+                Display.Update(Processed, Detections, Tracks=Tracks, Plots=Plots)
+
+                T5 = time.perf_counter()
+
+                if DwellId % 1 == 0:
+                    if LastPrintedBoresightDeg is None:
+                        PrintedAzStepDeg = 0.0
+                    else:
+                        PrintedAzStepDeg = BoresightDeg - LastPrintedBoresightDeg
+                        while PrintedAzStepDeg > 180.0:
+                            PrintedAzStepDeg -= 360.0
+                        while PrintedAzStepDeg < -180.0:
+                            PrintedAzStepDeg += 360.0
+                    LastPrintedBoresightDeg = float(BoresightDeg)
+
+                    print(
+                        f"Dwell {DwellId:5d} | "
+                        f"WallDt {1000*DwellWallDtSec:7.2f} ms | "
+                        f"AzStep {PrintedAzStepDeg:6.2f} deg | "
+                        f"Collect {1000*(T1-T0):7.2f} ms | "
+                        f"Process {1000*(T2-T1):7.2f} ms | "
+                        f"Detect+Track {1000*(T3-T2):7.2f} ms | "
+                        f"Log {1000*(T4-T3):7.2f} ms | "
+                        f"Display {1000*(T5-T4):7.2f} ms | "
+                        f"Total {1000*(T5-T0):7.2f} ms | "
+                        f"PTZ {PtzAzDeg:7.2f} deg {PtzSource} | "
+                        f"Mode {DisplayMode} Scan {ScanEnabled} | "
+                        f"Dets {len(Detections):3d} Plots {len(Plots):3d} Tracks {len(Tracks):3d} | "
+                        f"Pts {int(TrackerDebug.get('CurrentScanPoints', 0)):3d} "
+                        f"Blobs {int(TrackerDebug.get('LastCompletedBlobs', 0)):3d} "
+                        f"Tent {int(TrackerDebug.get('TentativeTracks', 0)):3d} "
+                        f"Conf {int(TrackerDebug.get('ConfirmedTracks', 0)):3d} "
+                        f"ScanCycle {ScanCycle}"
+                    )
+
+
+                # -------------------------------------------------------------
+                # Move targets forward by one dwell time.
+                # -------------------------------------------------------------
+
+                DwellTimeS = Config["NumPulses"] * Config["PRI"]
+                update_scene_objects(SceneObjects, DwellTimeS)
+
+                DwellId += 1
+
+                # -------------------------------------------------------------
+                # Update scan limits from display/operator controls.
+                #
+                # IMPORTANT:
+                # Do not free-run CurrentScanBoresightDeg here. PTZ scan targets
+                # are advanced above only after the real PTZ reaches the current
+                # target. This keeps display, radar boresight and PTZ aligned.
+                # -------------------------------------------------------------
+
+                ScanStartDeg = float(Config.get("ScanStartDeg", ScanStartDeg))
+                ScanStopDeg = float(Config.get("ScanStopDeg", ScanStopDeg))
+                ScanStepDeg = abs(float(Config.get("ScanStepDeg", ScanStepDeg)))
+
+
+
+    except KeyboardInterrupt:
+        print("")
+        print("Scan stopped by user.")
+
+    finally:
+        # ---------------------------------------------------------------------
+        # Shutdown source
+        # ---------------------------------------------------------------------
+
+        try:
+            Logger.close()
+        except Exception:
+            pass
+
+        try:
+            if Ptz is not None:
+                Ptz.Stop()
+                Ptz.Close()
+        except Exception:
+            pass
+
+        Source.Shutdown()
+
+
+if __name__ == "__main__":
+    Main()
