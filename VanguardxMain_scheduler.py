@@ -782,11 +782,11 @@ def Main():
                 LastRadarDwellTimeSec = NowDwellSec
 
                 # -------------------------------------------------------------
-                # PTZ / X6-60 state and temporary non-scan controls.
+                # PTZ / X6-60 state and operator controls.
                 #
-                # Continuous SCAN commands, endpoint reversal, and STOP are now
-                # owned exclusively by PointingManager. Main still reads measured
-                # state and temporarily retains manual nudge until Stage 3C.3.
+                # Continuous SCAN, endpoint reversal, STOP, and manual nudge are
+                # now owned exclusively by PointingManager. Main only forwards
+                # operator intent and consumes measured pointing state.
                 # -------------------------------------------------------------
 
                 PtzValid = False
@@ -804,7 +804,7 @@ def Main():
                         PtzValid = bool(PtzState.Valid)
                         PtzSource = str(PtzState.Source)
 
-                        # Manual nudge remains in Main until Stage 3C.3.
+                        # Manual positioning is owned by PointingManager.
                         ManualNudgeCommandId = None
                         ManualNudgeDeltaDeg = 0.0
                         if ControlState is not None:
@@ -820,14 +820,7 @@ def Main():
                             and abs(ManualNudgeDeltaDeg) > 0.0
                         ):
                             Main._LastConsumedNudgeId = ManualNudgeCommandId
-
-                            TargetDeg = ClampDeg(
-                                PtzAzDeg + ManualNudgeDeltaDeg,
-                                float(Config.get("PTZLeftLimitDeg", 10.0)),
-                                float(Config.get("PTZRightLimitDeg", 300.0)),
-                            )
-
-                            Ptz.SetPanPositionNative(TargetDeg)
+                            Pointing.Nudge(ManualNudgeDeltaDeg)
 
                         elif not (DisplayMode == "SCAN" and ScanEnabled):
                             # PointingManager owns the stop transition. This

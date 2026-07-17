@@ -285,6 +285,52 @@ class PointingManager:
                 f"toward {self.SearchTask.Sector.ActiveEndpoint}"
             )
 
+    def Nudge(self, delta_deg: float) -> float:
+        """Move the antenna by a relative operator-requested increment.
+
+        Manual positioning is owned here so callers never command the PTZ
+        directly. The target is clamped to the configured mechanical limits.
+        Any active search or track task is cleared; the scheduler may reactivate
+        search when the operator returns to SCAN mode.
+
+        Returns the commanded platform-relative azimuth in degrees.
+        """
+        delta = float(delta_deg)
+
+        try:
+            state = self.Ptz.Update()
+            current_relative = float(state.AzimuthDeg)
+        except Exception:
+            if self.LastCommandedRelativeDeg is None:
+                raise
+            current_relative = float(self.LastCommandedRelativeDeg)
+
+        target_relative = clamp(
+            current_relative + delta,
+            self.LeftLimitDeg,
+            self.RightLimitDeg,
+        )
+
+        self.Ptz.Stop()
+        self.Ptz.SetPanPositionNative(target_relative)
+
+        self.ActiveTask = None
+        self.ActiveMode = PointingMode.HOLD_CURRENT
+        self.SearchInterrupted = self.SearchTask is not None
+        self.LastCommandedRelativeDeg = target_relative
+        self.LastCommandedTrueDeg = None
+        self._goto_ready_since_sec = None
+
+        if self.Debug:
+            print(
+                "PointingManager NUDGE: "
+                f"current={current_relative:.2f} deg "
+                f"delta={delta:+.2f} deg "
+                f"target={target_relative:.2f} deg"
+            )
+
+        return target_relative
+
     def Stop(self) -> None:
         self.Ptz.Stop()
         self.ActiveTask = None
