@@ -305,7 +305,7 @@ class RadarExecutor:
                     "SearchWaveformId",
                     "Frank10",
                 ),
-                SampleRate=float(self.Config["SampleRate"]),
+                SampleRate=float(self.Config["EttusSampleRateHz"]),
                 NumSamples=int(self.Config["NumSamples"]),
                 NumPulses=int(self.Config["NumPulses"]),
                 PriSec=float(self.Config["PRI"]),
@@ -330,10 +330,7 @@ class RadarExecutor:
                     "TrackWaveformId",
                     self.Config.get("SearchWaveformId", "Barker13"),
                 ),
-                SampleRate=float(self.Config.get(
-                    "TrackSampleRate",
-                    self.Config["SampleRate"],
-                )),
+                SampleRate=float(self.Config["EttusSampleRateHz"]),
                 NumSamples=int(self.Config.get(
                     "TrackNumSamples",
                     self.Config["NumSamples"],

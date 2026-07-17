@@ -3,6 +3,15 @@ Vanguard X - EttusRadarSource.py
 
 Stage 4A.2 receive-only source for an Ettus B200mini.
 
+The setup now runs automatically during Initialise() and configures:
+
+J6 pin 3, GPIO_1, as TX ATR
+J6 pin 4, GPIO_2, as RX ATR
+ATR_0X: both low
+ATR_RX: RX high, TX low
+ATR_TX: TX high, RX low
+ATR_XX: both low
+
 Key behaviour:
 - One finite UHD receive command is issued for each PRI.
 - Each command captures exactly NumSamples IQ samples.
@@ -58,6 +67,20 @@ class EttusRadarSource:
         )
         self.Debug = bool(Config.get("EttusDebug", False))
 
+        # B200mini front-panel GPIO/ATR configuration.  The configuration
+        # values are logical GPIO bit numbers, not physical connector pins:
+        # J6 pin 3 -> GPIO_1 -> bit 1 (TX ATR)
+        # J6 pin 4 -> GPIO_2 -> bit 2 (RX ATR)
+        self.AtrGpioEnabled = bool(
+            Config.get("EttusAtrGpioEnabled", True)
+        )
+        self.GpioBank = str(Config.get("EttusGPIOBank", "FP0"))
+        self.TxAtrGpioBit = int(Config.get("EttusTxAtrGPIO", 1))
+        self.RxAtrGpioBit = int(Config.get("EttusRxAtrGPIO", 2))
+        self.TxAtrMask = 1 << self.TxAtrGpioBit
+        self.RxAtrMask = 1 << self.RxAtrGpioBit
+        self.AtrGpioMask = self.TxAtrMask | self.RxAtrMask
+
         self._configured_sample_rate = None
         self._initialised = False
 
@@ -94,13 +117,17 @@ class EttusRadarSource:
         stream_args.channels = [self.Channel]
         self.RxStreamer = self.Usrp.get_rx_stream(stream_args)
 
+        if self.AtrGpioEnabled:
+            self._configure_atr_gpio()
+
         self._initialised = True
         print(
             "Ettus source initialised: "
             f"device='{args or 'auto'}', "
             f"RX={self.Usrp.get_rx_freq(self.Channel):.3f} Hz, "
             f"gain={self.Usrp.get_rx_gain(self.Channel):.2f} dB, "
-            f"antenna={self.Usrp.get_rx_antenna(self.Channel)}"
+            f"antenna={self.Usrp.get_rx_antenna(self.Channel)}, "
+            f"ATR GPIO={'enabled' if self.AtrGpioEnabled else 'disabled'}"
         )
 
     def Shutdown(self):
@@ -129,7 +156,9 @@ class EttusRadarSource:
                 "Call EttusRadarSource.Initialise() before ExecuteDwell()."
             )
 
-        sample_rate = float(ThisDwell.SampleRate)
+        sample_rate = float(
+            self.Config["EttusSampleRateHz"]
+            )
         num_samples = int(ThisDwell.NumSamples)
         num_pulses = self._get_num_pulses(ThisDwell)
 
@@ -245,6 +274,10 @@ class EttusRadarSource:
             "RxFrequencyHz": float(self.Usrp.get_rx_freq(self.Channel)),
             "RxGainDb": float(self.Usrp.get_rx_gain(self.Channel)),
             "RxAntenna": str(self.Usrp.get_rx_antenna(self.Channel)),
+            "AtrGpioEnabled": bool(self.AtrGpioEnabled),
+            "AtrGpioBank": str(self.GpioBank),
+            "TxAtrGpioBit": int(self.TxAtrGpioBit),
+            "RxAtrGpioBit": int(self.RxAtrGpioBit),
             "PulseDiagnostics": pulse_diagnostics,
             "CaptureElapsedSec": wall_end - wall_start,
         }
@@ -260,6 +293,70 @@ class EttusRadarSource:
             PulseWaveformIds=pulse_waveform_ids,
             PulseValid=pulse_valid,
             Diagnostics=diagnostics,
+        )
+
+    def _configure_atr_gpio(self):
+        """Configure J6 pins 3 and 4 as FPGA-controlled ATR outputs."""
+        available_banks = list(self.Usrp.get_gpio_banks(0))
+        if self.GpioBank not in available_banks:
+            raise RuntimeError(
+                f"GPIO bank '{self.GpioBank}' is unavailable; "
+                f"available banks are {available_banks}"
+            )
+
+        if self.TxAtrGpioBit == self.RxAtrGpioBit:
+            raise ValueError(
+                "EttusTxAtrGPIO and EttusRxAtrGPIO must use different bits"
+            )
+        if self.TxAtrGpioBit < 0 or self.RxAtrGpioBit < 0:
+            raise ValueError(
+                "ATR GPIO bit numbers must be non-negative"
+            )
+
+        # CTRL=1 selects FPGA ATR control; DDR=1 selects output direction.
+        self.Usrp.set_gpio_attr(
+            self.GpioBank,
+            "CTRL",
+            self.AtrGpioMask,
+            self.AtrGpioMask,
+            0,
+        )
+        self.Usrp.set_gpio_attr(
+            self.GpioBank,
+            "DDR",
+            self.AtrGpioMask,
+            self.AtrGpioMask,
+            0,
+        )
+
+        # ATR states for the Vanguard X half-duplex radar:
+        # idle: both low; RX: pin 4 high; TX: pin 3 high; TX/RX: both low.
+        self.Usrp.set_gpio_attr(
+            self.GpioBank, "ATR_0X", 0, self.AtrGpioMask, 0
+        )
+        self.Usrp.set_gpio_attr(
+            self.GpioBank,
+            "ATR_RX",
+            self.RxAtrMask,
+            self.AtrGpioMask,
+            0,
+        )
+        self.Usrp.set_gpio_attr(
+            self.GpioBank,
+            "ATR_TX",
+            self.TxAtrMask,
+            self.AtrGpioMask,
+            0,
+        )
+        self.Usrp.set_gpio_attr(
+            self.GpioBank, "ATR_XX", 0, self.AtrGpioMask, 0
+        )
+
+        print(
+            "Ettus ATR GPIO configured: "
+            f"bank={self.GpioBank}, "
+            f"J6 pin 3=TX (GPIO_{self.TxAtrGpioBit}), "
+            f"J6 pin 4=RX (GPIO_{self.RxAtrGpioBit})"
         )
 
     def _issue_receive_command(self, num_samples, scheduled_time_sec):

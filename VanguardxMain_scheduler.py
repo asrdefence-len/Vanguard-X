@@ -364,7 +364,6 @@ def Main():
     # -------------------------------------------------------------------------
 
     Config = {
-        "SampleRate": 40e6,
         "NumSamples": 4096,
         "NumPulses": 32,
         "PRI": 200e-6,
@@ -381,6 +380,8 @@ def Main():
         "EttusRxGainDb": 10.0,
         "EttusRxAntenna": "RX2",
         "EttusRxChannel": 0,
+        "EttusSampleRateHz": 40.0e6,
+        "EttusMaxSampleRateHz": 40.0e6,
         "EttusReceiveTimeoutSec": 1.0,
         "EttusCommandLeadTimeSec": 0.005,
         "EttusDebug": True,
