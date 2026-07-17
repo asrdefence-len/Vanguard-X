@@ -48,7 +48,6 @@ from RadarExecutor import RadarExecutor
 from RadarScheduler import RadarScheduler
 from RadarTasks import AngleFrame, MakeSearchTask, RadarTaskType
 
-from RadarPlans import make_uniform_dwell_plan
 from SimulatedSource import SimulatedSource
 from WaveformLibrary import WaveformLibrary
 from RadarProcessor import RadarProcessor
@@ -240,16 +239,50 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
 
 
 
+class ExternalPointingAdapter:
+    """Read-only PTZ view used during the Stage 3B migration.
+
+    The proven main-loop X6-60 scan state machine remains the sole command
+    owner in this stage. PointingManager may inspect the latest measured state,
+    but commands issued through this adapter are intentionally ignored. This
+    prevents two independent scan controllers from fighting at sector edges.
+    """
+
+    def __init__(self, initial_azimuth_deg=0.0, initial_elevation_deg=0.0):
+        self.WrapMode = False
+        self._state = type("ExternalPointingState", (), {})()
+        self._state.AzimuthDeg = float(initial_azimuth_deg)
+        self._state.ElevationDeg = float(initial_elevation_deg)
+        self._state.PanRateDegPerSec = 0.0
+        self._state.Valid = True
+        self._state.Source = "EXTERNAL_POINTING"
+
+    def SetMeasuredState(self, state):
+        self._state = state
+
+    def Update(self):
+        return self._state
+
+    def CommandSlew(self, rate_deg_per_sec, tilt_rate_deg_per_sec=0.0):
+        return None
+
+    def SetPanPositionNative(self, target_deg):
+        return None
+
+    def Stop(self):
+        return None
+
+
 def ExecuteRadarDwell(
     Config,
     ScheduledTask,
-    Source,
+    Executor,
+    NavigationAttitude,
     Processor,
     Detector,
     Tracker,
     Display,
     Logger,
-    DwellId,
     ScanCycle,
     DisplayMode,
     BoresightDeg,
@@ -264,46 +297,38 @@ def ExecuteRadarDwell(
     PtzSource,
     PtzAtTarget,
 ):
-    """Execute one complete radar dwell using the existing processing chain.
+    """Execute one scheduled dwell and preserve the processing chain.
 
-    This helper is intentionally behaviour-preserving. It only extracts the
-    existing dwell construction, source execution, processing, detection,
-    tracking, logging and display update from Main().
+    RadarExecutor owns DwellPlan construction and source execution. During this
+    migration stage the legacy main-loop scan controller remains the sole owner
+    of X6-60 movement; PointingManager receives a read-only measured-state view.
     """
 
-    ScheduledTaskType = (
-        ScheduledTask.TaskType.value
-        if hasattr(ScheduledTask.TaskType, "value")
-        else str(ScheduledTask.TaskType)
-    )
-
-    ThisDwell = make_uniform_dwell_plan(
-        dwell_id=DwellId,
-        task_id=int(ScheduledTask.TaskId),
-        task_type=str(ScheduledTaskType),
-        waveform_id=Config.get("SearchWaveformId", "Frank10"),
-        sample_rate=Config["SampleRate"],
-        num_samples=Config["NumSamples"],
-        num_pulses=Config["NumPulses"],
-        pri_sec=Config["PRI"],
-        azimuth_deg=BoresightDeg,
-        elevation_deg=Config.get("AntennaElDeg", 0.0),
-        rx_attenuation_db=Config.get("TRMRxAttenuationDb", 0.0),
-        tx_attenuation_db=Config.get("TRMTxAttenuationDb", 31.5),
-        metadata={
-            "ScanCycle": int(ScanCycle),
-            "DisplayMode": str(DisplayMode),
-            "ScheduledTaskId": int(ScheduledTask.TaskId),
-            "ScheduledTaskType": str(ScheduledTaskType),
-            "ScheduledWaveformProfileId": str(
-                getattr(ScheduledTask, "WaveformProfileId", "")
-            ),
-        },
-    )
-
     T0 = time.perf_counter()
-    Raw = Source.ExecuteDwell(ThisDwell)
+    ExecutionResult = Executor.ExecuteTaskStep(
+        task=ScheduledTask,
+        navigation=NavigationAttitude,
+    )
     T1 = time.perf_counter()
+
+    if not ExecutionResult.Executed:
+        return {
+            "Executed": False,
+            "WaitingForPointing": bool(ExecutionResult.WaitingForPointing),
+            "Reason": str(ExecutionResult.Reason),
+            "Pointing": ExecutionResult.Pointing,
+            "T0": T0,
+            "T1": T1,
+        }
+
+    Raw = ExecutionResult.Raw
+    ThisDwell = ExecutionResult.Dwell
+
+    # The executor obtains the same measured X6-60 state through the read-only
+    # adapter. Preserve operator context without mutating core DwellPlan fields.
+    ThisDwell.Metadata["ScanCycle"] = int(ScanCycle)
+    ThisDwell.Metadata["DisplayMode"] = str(DisplayMode)
+    ThisDwell.Metadata["ExternalPointingControl"] = True
 
     Processed = Processor.Process(Raw, ThisDwell)
     T2 = time.perf_counter()
@@ -322,7 +347,7 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["PTZAtTarget"] = bool(PtzAtTarget)
     Processed.Diagnostics["ScanCycle"] = int(ScanCycle)
     Processed.Diagnostics["ScheduledTaskId"] = int(ScheduledTask.TaskId)
-    Processed.Diagnostics["ScheduledTaskType"] = str(ScheduledTaskType)
+    Processed.Diagnostics["ScheduledTaskType"] = str(ScheduledTask.TaskType)
     Processed.Diagnostics["ScheduledWaveformProfileId"] = str(
         getattr(ScheduledTask, "WaveformProfileId", "")
     )
@@ -348,6 +373,10 @@ def ExecuteRadarDwell(
     T5 = time.perf_counter()
 
     return {
+        "Executed": True,
+        "WaitingForPointing": False,
+        "Reason": "",
+        "Pointing": ExecutionResult.Pointing,
         "Dwell": ThisDwell,
         "Processed": Processed,
         "Detections": Detections,
@@ -648,18 +677,25 @@ def Main():
     # -------------------------------------------------------------------------
     # Radar operating-system architecture
     #
-    # Stage 3A:
-    # The scheduler now selects the high-level task that owns each dwell.
-    # Dwell construction and source execution still use the existing legacy
-    # path; RadarExecutor integration is deliberately deferred to Stage 3B.
+    # Stage 3B:
+    # RadarScheduler selects the high-level task and RadarExecutor constructs
+    # and executes each dwell. The proven main-loop X6-60 scan controller is
+    # temporarily retained as the sole movement-command owner. PointingManager
+    # receives measured state through ExternalPointingAdapter and cannot issue
+    # competing motor commands.
     # -------------------------------------------------------------------------
 
     Navigation = SimulatedNavigationSource(
         initial_heading_deg=0.0,
     )
 
+    PointingAdapter = ExternalPointingAdapter(
+        initial_azimuth_deg=float(Config.get("InitialBeamAngleDeg", 0.0)),
+        initial_elevation_deg=float(Config.get("AntennaElDeg", 0.0)),
+    )
+
     Pointing = PointingManager(
-        ptz=Ptz,
+        ptz=PointingAdapter,
         left_limit_deg=float(Config.get("PTZLeftLimitDeg", 10.0)),
         right_limit_deg=float(Config.get("PTZRightLimitDeg", 300.0)),
         endpoint_margin_deg=float(
@@ -836,6 +872,7 @@ def Main():
 
                         # Query/update position. This is throttled inside PTZController.
                         PtzState = Ptz.Update()
+                        PointingAdapter.SetMeasuredState(PtzState)
                         PtzAzDeg = float(PtzState.AzimuthDeg)
                         PtzRateDegPerSec = float(PtzState.PanRateDegPerSec)
                         PtzValid = bool(PtzState.Valid)
@@ -998,10 +1035,12 @@ def Main():
                     print_scene_returns(SceneReturns, BoresightDeg)
 
                 # -------------------------------------------------------------
-                # Stage 3A: ask RadarScheduler which high-level task owns this
-                # dwell. The legacy execution path remains unchanged for now;
-                # the selected task is carried into the DwellPlan and diagnostics.
+                # Stage 3B: RadarScheduler selects the task. RadarExecutor will
+                # build the DwellPlan and execute the source using the latest
+                # externally measured pointing state.
                 # -------------------------------------------------------------
+
+                NavigationAttitude = Navigation.get_attitude()
 
                 ScheduledTask = Scheduler.GetNextTask(
                     current_time_sec=NowDwellSec,
@@ -1020,13 +1059,13 @@ def Main():
                 DwellResult = ExecuteRadarDwell(
                     Config=Config,
                     ScheduledTask=ScheduledTask,
-                    Source=Source,
+                    Executor=Executor,
+                    NavigationAttitude=NavigationAttitude,
                     Processor=Processor,
                     Detector=Detector,
                     Tracker=Tracker,
                     Display=Display,
                     Logger=Logger,
-                    DwellId=DwellId,
                     ScanCycle=ScanCycle,
                     DisplayMode=DisplayMode,
                     BoresightDeg=BoresightDeg,
@@ -1041,6 +1080,12 @@ def Main():
                     PtzSource=PtzSource,
                     PtzAtTarget=PtzAtTarget,
                 )
+
+                if not DwellResult["Executed"]:
+                    if hasattr(Display, "App"):
+                        Display.App.processEvents()
+                    time.sleep(0.002)
+                    continue
 
                 ThisDwell = DwellResult["Dwell"]
                 Processed = DwellResult["Processed"]
