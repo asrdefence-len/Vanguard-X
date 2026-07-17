@@ -172,14 +172,24 @@ class EttusRadarSource:
         )
         wall_start = time.time()
 
-        for pulse_index in range(num_pulses):
-            scheduled_time_sec = (
-                hardware_start_sec + pulse_times_sec[pulse_index]
+        # Queue every timed RX command before waiting for any samples.
+        # CommandLeadTimeSec is applied once to hardware_start_sec above;
+        # subsequent PRI times are derived only from the dwell PRI schedule.
+        scheduled_times_sec = hardware_start_sec + pulse_times_sec
+        for scheduled_time_sec in scheduled_times_sec:
+            self._issue_receive_command(
+                num_samples=num_samples,
+                scheduled_time_sec=float(scheduled_time_sec),
             )
 
-            pulse_iq, diag = self._receive_one_pri(
+        # After all receive windows are armed, collect one window per PRI.
+        # This structure also leaves room to queue timed TX commands between
+        # the RX-command loop above and the blocking receive loop below.
+        for pulse_index in range(num_pulses):
+            scheduled_time_sec = float(scheduled_times_sec[pulse_index])
+
+            pulse_iq, diag = self._receive_scheduled_pri(
                 num_samples=num_samples,
-                scheduled_time_sec=scheduled_time_sec,
             )
 
             copied = min(len(pulse_iq), num_samples)
@@ -223,6 +233,8 @@ class EttusRadarSource:
             "SourceType": "EttusRadarSource",
             "ReceiveOnly": True,
             "ReceiveCommandPerPri": True,
+            "AllReceiveCommandsQueuedBeforeCollection": True,
+            "CommandLeadTimeAppliedOncePerDwell": True,
             "TimedTransmitEnabled": False,
             "SecondTransmitPulseEnabled": False,
             "SoftwareIqInjectionEnabled": self.IqInjector is not None,
@@ -250,9 +262,8 @@ class EttusRadarSource:
             Diagnostics=diagnostics,
         )
 
-    def _receive_one_pri(self, num_samples, scheduled_time_sec):
-        metadata = uhd.types.RXMetadata()
-
+    def _issue_receive_command(self, num_samples, scheduled_time_sec):
+        """Queue one finite timed receive window without blocking."""
         command = uhd.types.StreamCMD(
             uhd.types.StreamMode.num_done
         )
@@ -262,6 +273,10 @@ class EttusRadarSource:
             float(scheduled_time_sec)
         )
         self.RxStreamer.issue_stream_cmd(command)
+
+    def _receive_scheduled_pri(self, num_samples):
+        """Collect samples from the next previously queued RX window."""
+        metadata = uhd.types.RXMetadata()
 
         max_packet = int(self.RxStreamer.get_max_num_samps())
         recv_buffer = np.zeros((1, max_packet), dtype=np.complex64)

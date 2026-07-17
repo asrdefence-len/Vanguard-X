@@ -56,6 +56,7 @@ from RadarTracker import RadarTracker
 from SimpleDisplay import SimpleDisplay
 from RadarDisplayQt5 import RadarDisplay
 from DataLogger import DataLogger
+from EttusRadarSource import EttusRadarSource
 import time
 
 try:
@@ -368,6 +369,22 @@ def Main():
         "NumPulses": 32,
         "PRI": 200e-6,
 
+        # ---------------------------------------------------------------------
+        # Radar source
+        # ---------------------------------------------------------------------
+
+        "RadarSource": "ETTUS",      # "SIM" or "ETTUS"
+
+        # Ettus configuration
+        "EttusSerial": "34A0320",
+        "EttusRxFrequencyHz": 1.0e9,
+        "EttusRxGainDb": 10.0,
+        "EttusRxAntenna": "RX2",
+        "EttusRxChannel": 0,
+        "EttusReceiveTimeoutSec": 1.0,
+        "EttusCommandLeadTimeSec": 0.005,
+        "EttusDebug": True,
+
         # Initial pulse-plan architecture. Search and track waveform selectors
         # are separate even though only SEARCH is scheduled in this version.
         "SearchWaveformId": "Frank10",
@@ -549,8 +566,23 @@ def Main():
     # Source, processor, detector and display
     # -------------------------------------------------------------------------
 
-    Source = SimulatedSource(Config, TheWaveformLibrary)
+
+    # -------------------------------------------------------------------------
+    # Source selection
+    # -------------------------------------------------------------------------
+
+    RadarSourceType = Config.get("RadarSource", "SIM").upper()
+
+    if RadarSourceType == "ETTUS":
+        print("Using Ettus B200mini radar source")
+        Source = EttusRadarSource(Config, TheWaveformLibrary)
+
+    else:
+        print("Using simulated radar source")
+        Source = SimulatedSource(Config, TheWaveformLibrary)
+
     Processor = RadarProcessor(Config, TheWaveformLibrary)
+
     Detector = CfarDetector(Config)
     Tracker = RadarTracker(Config)
     Display = SelectDisplay(Config)
