@@ -242,6 +242,7 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
 
 def ExecuteRadarDwell(
     Config,
+    ScheduledTask,
     Source,
     Processor,
     Detector,
@@ -270,10 +271,16 @@ def ExecuteRadarDwell(
     tracking, logging and display update from Main().
     """
 
+    ScheduledTaskType = (
+        ScheduledTask.TaskType.value
+        if hasattr(ScheduledTask.TaskType, "value")
+        else str(ScheduledTask.TaskType)
+    )
+
     ThisDwell = make_uniform_dwell_plan(
         dwell_id=DwellId,
-        task_id=DwellId,
-        task_type="SEARCH",
+        task_id=int(ScheduledTask.TaskId),
+        task_type=str(ScheduledTaskType),
         waveform_id=Config.get("SearchWaveformId", "Frank10"),
         sample_rate=Config["SampleRate"],
         num_samples=Config["NumSamples"],
@@ -286,6 +293,11 @@ def ExecuteRadarDwell(
         metadata={
             "ScanCycle": int(ScanCycle),
             "DisplayMode": str(DisplayMode),
+            "ScheduledTaskId": int(ScheduledTask.TaskId),
+            "ScheduledTaskType": str(ScheduledTaskType),
+            "ScheduledWaveformProfileId": str(
+                getattr(ScheduledTask, "WaveformProfileId", "")
+            ),
         },
     )
 
@@ -309,6 +321,11 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["PTZSource"] = str(PtzSource)
     Processed.Diagnostics["PTZAtTarget"] = bool(PtzAtTarget)
     Processed.Diagnostics["ScanCycle"] = int(ScanCycle)
+    Processed.Diagnostics["ScheduledTaskId"] = int(ScheduledTask.TaskId)
+    Processed.Diagnostics["ScheduledTaskType"] = str(ScheduledTaskType)
+    Processed.Diagnostics["ScheduledWaveformProfileId"] = str(
+        getattr(ScheduledTask, "WaveformProfileId", "")
+    )
 
     Detections = Detector.Detect(Processed, ThisDwell)
 
@@ -631,10 +648,10 @@ def Main():
     # -------------------------------------------------------------------------
     # Radar operating-system architecture
     #
-    # Stage 2A:
-    # Create the navigation, pointing, task, scheduler and executor objects.
-    # They are not yet used to execute the operational dwell path, so this
-    # stage must not change radar behaviour.
+    # Stage 3A:
+    # The scheduler now selects the high-level task that owns each dwell.
+    # Dwell construction and source execution still use the existing legacy
+    # path; RadarExecutor integration is deliberately deferred to Stage 3B.
     # -------------------------------------------------------------------------
 
     Navigation = SimulatedNavigationSource(
@@ -981,11 +998,28 @@ def Main():
                     print_scene_returns(SceneReturns, BoresightDeg)
 
                 # -------------------------------------------------------------
+                # Stage 3A: ask RadarScheduler which high-level task owns this
+                # dwell. The legacy execution path remains unchanged for now;
+                # the selected task is carried into the DwellPlan and diagnostics.
+                # -------------------------------------------------------------
+
+                ScheduledTask = Scheduler.GetNextTask(
+                    current_time_sec=NowDwellSec,
+                )
+
+                if ScheduledTask is None:
+                    if hasattr(Display, "App"):
+                        Display.App.processEvents()
+                    time.sleep(0.002)
+                    continue
+
+                # -------------------------------------------------------------
                 # Execute one complete radar dwell through the extracted helper.
                 # -------------------------------------------------------------
 
                 DwellResult = ExecuteRadarDwell(
                     Config=Config,
+                    ScheduledTask=ScheduledTask,
                     Source=Source,
                     Processor=Processor,
                     Detector=Detector,
@@ -1020,6 +1054,13 @@ def Main():
                 T3 = DwellResult["T3"]
                 T4 = DwellResult["T4"]
                 T5 = DwellResult["T5"]
+
+                # One scheduler task currently corresponds to one completed
+                # legacy dwell. SEARCH is persistent, so completing it simply
+                # returns it to the queued state for the next dwell.
+                Scheduler.CompleteActiveTask(
+                    current_time_sec=time.time(),
+                )
 
                 if DwellId % 1 == 0:
                     if LastPrintedBoresightDeg is None:
