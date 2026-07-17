@@ -164,7 +164,8 @@ class RadarExecutor:
                 Reason="Track pointing not ready",
             )
 
-        dwell = self.BuildDwellPlan(task, pointing)
+        profile = self._profile_for_task(task)
+        dwell = self.BuildDwellPlan(task, pointing, profile=profile)
 
         raw = self.Source.ExecuteDwell(dwell)
         self._attach_execution_metadata(
@@ -173,6 +174,7 @@ class RadarExecutor:
             task=task,
             pointing=pointing,
             navigation=navigation,
+            profile=profile,
             execution_time_sec=now,
         )
 
@@ -181,6 +183,7 @@ class RadarExecutor:
                 "RadarExecutor executed "
                 f"{task.TaskType.value} task={task.TaskId} "
                 f"dwell={dwell.DwellId} "
+                f"profile={profile.Name} "
                 f"bearing_true={pointing.BeamBearingTrueDeg:.2f} deg"
             )
 
@@ -199,6 +202,7 @@ class RadarExecutor:
         self,
         task: RadarTask,
         pointing: PointingState,
+        profile: Optional[ExecutionProfile] = None,
     ) -> DwellPlan:
         """
         Build the current fixed-PRI DwellPlan for SEARCH or TRACK.
@@ -206,7 +210,8 @@ class RadarExecutor:
         This deliberately uses the existing uniform dwell helper so the new
         execution architecture remains compatible with RadarProcessor.
         """
-        profile = self._profile_for_task(task)
+        if profile is None:
+            profile = self._profile_for_task(task)
 
         dwell_id = self._allocate_dwell_id()
 
@@ -214,6 +219,15 @@ class RadarExecutor:
             "TaskId": int(task.TaskId),
             "TaskType": task.TaskType.value,
             "WaveformProfileId": str(task.WaveformProfileId),
+            "ExecutionProfileName": str(profile.Name),
+            "ExecutionWaveformId": str(profile.WaveformId),
+            "ExecutionSampleRate": float(profile.SampleRate),
+            "ExecutionNumSamples": int(profile.NumSamples),
+            "ExecutionNumPulses": int(profile.NumPulses),
+            "ExecutionPriSec": float(profile.PriSec),
+            "ExecutionRxAttenuationDb": float(profile.RxAttenuationDb),
+            "ExecutionTxAttenuationDb": float(profile.TxAttenuationDb),
+            "ExecutionSDRProfile": str(profile.SDRProfile),
             "PointingMode": pointing.Mode.value,
             "AntennaAzimuthRelativeDeg": float(
                 pointing.AntennaAzimuthRelativeDeg
@@ -366,6 +380,7 @@ class RadarExecutor:
         task: RadarTask,
         pointing: PointingState,
         navigation: PlatformAttitude,
+        profile: ExecutionProfile,
         execution_time_sec: float,
     ) -> None:
         diagnostics = getattr(raw, "Diagnostics", None)
@@ -379,6 +394,16 @@ class RadarExecutor:
             "TaskType": task.TaskType.value,
             "DwellId": int(dwell.DwellId),
             "ExecutionTimeSec": float(execution_time_sec),
+
+            "ExecutionProfileName": str(profile.Name),
+            "ExecutionWaveformId": str(profile.WaveformId),
+            "ExecutionSampleRate": float(profile.SampleRate),
+            "ExecutionNumSamples": int(profile.NumSamples),
+            "ExecutionNumPulses": int(profile.NumPulses),
+            "ExecutionPriSec": float(profile.PriSec),
+            "ExecutionRxAttenuationDb": float(profile.RxAttenuationDb),
+            "ExecutionTxAttenuationDb": float(profile.TxAttenuationDb),
+            "ExecutionSDRProfile": str(profile.SDRProfile),
 
             "BoresightDeg": float(pointing.BeamBearingTrueDeg),
             "BeamBearingTrueDeg": float(pointing.BeamBearingTrueDeg),
