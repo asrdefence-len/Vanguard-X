@@ -41,6 +41,28 @@ from PointingManager import PointingManager, PointingState
 from NavigationState import PlatformAttitude
 
 
+@dataclass(frozen=True)
+class ExecutionProfile:
+    """
+    Hardware-independent parameters required to execute one radar dwell.
+
+    The profile is selected from the scheduled task and translated into a
+    DwellPlan. Hardware-specific source implementations may later use the
+    SDRProfile field to select Ettus/TRM configuration without changing the
+    scheduler or signal-processing layers.
+    """
+
+    Name: str
+    WaveformId: str
+    SampleRate: float
+    NumSamples: int
+    NumPulses: int
+    PriSec: float
+    RxAttenuationDb: float
+    TxAttenuationDb: float
+    SDRProfile: str = "Default"
+
+
 @dataclass
 class RadarExecutionResult:
     """
@@ -142,7 +164,8 @@ class RadarExecutor:
                 Reason="Track pointing not ready",
             )
 
-        dwell = self.BuildDwellPlan(task, pointing)
+        profile = self._profile_for_task(task)
+        dwell = self.BuildDwellPlan(task, pointing, profile=profile)
 
         raw = self.Source.ExecuteDwell(dwell)
         self._attach_execution_metadata(
@@ -151,6 +174,7 @@ class RadarExecutor:
             task=task,
             pointing=pointing,
             navigation=navigation,
+            profile=profile,
             execution_time_sec=now,
         )
 
@@ -159,6 +183,7 @@ class RadarExecutor:
                 "RadarExecutor executed "
                 f"{task.TaskType.value} task={task.TaskId} "
                 f"dwell={dwell.DwellId} "
+                f"profile={profile.Name} "
                 f"bearing_true={pointing.BeamBearingTrueDeg:.2f} deg"
             )
 
@@ -177,6 +202,7 @@ class RadarExecutor:
         self,
         task: RadarTask,
         pointing: PointingState,
+        profile: Optional[ExecutionProfile] = None,
     ) -> DwellPlan:
         """
         Build the current fixed-PRI DwellPlan for SEARCH or TRACK.
@@ -184,7 +210,8 @@ class RadarExecutor:
         This deliberately uses the existing uniform dwell helper so the new
         execution architecture remains compatible with RadarProcessor.
         """
-        profile = self._profile_for_task(task)
+        if profile is None:
+            profile = self._profile_for_task(task)
 
         dwell_id = self._allocate_dwell_id()
 
@@ -192,6 +219,15 @@ class RadarExecutor:
             "TaskId": int(task.TaskId),
             "TaskType": task.TaskType.value,
             "WaveformProfileId": str(task.WaveformProfileId),
+            "ExecutionProfileName": str(profile.Name),
+            "ExecutionWaveformId": str(profile.WaveformId),
+            "ExecutionSampleRate": float(profile.SampleRate),
+            "ExecutionNumSamples": int(profile.NumSamples),
+            "ExecutionNumPulses": int(profile.NumPulses),
+            "ExecutionPriSec": float(profile.PriSec),
+            "ExecutionRxAttenuationDb": float(profile.RxAttenuationDb),
+            "ExecutionTxAttenuationDb": float(profile.TxAttenuationDb),
+            "ExecutionSDRProfile": str(profile.SDRProfile),
             "PointingMode": pointing.Mode.value,
             "AntennaAzimuthRelativeDeg": float(
                 pointing.AntennaAzimuthRelativeDeg
@@ -235,15 +271,15 @@ class RadarExecutor:
             dwell_id=dwell_id,
             task_id=int(task.TaskId),
             task_type=task.TaskType.value,
-            waveform_id=profile["WaveformId"],
-            sample_rate=float(profile["SampleRate"]),
-            num_samples=int(profile["NumSamples"]),
-            num_pulses=int(profile["NumPulses"]),
-            pri_sec=float(profile["PriSec"]),
+            waveform_id=profile.WaveformId,
+            sample_rate=float(profile.SampleRate),
+            num_samples=int(profile.NumSamples),
+            num_pulses=int(profile.NumPulses),
+            pri_sec=float(profile.PriSec),
             azimuth_deg=float(pointing.BeamBearingTrueDeg),
             elevation_deg=float(pointing.BeamElevationTrueDeg),
-            rx_attenuation_db=float(profile["RxAttenuationDb"]),
-            tx_attenuation_db=float(profile["TxAttenuationDb"]),
+            rx_attenuation_db=float(profile.RxAttenuationDb),
+            tx_attenuation_db=float(profile.TxAttenuationDb),
             metadata=metadata,
         )
 
@@ -261,58 +297,68 @@ class RadarExecutor:
     # Profiles / configuration
     # ------------------------------------------------------------------
 
-    def _profile_for_task(self, task: RadarTask) -> Dict:
+    def _profile_for_task(self, task: RadarTask) -> ExecutionProfile:
         if task.TaskType == RadarTaskType.SEARCH:
-            return {
-                "WaveformId": self.Config.get(
+            return ExecutionProfile(
+                Name="Search",
+                WaveformId=self.Config.get(
                     "SearchWaveformId",
                     "Frank10",
                 ),
-                "SampleRate": self.Config["SampleRate"],
-                "NumSamples": self.Config["NumSamples"],
-                "NumPulses": self.Config["NumPulses"],
-                "PriSec": self.Config["PRI"],
-                "RxAttenuationDb": self.Config.get(
+                SampleRate=float(self.Config["SampleRate"]),
+                NumSamples=int(self.Config["NumSamples"]),
+                NumPulses=int(self.Config["NumPulses"]),
+                PriSec=float(self.Config["PRI"]),
+                RxAttenuationDb=float(self.Config.get(
                     "TRMRxAttenuationDb",
                     0.0,
-                ),
-                "TxAttenuationDb": self.Config.get(
+                )),
+                TxAttenuationDb=float(self.Config.get(
                     "TRMTxAttenuationDb",
                     31.5,
-                ),
-            }
+                )),
+                SDRProfile=str(self.Config.get(
+                    "SearchSDRProfile",
+                    "Default",
+                )),
+            )
 
         if task.TaskType == RadarTaskType.TRACK:
-            return {
-                "WaveformId": self.Config.get(
+            return ExecutionProfile(
+                Name="Track",
+                WaveformId=self.Config.get(
                     "TrackWaveformId",
                     self.Config.get("SearchWaveformId", "Barker13"),
                 ),
-                "SampleRate": self.Config.get(
+                SampleRate=float(self.Config.get(
                     "TrackSampleRate",
                     self.Config["SampleRate"],
-                ),
-                "NumSamples": self.Config.get(
+                )),
+                NumSamples=int(self.Config.get(
                     "TrackNumSamples",
                     self.Config["NumSamples"],
-                ),
-                "NumPulses": self.Config.get(
+                )),
+                NumPulses=int(self.Config.get(
                     "TrackNumPulses",
                     self.Config["NumPulses"],
-                ),
-                "PriSec": self.Config.get(
+                )),
+                PriSec=float(self.Config.get(
                     "TrackPRI",
                     self.Config["PRI"],
-                ),
-                "RxAttenuationDb": self.Config.get(
+                )),
+                RxAttenuationDb=float(self.Config.get(
                     "TrackRxAttenuationDb",
                     self.Config.get("TRMRxAttenuationDb", 0.0),
-                ),
-                "TxAttenuationDb": self.Config.get(
+                )),
+                TxAttenuationDb=float(self.Config.get(
                     "TrackTxAttenuationDb",
                     self.Config.get("TRMTxAttenuationDb", 31.5),
-                ),
-            }
+                )),
+                SDRProfile=str(self.Config.get(
+                    "TrackSDRProfile",
+                    self.Config.get("SearchSDRProfile", "Default"),
+                )),
+            )
 
         raise ValueError(
             f"No execution profile for task type {task.TaskType.value}"
@@ -334,6 +380,7 @@ class RadarExecutor:
         task: RadarTask,
         pointing: PointingState,
         navigation: PlatformAttitude,
+        profile: ExecutionProfile,
         execution_time_sec: float,
     ) -> None:
         diagnostics = getattr(raw, "Diagnostics", None)
@@ -347,6 +394,16 @@ class RadarExecutor:
             "TaskType": task.TaskType.value,
             "DwellId": int(dwell.DwellId),
             "ExecutionTimeSec": float(execution_time_sec),
+
+            "ExecutionProfileName": str(profile.Name),
+            "ExecutionWaveformId": str(profile.WaveformId),
+            "ExecutionSampleRate": float(profile.SampleRate),
+            "ExecutionNumSamples": int(profile.NumSamples),
+            "ExecutionNumPulses": int(profile.NumPulses),
+            "ExecutionPriSec": float(profile.PriSec),
+            "ExecutionRxAttenuationDb": float(profile.RxAttenuationDb),
+            "ExecutionTxAttenuationDb": float(profile.TxAttenuationDb),
+            "ExecutionSDRProfile": str(profile.SDRProfile),
 
             "BoresightDeg": float(pointing.BeamBearingTrueDeg),
             "BeamBearingTrueDeg": float(pointing.BeamBearingTrueDeg),
