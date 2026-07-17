@@ -26,6 +26,7 @@ from WaveformLibrary import WaveformLibrary
 def main():
     config = {
         "SampleRate": 2.0e6,
+	"EttusSampleRateHz":2.0e6,
         "NumSamples": 512,
         "NumPulses": 16,
         "PRI": 1.0e-3,
