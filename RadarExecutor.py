@@ -303,7 +303,7 @@ class RadarExecutor:
                 Name="Search",
                 WaveformId=self.Config.get(
                     "SearchWaveformId",
-                    "Frank10",
+                    "Frank10_20MHz",
                 ),
                 SampleRate=float(self.Config["EttusSampleRateHz"]),
                 NumSamples=int(self.Config["NumSamples"]),
@@ -328,7 +328,10 @@ class RadarExecutor:
                 Name="Track",
                 WaveformId=self.Config.get(
                     "TrackWaveformId",
-                    self.Config.get("SearchWaveformId", "Barker13"),
+                    self.Config.get(
+                        "SearchWaveformId",
+                        "Barker13_20MHz",
+                    ),
                 ),
                 SampleRate=float(self.Config["EttusSampleRateHz"]),
                 NumSamples=int(self.Config.get(

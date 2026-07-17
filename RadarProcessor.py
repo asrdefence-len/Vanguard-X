@@ -60,11 +60,16 @@ class RadarProcessor:
         """
         Build/cache the FFT of the matched filter for linear convolution.
         """
-        CodeLength = len(TxWaveform)
-        FullLength = NumSamples + CodeLength - 1
+        SampledWaveformLength = len(TxWaveform)
+        FullLength = NumSamples + SampledWaveformLength - 1
         Nfft = self._NextPowerOfTwo(FullLength)
 
-        CacheKey = (WaveformName, NumSamples, CodeLength, Nfft)
+        CacheKey = (
+            WaveformName,
+            NumSamples,
+            SampledWaveformLength,
+            Nfft,
+        )
         Cached = self._FilterCache.get(CacheKey)
         if Cached is not None:
             return Cached
@@ -72,12 +77,13 @@ class RadarProcessor:
         MatchedFilter = np.conj(TxWaveform[::-1]).astype(np.complex64)
 
         FilterPadded = np.zeros(Nfft, dtype=np.complex64)
-        FilterPadded[:CodeLength] = MatchedFilter
+        FilterPadded[:SampledWaveformLength] = MatchedFilter
         MatchedFilterFft = np.fft.fft(FilterPadded).astype(np.complex64)
 
         # np.convolve(..., mode="same") is the centred part of the full linear
-        # convolution. For NumSamples >= CodeLength this is the matching slice.
-        SameStart = (CodeLength - 1) // 2
+        # convolution. For NumSamples >= SampledWaveformLength this is the
+        # matching slice.
+        SameStart = (SampledWaveformLength - 1) // 2
         SameEnd = SameStart + NumSamples
 
         Cached = (MatchedFilterFft, Nfft, SameStart, SameEnd)
@@ -198,7 +204,15 @@ class RadarProcessor:
 
         WaveformName, PRI = self._ValidateUniformPriPlan(ThisDwell)
         TxWaveform = self.TheWaveformLibrary.Get(WaveformName)
-        CodeLength = len(TxWaveform)
+        WaveformMetadata = self.TheWaveformLibrary.GetMetadata(WaveformName)
+        ChipCount = int(WaveformMetadata["ChipCount"])
+        SampledWaveformLength = int(WaveformMetadata["NumSamples"])
+
+        if len(TxWaveform) != SampledWaveformLength:
+            raise ValueError(
+                f"Waveform metadata/sample mismatch for {WaveformName}: "
+                f"metadata={SampledWaveformLength}, samples={len(TxWaveform)}"
+            )
 
         NumPulses = Raw.IQ.shape[0]
         NumSamples = Raw.IQ.shape[1]
@@ -233,7 +247,9 @@ class RadarProcessor:
         PeakRangeM = float(RangeAxisM[PeakRangeBin])
         PeakDopplerHz = float(DopplerAxisHz[PeakDopplerBin])
         PeakVelocityMps = float(VelocityAxisMps[PeakDopplerBin])
-        IdealProcessingGainDb = 10.0 * np.log10(CodeLength)
+        IdealProcessingGainDb = (
+            self.TheWaveformLibrary.GetIdealProcessingGainDb(WaveformName)
+        )
 
         Diagnostics = {
             "ProcessingMode": "UNIFORM_PRI_FFT",
@@ -244,7 +260,17 @@ class RadarProcessor:
             ),
             "WaveformId": WaveformName,
             "NominalPriSec": PRI,
-            "CodeLength": CodeLength,
+            # CodeLength is retained for compatibility and now unambiguously
+            # means phase-code chip count. Matched-filter length is recorded
+            # separately in complex samples.
+            "CodeLength": ChipCount,
+            "ChipCount": ChipCount,
+            "ChipRateHz": float(WaveformMetadata["ChipRateHz"]),
+            "SamplesPerChip": int(WaveformMetadata["SamplesPerChip"]),
+            "SampledWaveformLength": SampledWaveformLength,
+            "PulseDurationSec": float(
+                WaveformMetadata["PulseDurationSec"]
+            ),
             "IdealProcessingGainDb": IdealProcessingGainDb,
             "PeakRangeBin": int(PeakRangeBin),
             "PeakDopplerBin": int(PeakDopplerBin),

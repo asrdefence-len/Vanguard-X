@@ -388,8 +388,8 @@ def Main():
 
         # Initial pulse-plan architecture. Search and track waveform selectors
         # are separate even though only SEARCH is scheduled in this version.
-        "SearchWaveformId": "Frank10",
-        "TrackWaveformId": "Barker13",
+        "SearchWaveformId": "Frank10_20MHz",
+        "TrackWaveformId": "Barker13_20MHz",
 
         # RF parameters
         "RfFrequency": 9.4e9,
