@@ -117,21 +117,6 @@ def ClampDeg(Value, MinValue, MaxValue):
     return max(float(MinValue), min(float(MaxValue), float(Value)))
 
 
-def EndpointDirectionDeg(TargetDeg, CurrentDeg):
-    """
-    Return direction to move from CurrentDeg to TargetDeg for non-wrapping
-    Vanguard PTZ physical angles.
-    """
-    Delta = float(TargetDeg) - float(CurrentDeg)
-
-    if abs(Delta) < 0.05:
-        return 0
-
-    return 1 if Delta > 0.0 else -1
-
-
-def ReachedEndpoint(CurrentDeg, TargetDeg, ToleranceDeg):
-    return abs(float(CurrentDeg) - float(TargetDeg)) <= float(ToleranceDeg)
 
 
 def GetControlledBoresightDeg(Display, ScanBoresightDeg, ControlState=None):
@@ -239,38 +224,6 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
 
 
 
-class ExternalPointingAdapter:
-    """Read-only PTZ view used during the Stage 3B migration.
-
-    The proven main-loop X6-60 scan state machine remains the sole command
-    owner in this stage. PointingManager may inspect the latest measured state,
-    but commands issued through this adapter are intentionally ignored. This
-    prevents two independent scan controllers from fighting at sector edges.
-    """
-
-    def __init__(self, initial_azimuth_deg=0.0, initial_elevation_deg=0.0):
-        self.WrapMode = False
-        self._state = type("ExternalPointingState", (), {})()
-        self._state.AzimuthDeg = float(initial_azimuth_deg)
-        self._state.ElevationDeg = float(initial_elevation_deg)
-        self._state.PanRateDegPerSec = 0.0
-        self._state.Valid = True
-        self._state.Source = "EXTERNAL_POINTING"
-
-    def SetMeasuredState(self, state):
-        self._state = state
-
-    def Update(self):
-        return self._state
-
-    def CommandSlew(self, rate_deg_per_sec, tilt_rate_deg_per_sec=0.0):
-        return None
-
-    def SetPanPositionNative(self, target_deg):
-        return None
-
-    def Stop(self):
-        return None
 
 
 def ExecuteRadarDwell(
@@ -299,9 +252,8 @@ def ExecuteRadarDwell(
 ):
     """Execute one scheduled dwell and preserve the processing chain.
 
-    RadarExecutor owns DwellPlan construction and source execution. During this
-    migration stage the legacy main-loop scan controller remains the sole owner
-    of X6-60 movement; PointingManager receives a read-only measured-state view.
+    RadarExecutor owns DwellPlan construction and source execution.
+    PointingManager is the sole owner of continuous X6-60 search-scan movement.
     """
 
     T0 = time.perf_counter()
@@ -324,11 +276,16 @@ def ExecuteRadarDwell(
     Raw = ExecutionResult.Raw
     ThisDwell = ExecutionResult.Dwell
 
-    # The executor obtains the same measured X6-60 state through the read-only
-    # adapter. Preserve operator context without mutating core DwellPlan fields.
-    ThisDwell.Metadata["ScanCycle"] = int(ScanCycle)
+    EffectiveScanCycle = (
+        int(ExecutionResult.Pointing.SearchCycle)
+        if ExecutionResult.Pointing.SearchCycle is not None
+        else int(ScanCycle)
+    )
+
+    # Preserve operator context without mutating core DwellPlan fields.
+    ThisDwell.Metadata["ScanCycle"] = EffectiveScanCycle
     ThisDwell.Metadata["DisplayMode"] = str(DisplayMode)
-    ThisDwell.Metadata["ExternalPointingControl"] = True
+    ThisDwell.Metadata["PointingControlOwner"] = "PointingManager"
 
     Processed = Processor.Process(Raw, ThisDwell)
     T2 = time.perf_counter()
@@ -345,7 +302,7 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["PTZValid"] = bool(PtzValid)
     Processed.Diagnostics["PTZSource"] = str(PtzSource)
     Processed.Diagnostics["PTZAtTarget"] = bool(PtzAtTarget)
-    Processed.Diagnostics["ScanCycle"] = int(ScanCycle)
+    Processed.Diagnostics["ScanCycle"] = EffectiveScanCycle
     Processed.Diagnostics["ScheduledTaskId"] = int(ScheduledTask.TaskId)
     Processed.Diagnostics["ScheduledTaskType"] = str(ScheduledTask.TaskType)
     Processed.Diagnostics["ScheduledWaveformProfileId"] = str(
@@ -377,6 +334,7 @@ def ExecuteRadarDwell(
         "WaitingForPointing": False,
         "Reason": "",
         "Pointing": ExecutionResult.Pointing,
+        "ScanCycle": EffectiveScanCycle,
         "Dwell": ThisDwell,
         "Processed": Processed,
         "Detections": Detections,
@@ -659,13 +617,6 @@ def Main():
 
     CurrentScanBoresightDeg = float(Config.get("InitialBeamAngleDeg", Config.get("BoresightDeg", 0.0)))
     CurrentScanBoresightDeg = max(min(CurrentScanBoresightDeg, ScanStopDeg), ScanStartDeg)
-    ScanDirection = 1.0
-
-    # PTZ scan state. These must be initialised before the main loop.
-    ActivePtzScanTargetDeg = None
-    ActivePtzScanTargetName = None  # 'start' or 'stop'
-    LastPtzScanReverseTimeSec = 0.0
-
     LastManualNudgeCommandId = 0
     LastStopCommandId = 0
     PtzStopped = False
@@ -677,25 +628,19 @@ def Main():
     # -------------------------------------------------------------------------
     # Radar operating-system architecture
     #
-    # Stage 3B:
-    # RadarScheduler selects the high-level task and RadarExecutor constructs
-    # and executes each dwell. The proven main-loop X6-60 scan controller is
-    # temporarily retained as the sole movement-command owner. PointingManager
-    # receives measured state through ExternalPointingAdapter and cannot issue
-    # competing motor commands.
+    # Stage 3C.1:
+    # RadarScheduler selects the high-level task, RadarExecutor constructs and
+    # executes each dwell, and PointingManager is the sole owner of continuous
+    # X6-60 search-scan movement and endpoint reversal. STOP and manual nudge
+    # remain in Main temporarily for the later Stage 3C.2/3C.3 migrations.
     # -------------------------------------------------------------------------
 
     Navigation = SimulatedNavigationSource(
         initial_heading_deg=0.0,
     )
 
-    PointingAdapter = ExternalPointingAdapter(
-        initial_azimuth_deg=float(Config.get("InitialBeamAngleDeg", 0.0)),
-        initial_elevation_deg=float(Config.get("AntennaElDeg", 0.0)),
-    )
-
     Pointing = PointingManager(
-        ptz=PointingAdapter,
+        ptz=Ptz,
         left_limit_deg=float(Config.get("PTZLeftLimitDeg", 10.0)),
         right_limit_deg=float(Config.get("PTZRightLimitDeg", 300.0)),
         endpoint_margin_deg=float(
@@ -787,14 +732,6 @@ def Main():
 
                 ScanJustStarted = bool(ScanEnabled and not PreviousScanEnabled)
 
-                # Defensive PTZ scan-state initialisation.
-                if 'ActivePtzScanTargetDeg' not in locals():
-                    ActivePtzScanTargetDeg = None
-                if 'ActivePtzScanTargetName' not in locals():
-                    ActivePtzScanTargetName = None
-                if 'LastPtzScanReverseTimeSec' not in locals():
-                    LastPtzScanReverseTimeSec = 0.0
-
                 # -------------------------------------------------------------
                 # Timed radar dwell scheduler.
                 #
@@ -820,8 +757,6 @@ def Main():
                             Ptz.Stop()
                         except Exception:
                             pass
-                        ActivePtzScanTargetDeg = None
-                        ActivePtzScanTargetName = None
 
                     LastScanEnabled = bool(ScanEnabled)
                     LastDisplayMode = str(DisplayMode)
@@ -843,20 +778,11 @@ def Main():
                 LastRadarDwellTimeSec = NowDwellSec
 
                 # -------------------------------------------------------------
-                # PTZ control: simple proven scan state machine.
+                # PTZ / X6-60 state and temporary non-scan controls.
                 #
-                # SCAN:
-                #   - Determine active endpoint.
-                #   - Send one Pelco slew command toward that endpoint.
-                #   - Query PTZ position at PTZQueryIntervalSec inside Ptz.Update().
-                #   - Reverse when measured position crosses endpoint margin.
-                #
-                # STARE:
-                #   - No scan slew. Radar dwells continue at current/latest PTZ
-                #     angle.
-                #
-                # STOP:
-                #   - Send Stop once on transition and skip radar dwells.
+                # Continuous SCAN commands and endpoint reversal are now owned
+                # exclusively by PointingManager. Main still reads measured
+                # state and temporarily retains manual nudge and idle STOP.
                 # -------------------------------------------------------------
 
                 PtzValid = False
@@ -867,18 +793,14 @@ def Main():
 
                 if Ptz is not None:
                     try:
-                        EndpointMarginDeg = float(Config.get("PTZScanEndpointMarginDeg", 1.0))
-                        ScanSlewRateDegPerSec = float(Config.get("PTZScanSlewRateDegPerSec", 14.0))
-
                         # Query/update position. This is throttled inside PTZController.
                         PtzState = Ptz.Update()
-                        PointingAdapter.SetMeasuredState(PtzState)
                         PtzAzDeg = float(PtzState.AzimuthDeg)
                         PtzRateDegPerSec = float(PtzState.PanRateDegPerSec)
                         PtzValid = bool(PtzState.Valid)
                         PtzSource = str(PtzState.Source)
 
-                        # Manual nudge event, if the display generated one.
+                        # Manual nudge remains in Main until Stage 3C.3.
                         ManualNudgeCommandId = None
                         ManualNudgeDeltaDeg = 0.0
                         if ControlState is not None:
@@ -893,8 +815,6 @@ def Main():
                             and ManualNudgeCommandId != Main._LastConsumedNudgeId
                             and abs(ManualNudgeDeltaDeg) > 0.0
                         ):
-                            ActivePtzScanTargetDeg = None
-                            ActivePtzScanTargetName = None
                             Main._LastConsumedNudgeId = ManualNudgeCommandId
 
                             TargetDeg = ClampDeg(
@@ -905,51 +825,8 @@ def Main():
 
                             Ptz.SetPanPositionNative(TargetDeg)
 
-                        elif DisplayMode == "SCAN" and ScanEnabled:
-                            if ScanJustStarted or ActivePtzScanTargetName is None:
-                                ActivePtzScanTargetName = "stop"
-                                ActivePtzScanTargetDeg = float(ScanStopDeg)
-                                print(f"PTZ scan start: {ScanStartDeg:.2f} -> {ScanStopDeg:.2f}")
-
-                            if PtzValid:
-                                if ActivePtzScanTargetName == "stop":
-                                    if ScanStopDeg >= ScanStartDeg:
-                                        Reached = PtzAzDeg >= (ScanStopDeg - EndpointMarginDeg)
-                                    else:
-                                        Reached = PtzAzDeg <= (ScanStopDeg + EndpointMarginDeg)
-
-                                    if Reached:
-                                        ActivePtzScanTargetName = "start"
-                                        ActivePtzScanTargetDeg = float(ScanStartDeg)
-                                        ScanCycle += 1
-                                        print(f"PTZ scan reverse: target=start {ScanStartDeg:.2f}, cycle={ScanCycle}")
-
-                                elif ActivePtzScanTargetName == "start":
-                                    if ScanStartDeg >= ScanStopDeg:
-                                        Reached = PtzAzDeg >= (ScanStartDeg - EndpointMarginDeg)
-                                    else:
-                                        Reached = PtzAzDeg <= (ScanStartDeg + EndpointMarginDeg)
-
-                                    if Reached:
-                                        ActivePtzScanTargetName = "stop"
-                                        ActivePtzScanTargetDeg = float(ScanStopDeg)
-                                        ScanCycle += 1
-                                        print(f"PTZ scan reverse: target=stop {ScanStopDeg:.2f}, cycle={ScanCycle}")
-
-                            DirectionToTarget = EndpointDirectionDeg(ActivePtzScanTargetDeg, PtzAzDeg)
-
-                            if DirectionToTarget > 0:
-                                Ptz.CommandSlew(+ScanSlewRateDegPerSec, 0.0)
-                                ScanDirection = 1.0
-                            elif DirectionToTarget < 0:
-                                Ptz.CommandSlew(-ScanSlewRateDegPerSec, 0.0)
-                                ScanDirection = -1.0
-
-                        else:
-                            # STOP or idle. Send stop only on transition into idle.
-                            ActivePtzScanTargetDeg = None
-                            ActivePtzScanTargetName = None
-
+                        elif not (DisplayMode == "SCAN" and ScanEnabled):
+                            # Idle/STARE stop remains in Main until Stage 3C.2.
                             if LastDisplayMode != "STOP" or LastScanEnabled:
                                 Ptz.Stop()
 
@@ -1035,12 +912,30 @@ def Main():
                     print_scene_returns(SceneReturns, BoresightDeg)
 
                 # -------------------------------------------------------------
-                # Stage 3B: RadarScheduler selects the task. RadarExecutor will
-                # build the DwellPlan and execute the source using the latest
-                # externally measured pointing state.
+                # Stage 3C.1: RadarScheduler selects the task. RadarExecutor
+                # executes it, while PointingManager owns continuous scan slew
+                # and endpoint reversal through the real X6-60 controller.
                 # -------------------------------------------------------------
 
                 NavigationAttitude = Navigation.get_attitude()
+
+                # Keep the persistent scheduler search task aligned with the
+                # operator-selected sector and scan rate.
+                SearchTask.Sector.StartDeg = float(ScanStartDeg)
+                SearchTask.Sector.StopDeg = float(ScanStopDeg)
+                SearchTask.Sector.ScanRateDegPerSec = abs(
+                    float(Config.get("PTZScanSlewRateDegPerSec", 14.0))
+                )
+
+                # STOP is still issued directly by Main in Stage 3C.1. Reissue
+                # the search command on a new SCAN transition so stop/start
+                # remains functional even though the executor task ID is stable.
+                if ScanJustStarted:
+                    print(
+                        f"PointingManager scan start: "
+                        f"{ScanStartDeg:.2f} -> {ScanStopDeg:.2f}"
+                    )
+                    Pointing.ActivateTask(SearchTask, NavigationAttitude)
 
                 ScheduledTask = Scheduler.GetNextTask(
                     current_time_sec=NowDwellSec,
@@ -1087,6 +982,7 @@ def Main():
                     time.sleep(0.002)
                     continue
 
+                ScanCycle = int(DwellResult["ScanCycle"])
                 ThisDwell = DwellResult["Dwell"]
                 Processed = DwellResult["Processed"]
                 Detections = DwellResult["Detections"]
@@ -1152,9 +1048,9 @@ def Main():
                 # Update scan limits from display/operator controls.
                 #
                 # IMPORTANT:
-                # Do not free-run CurrentScanBoresightDeg here. PTZ scan targets
-                # are advanced above only after the real PTZ reaches the current
-                # target. This keeps display, radar boresight and PTZ aligned.
+                # Do not free-run CurrentScanBoresightDeg here. PointingManager
+                # advances the search sector only after measured X6-60 pointing
+                # reaches or crosses the active endpoint.
                 # -------------------------------------------------------------
 
                 ScanStartDeg = float(Config.get("ScanStartDeg", ScanStartDeg))
