@@ -499,6 +499,14 @@ class PointingManager:
         navigation: PlatformAttitude,
         beam_true_deg: float,
     ) -> None:
+        """Reverse search only when the measured beam reaches or crosses the
+        active endpoint.
+
+        The crossing decision is based on measured motion, not
+        SearchSector.Direction.  SearchSector.Direction describes logical
+        movement between START and STOP; it is not necessarily the physical
+        sign of antenna motion when StartDeg is greater than StopDeg.
+        """
         sector = task.Sector
 
         try:
@@ -508,41 +516,51 @@ class PointingManager:
             ptz_state = self.Ptz.Update()
             relative_az = float(ptz_state.AzimuthDeg)
 
-        sector.LastMeasuredAzimuthDeg = (
-            beam_true_deg
+        measured = (
+            wrap360(beam_true_deg)
             if sector.Frame == AngleFrame.TRUE
-            else relative_az
+            else (wrap360(relative_az) if self.PtzWrapMode else relative_az)
+        )
+        previous = sector.LastMeasuredAzimuthDeg
+        sector.LastMeasuredAzimuthDeg = measured
+
+        target = (
+            wrap360(sector.ActiveEndpointDeg)
+            if sector.Frame == AngleFrame.TRUE or self.PtzWrapMode
+            else float(sector.ActiveEndpointDeg)
         )
 
-        reached = False
-
-        if sector.Frame == AngleFrame.TRUE:
-            target = wrap360(sector.ActiveEndpointDeg)
-            error = signed_angle_delta_deg(target, beam_true_deg)
-            reached = abs(error) <= self.EndpointMarginDeg
-
-            # Crossing test in the commanded direction.
-            if sector.Direction > 0 and error < 0.0:
-                reached = True
-            elif sector.Direction < 0 and error > 0.0:
-                reached = True
+        if sector.Frame == AngleFrame.TRUE or self.PtzWrapMode:
+            error = signed_angle_delta_deg(target, measured)
         else:
-            target = wrap360(sector.ActiveEndpointDeg)
+            error = target - measured
 
-            if not self.PtzWrapMode:
-                error = target - relative_az
+        reached = abs(error) <= self.EndpointMarginDeg
+
+        if not reached and previous is not None:
+            if sector.Frame == AngleFrame.TRUE or self.PtzWrapMode:
+                motion = signed_angle_delta_deg(measured, previous)
+                previous_error = signed_angle_delta_deg(target, previous)
             else:
-                error = signed_angle_delta_deg(target, relative_az)
+                motion = measured - previous
+                previous_error = target - previous
 
-            reached = abs(error) <= self.EndpointMarginDeg
+            motion_epsilon = 0.01
 
-            if sector.Direction > 0 and error < 0.0:
-                reached = True
-            elif sector.Direction < 0 and error > 0.0:
-                reached = True
+            # The endpoint was crossed only when the measured antenna was
+            # moving toward it and the target error changed sign.
+            if motion > motion_epsilon:
+                reached = previous_error > 0.0 and error <= 0.0
+            elif motion < -motion_epsilon:
+                reached = previous_error < 0.0 and error >= 0.0
 
         if reached:
             sector.Reverse()
+
+            # Reset the crossing history for the new endpoint. Otherwise the
+            # final sample from the previous leg can be interpreted as motion
+            # across the newly selected endpoint.
+            sector.LastMeasuredAzimuthDeg = measured
             self._command_search_slew(task, navigation)
 
             if self.Debug:
