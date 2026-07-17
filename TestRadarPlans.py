@@ -30,7 +30,7 @@ def main():
         dwell_id=1,
         task_id=1,
         task_type="SEARCH",
-        waveform_id="Barker13",
+        waveform_id="Barker13_20MHz",
         sample_rate=config["SampleRate"],
         num_samples=config["NumSamples"],
         num_pulses=config["NumPulses"],
@@ -38,9 +38,9 @@ def main():
     )
 
     assert plan.NumPulses == 16
-    assert plan.WaveformName == "Barker13"
+    assert plan.WaveformName == "Barker13_20MHz"
     assert np.isclose(plan.PRI, 1e-3)
-    assert all(p.WaveformId == "Barker13" for p in plan.PulsePlans)
+    assert all(p.WaveformId == "Barker13_20MHz" for p in plan.PulsePlans)
 
     waveforms = WaveformLibrary(config)
     waveforms.LoadDefaultWaveforms()
@@ -53,7 +53,7 @@ def main():
     assert raw.IQ.shape == (16, 512)
     assert raw.PulseTimesSec.shape == (16,)
     assert raw.PulsePriSec.shape == (16,)
-    assert raw.PulseWaveformIds == ["Barker13"] * 16
+    assert raw.PulseWaveformIds == ["Barker13_20MHz"] * 16
     assert processed.RangeDopplerMap.shape == (16, 512)
     assert processed.Diagnostics["ProcessingMode"] == "UNIFORM_PRI_FFT"
 

@@ -25,13 +25,13 @@ from WaveformLibrary import WaveformLibrary
 
 def main():
     config = {
-        "SampleRate": 2.0e6,
-	"EttusSampleRateHz":2.0e6,
-        "NumSamples": 512,
+        "SampleRate": 40.0e6,
+        "EttusSampleRateHz": 40.0e6,
+        "NumSamples": 4096,
         "NumPulses": 16,
         "PRI": 1.0e-3,
-        "SearchWaveformId": "Barker13",
-        "TrackWaveformId": "Frank10",
+        "SearchWaveformId": "Barker13_20MHz",
+        "TrackWaveformId": "Frank10_20MHz",
         "TrackNumPulses": 16,
         "TrackPRI": 1.0e-3,
         "RfFrequency": 9.4e9,
