@@ -41,6 +41,28 @@ from PointingManager import PointingManager, PointingState
 from NavigationState import PlatformAttitude
 
 
+@dataclass(frozen=True)
+class ExecutionProfile:
+    """
+    Hardware-independent parameters required to execute one radar dwell.
+
+    The profile is selected from the scheduled task and translated into a
+    DwellPlan. Hardware-specific source implementations may later use the
+    SDRProfile field to select Ettus/TRM configuration without changing the
+    scheduler or signal-processing layers.
+    """
+
+    Name: str
+    WaveformId: str
+    SampleRate: float
+    NumSamples: int
+    NumPulses: int
+    PriSec: float
+    RxAttenuationDb: float
+    TxAttenuationDb: float
+    SDRProfile: str = "Default"
+
+
 @dataclass
 class RadarExecutionResult:
     """
@@ -235,15 +257,15 @@ class RadarExecutor:
             dwell_id=dwell_id,
             task_id=int(task.TaskId),
             task_type=task.TaskType.value,
-            waveform_id=profile["WaveformId"],
-            sample_rate=float(profile["SampleRate"]),
-            num_samples=int(profile["NumSamples"]),
-            num_pulses=int(profile["NumPulses"]),
-            pri_sec=float(profile["PriSec"]),
+            waveform_id=profile.WaveformId,
+            sample_rate=float(profile.SampleRate),
+            num_samples=int(profile.NumSamples),
+            num_pulses=int(profile.NumPulses),
+            pri_sec=float(profile.PriSec),
             azimuth_deg=float(pointing.BeamBearingTrueDeg),
             elevation_deg=float(pointing.BeamElevationTrueDeg),
-            rx_attenuation_db=float(profile["RxAttenuationDb"]),
-            tx_attenuation_db=float(profile["TxAttenuationDb"]),
+            rx_attenuation_db=float(profile.RxAttenuationDb),
+            tx_attenuation_db=float(profile.TxAttenuationDb),
             metadata=metadata,
         )
 
@@ -261,58 +283,68 @@ class RadarExecutor:
     # Profiles / configuration
     # ------------------------------------------------------------------
 
-    def _profile_for_task(self, task: RadarTask) -> Dict:
+    def _profile_for_task(self, task: RadarTask) -> ExecutionProfile:
         if task.TaskType == RadarTaskType.SEARCH:
-            return {
-                "WaveformId": self.Config.get(
+            return ExecutionProfile(
+                Name="Search",
+                WaveformId=self.Config.get(
                     "SearchWaveformId",
                     "Frank10",
                 ),
-                "SampleRate": self.Config["SampleRate"],
-                "NumSamples": self.Config["NumSamples"],
-                "NumPulses": self.Config["NumPulses"],
-                "PriSec": self.Config["PRI"],
-                "RxAttenuationDb": self.Config.get(
+                SampleRate=float(self.Config["SampleRate"]),
+                NumSamples=int(self.Config["NumSamples"]),
+                NumPulses=int(self.Config["NumPulses"]),
+                PriSec=float(self.Config["PRI"]),
+                RxAttenuationDb=float(self.Config.get(
                     "TRMRxAttenuationDb",
                     0.0,
-                ),
-                "TxAttenuationDb": self.Config.get(
+                )),
+                TxAttenuationDb=float(self.Config.get(
                     "TRMTxAttenuationDb",
                     31.5,
-                ),
-            }
+                )),
+                SDRProfile=str(self.Config.get(
+                    "SearchSDRProfile",
+                    "Default",
+                )),
+            )
 
         if task.TaskType == RadarTaskType.TRACK:
-            return {
-                "WaveformId": self.Config.get(
+            return ExecutionProfile(
+                Name="Track",
+                WaveformId=self.Config.get(
                     "TrackWaveformId",
                     self.Config.get("SearchWaveformId", "Barker13"),
                 ),
-                "SampleRate": self.Config.get(
+                SampleRate=float(self.Config.get(
                     "TrackSampleRate",
                     self.Config["SampleRate"],
-                ),
-                "NumSamples": self.Config.get(
+                )),
+                NumSamples=int(self.Config.get(
                     "TrackNumSamples",
                     self.Config["NumSamples"],
-                ),
-                "NumPulses": self.Config.get(
+                )),
+                NumPulses=int(self.Config.get(
                     "TrackNumPulses",
                     self.Config["NumPulses"],
-                ),
-                "PriSec": self.Config.get(
+                )),
+                PriSec=float(self.Config.get(
                     "TrackPRI",
                     self.Config["PRI"],
-                ),
-                "RxAttenuationDb": self.Config.get(
+                )),
+                RxAttenuationDb=float(self.Config.get(
                     "TrackRxAttenuationDb",
                     self.Config.get("TRMRxAttenuationDb", 0.0),
-                ),
-                "TxAttenuationDb": self.Config.get(
+                )),
+                TxAttenuationDb=float(self.Config.get(
                     "TrackTxAttenuationDb",
                     self.Config.get("TRMTxAttenuationDb", 31.5),
-                ),
-            }
+                )),
+                SDRProfile=str(self.Config.get(
+                    "TrackSDRProfile",
+                    self.Config.get("SearchSDRProfile", "Default"),
+                )),
+            )
 
         raise ValueError(
             f"No execution profile for task type {task.TaskType.value}"
