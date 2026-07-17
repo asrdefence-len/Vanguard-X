@@ -628,11 +628,11 @@ def Main():
     # -------------------------------------------------------------------------
     # Radar operating-system architecture
     #
-    # Stage 3C.1:
+    # Stage 3C.2:
     # RadarScheduler selects the high-level task, RadarExecutor constructs and
-    # executes each dwell, and PointingManager is the sole owner of continuous
-    # X6-60 search-scan movement and endpoint reversal. STOP and manual nudge
-    # remain in Main temporarily for the later Stage 3C.2/3C.3 migrations.
+    # executes each dwell, and PointingManager owns continuous search movement,
+    # endpoint reversal, and STOP handling. Manual nudge remains in Main until
+    # Stage 3C.3.
     # -------------------------------------------------------------------------
 
     Navigation = SimulatedNavigationSource(
@@ -730,7 +730,11 @@ def Main():
                     DisplayMode = "STOP"
                     ScanEnabled = False
 
-                ScanJustStarted = bool(ScanEnabled and not PreviousScanEnabled)
+                ScanJustStarted = bool(
+                    DisplayMode == "SCAN"
+                    and ScanEnabled
+                    and not (LastDisplayMode == "SCAN" and PreviousScanEnabled)
+                )
 
                 # -------------------------------------------------------------
                 # Timed radar dwell scheduler.
@@ -754,7 +758,7 @@ def Main():
                     # do not wait for the next dwell slot.
                     if Ptz is not None and (LastDisplayMode != "STOP" or LastScanEnabled):
                         try:
-                            Ptz.Stop()
+                            Pointing.Stop()
                         except Exception:
                             pass
 
@@ -780,9 +784,9 @@ def Main():
                 # -------------------------------------------------------------
                 # PTZ / X6-60 state and temporary non-scan controls.
                 #
-                # Continuous SCAN commands and endpoint reversal are now owned
-                # exclusively by PointingManager. Main still reads measured
-                # state and temporarily retains manual nudge and idle STOP.
+                # Continuous SCAN commands, endpoint reversal, and STOP are now
+                # owned exclusively by PointingManager. Main still reads measured
+                # state and temporarily retains manual nudge until Stage 3C.3.
                 # -------------------------------------------------------------
 
                 PtzValid = False
@@ -826,9 +830,10 @@ def Main():
                             Ptz.SetPanPositionNative(TargetDeg)
 
                         elif not (DisplayMode == "SCAN" and ScanEnabled):
-                            # Idle/STARE stop remains in Main until Stage 3C.2.
-                            if LastDisplayMode != "STOP" or LastScanEnabled:
-                                Ptz.Stop()
+                            # PointingManager owns the stop transition. This
+                            # clears its active task as well as stopping motion.
+                            if LastDisplayMode == "SCAN" and LastScanEnabled:
+                                Pointing.Stop()
 
                         if PtzValid:
                             CurrentScanBoresightDeg = float(PtzAzDeg)
@@ -912,9 +917,9 @@ def Main():
                     print_scene_returns(SceneReturns, BoresightDeg)
 
                 # -------------------------------------------------------------
-                # Stage 3C.1: RadarScheduler selects the task. RadarExecutor
-                # executes it, while PointingManager owns continuous scan slew
-                # and endpoint reversal through the real X6-60 controller.
+                # Stage 3C.2: RadarScheduler selects the task. RadarExecutor
+                # executes it, while PointingManager owns continuous scan slew,
+                # endpoint reversal, and stop handling for the X6-60.
                 # -------------------------------------------------------------
 
                 NavigationAttitude = Navigation.get_attitude()
@@ -927,9 +932,9 @@ def Main():
                     float(Config.get("PTZScanSlewRateDegPerSec", 14.0))
                 )
 
-                # STOP is still issued directly by Main in Stage 3C.1. Reissue
-                # the search command on a new SCAN transition so stop/start
-                # remains functional even though the executor task ID is stable.
+                # Pointing.Stop() clears the active task. Reissue the search
+                # command on every transition into active SCAN, including from
+                # STOP or STARE when ScanEnabled remained true.
                 if ScanJustStarted:
                     print(
                         f"PointingManager scan start: "
@@ -1075,7 +1080,7 @@ def Main():
 
         try:
             if Ptz is not None:
-                Ptz.Stop()
+                Pointing.Stop()
                 Ptz.Close()
         except Exception:
             pass
