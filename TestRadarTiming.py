@@ -188,6 +188,16 @@ class TestRadarTiming(unittest.TestCase):
                 MaximumRangeM=50000.0,
             )
 
+    def test_maximum_range_must_exceed_waveform_blind_range(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "must exceed the minimum full-echo range",
+        ):
+            CalculateRadarTiming(
+                self.Library.GetMetadata("Frank10_10MHz"),
+                MaximumRangeM=1000.0,
+            )
+
     def test_invalid_pulse_count_and_negative_margin_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "positive integer"):
             self.Calculate(PulsesPerCpi=0)

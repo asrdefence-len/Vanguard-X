@@ -250,6 +250,15 @@ def CalculateRadarTiming(
         2.0 * MaximumRangeM / SPEED_OF_LIGHT_MPS
     )
     RxStartDelaySec = TxPulseDurationSec + ReceiverRecoveryTimeSec
+    MinimumFullEchoRangeM = (
+        SPEED_OF_LIGHT_MPS * RxStartDelaySec / 2.0
+    )
+    if MaximumRangeM <= MinimumFullEchoRangeM:
+        raise ValueError(
+            f"Maximum range {MaximumRangeM:g} m must exceed the minimum "
+            f"full-echo range {MinimumFullEchoRangeM:.3f} m for waveform "
+            f"{WaveformId}"
+        )
     RequiredRxEndDelaySec = (
         MaximumEchoLeadingEdgeDelaySec
         + TxPulseDurationSec
@@ -294,9 +303,6 @@ def CalculateRadarTiming(
     TimingMarginAboveMinimumPriSec = PriSec - MinimumPriSec
 
     WavelengthM = SPEED_OF_LIGHT_MPS / RfFrequencyHz
-    MinimumFullEchoRangeM = (
-        SPEED_OF_LIGHT_MPS * RxStartDelaySec / 2.0
-    )
     FirstRxSampleRangeOffsetM = MinimumFullEchoRangeM
     MaximumUnambiguousRangeM = SPEED_OF_LIGHT_MPS * PriSec / 2.0
     UnambiguousRadialVelocityMps = WavelengthM * SelectedPrfHz / 4.0

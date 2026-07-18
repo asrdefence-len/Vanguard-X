@@ -47,6 +47,7 @@ from PointingManager import PointingManager
 from RadarExecutor import RadarExecutor
 from RadarScheduler import RadarScheduler
 from RadarTasks import AngleFrame, MakeSearchTask, RadarTaskType
+from RadarTimingControls import ApplyTimingControlState
 
 from SimulatedSource import SimulatedSource
 from WaveformLibrary import WaveformLibrary
@@ -371,7 +372,11 @@ def Main():
         "MaxPrfHz": 4000.0,
         "SelectedPrfHz": 2000.0,
         "SelectedPulsesPerCpi": 32,
+        "MinPulsesPerCpi": 8,
+        "MaxPulsesPerCpi": 128,
         "InstrumentedMaxRangeM": 15000.0,
+        "MinSelectableRangeM": 1000.0,
+        "MaxSelectableRangeM": 15000.0,
 
         # Provisional RF recovery/margin values. These must be replaced by
         # oscilloscope measurements before high-power timed transmission.
@@ -573,6 +578,9 @@ def Main():
 
     TheWaveformLibrary = WaveformLibrary(Config)
     TheWaveformLibrary.LoadDefaultWaveforms()
+    Config["AvailableWaveformIds"] = (
+        TheWaveformLibrary.ListWaveforms()
+    )
 
     # -------------------------------------------------------------------------
     # Source, processor, detector and display
@@ -718,7 +726,37 @@ def Main():
         debug=False,
     )
 
-    SearchProfile = Executor.GetExecutionProfile(SearchTask)
+    LastAppliedTimingRevision = -1
+    InitialControlState = (
+        Display.GetControlState()
+        if hasattr(Display, "GetControlState")
+        else None
+    )
+    InitialTimingApplication = ApplyTimingControlState(
+        Config=Config,
+        ControlState=InitialControlState,
+        Executor=Executor,
+        SearchTask=SearchTask,
+        LastAppliedRevision=LastAppliedTimingRevision,
+    )
+    if InitialTimingApplication.Changed:
+        LastAppliedTimingRevision = InitialTimingApplication.Revision
+        if not InitialTimingApplication.Applied:
+            raise RuntimeError(
+                "Initial operator timing selection is invalid: "
+                f"{InitialTimingApplication.Message}"
+            )
+        SearchProfile = InitialTimingApplication.Profile
+    else:
+        SearchProfile = Executor.GetExecutionProfile(SearchTask)
+
+    if hasattr(Display, "SetTimingApplicationResult"):
+        Display.SetTimingApplicationResult(
+            Applied=True,
+            Message="Applied",
+            Profile=SearchProfile,
+        )
+
     SearchTiming = SearchProfile.Timing
     print(
         "Search timing: "
@@ -745,6 +783,37 @@ def Main():
                     if hasattr(Display, "GetControlState")
                     else None
                 )
+
+                TimingApplication = ApplyTimingControlState(
+                    Config=Config,
+                    ControlState=ControlState,
+                    Executor=Executor,
+                    SearchTask=SearchTask,
+                    LastAppliedRevision=LastAppliedTimingRevision,
+                )
+                if TimingApplication.Changed:
+                    LastAppliedTimingRevision = TimingApplication.Revision
+                    if hasattr(Display, "SetTimingApplicationResult"):
+                        Display.SetTimingApplicationResult(
+                            Applied=TimingApplication.Applied,
+                            Message=TimingApplication.Message,
+                            Profile=TimingApplication.Profile,
+                        )
+                    if TimingApplication.Applied:
+                        AppliedTiming = TimingApplication.Profile.Timing
+                        print(
+                            "Operator timing applied: "
+                            f"waveform={TimingApplication.Profile.WaveformId}, "
+                            f"PRF={AppliedTiming.SelectedPrfHz:.0f} Hz, "
+                            f"pulses={AppliedTiming.PulsesPerCpi}, "
+                            f"CPI={AppliedTiming.CpiDurationSec * 1e3:.3f} ms, "
+                            f"max_range={AppliedTiming.MaximumRangeM / 1e3:.3f} km"
+                        )
+                    else:
+                        print(
+                            "Operator timing rejected: "
+                            f"{TimingApplication.Message}"
+                        )
 
                 # -------------------------------------------------------------
                 # Apply operator data-logging controls from the display.

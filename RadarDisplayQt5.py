@@ -86,6 +86,57 @@ class RadarDisplay:
         self.ScanStopDeg = float(Config.get("ScanStopDeg", 60.0))
         self.ScanStepDeg = float(Config.get("ScanStepDeg", 1.0))
 
+        # Operator timing selections. Editing widgets does not change the
+        # running radar until Apply is pressed and Main validates the new
+        # profile for the next dwell boundary.
+        self.AvailableWaveformIds = list(Config.get(
+            "AvailableWaveformIds",
+            [
+                "Barker13_10MHz",
+                "Barker13_20MHz",
+                "Frank10_10MHz",
+                "Frank10_20MHz",
+            ],
+        ))
+        self.SelectedWaveformId = str(Config.get(
+            "SearchWaveformId",
+            "Frank10_20MHz",
+        ))
+        if self.SelectedWaveformId not in self.AvailableWaveformIds:
+            self.AvailableWaveformIds.append(self.SelectedWaveformId)
+        self.SelectedPrfHz = float(Config.get("SelectedPrfHz", 2000.0))
+        self.SelectedPulsesPerCpi = int(Config.get(
+            "SelectedPulsesPerCpi",
+            32,
+        ))
+        self.SelectedMaximumRangeM = float(Config.get(
+            "InstrumentedMaxRangeM",
+            15000.0,
+        ))
+        self.MinPrfHz = float(Config.get("MinPrfHz", 1000.0))
+        self.MaxPrfHz = float(Config.get("MaxPrfHz", 4000.0))
+        self.MinPulsesPerCpi = int(Config.get("MinPulsesPerCpi", 8))
+        self.MaxPulsesPerCpi = int(Config.get("MaxPulsesPerCpi", 128))
+        self.MinSelectableRangeM = float(Config.get(
+            "MinSelectableRangeM",
+            1000.0,
+        ))
+        self.MaxSelectableRangeM = float(Config.get(
+            "MaxSelectableRangeM",
+            Config.get("MaxDisplayRangeM", 15000.0),
+        ))
+        self.TimingSelectionRevision = 0
+        self.TimingApplicationMessage = "Configured"
+
+        self.AppliedWaveformId = self.SelectedWaveformId
+        self.AppliedPrfHz = self.SelectedPrfHz
+        self.AppliedPulsesPerCpi = self.SelectedPulsesPerCpi
+        self.AppliedMaximumRangeM = self.SelectedMaximumRangeM
+        self.AppliedCpiDurationSec = (
+            self.AppliedPulsesPerCpi / self.AppliedPrfHz
+        )
+        self.AppliedRxSamples = None
+
         self.MaxDisplayRangeM = float(Config.get("MaxDisplayRangeM", 15000.0))
         self.PolarMaxRangeM = float(Config.get("PolarMaxRangeM", 15000.0))
         self.RangeRingStepM = float(Config.get("RangeRingStepM", 2000.0))
@@ -230,6 +281,8 @@ class RadarDisplay:
         self.TrackTextItems = []
         self.RangeProfileCurve = None
         self.ControlWidgets = {}
+        self.TimingFeedbackLabel = None
+        self.TimingSummaryLabel = None
 
         self.InitialiseWindow()
 
@@ -303,7 +356,61 @@ class RadarDisplay:
             "ManualNudgeCommandId": self.ManualNudgeCommandId,
             "ManualNudgeDeltaDeg": self.ManualNudgeDeltaDeg,
             "StopCommandId": self.StopCommandId,
+            "SelectedWaveformId": self.SelectedWaveformId,
+            "SelectedPrfHz": self.SelectedPrfHz,
+            "SelectedPulsesPerCpi": self.SelectedPulsesPerCpi,
+            "SelectedMaximumRangeM": self.SelectedMaximumRangeM,
+            "TimingSelectionRevision": self.TimingSelectionRevision,
         }
+
+    def SetTimingApplicationResult(
+        self,
+        Applied,
+        Message,
+        Profile=None,
+    ):
+        """Show the result of Main's dwell-boundary timing validation."""
+
+        self.TimingApplicationMessage = str(Message)
+        if self.TimingFeedbackLabel is not None:
+            Colour = "#00ff66" if Applied else "#ff6666"
+            self.TimingFeedbackLabel.setStyleSheet(f"color: {Colour};")
+            self.TimingFeedbackLabel.setText(self.TimingApplicationMessage)
+
+        if Applied and Profile is not None:
+            Timing = Profile.Timing
+            self.AppliedWaveformId = str(Profile.WaveformId)
+            self.AppliedPrfHz = float(Timing.SelectedPrfHz)
+            self.AppliedPulsesPerCpi = int(Timing.PulsesPerCpi)
+            self.AppliedMaximumRangeM = float(Timing.MaximumRangeM)
+            self.AppliedCpiDurationSec = float(Timing.CpiDurationSec)
+            self.AppliedRxSamples = int(Timing.NumRxSamples)
+            self.UpdateTimingSummary(Profile)
+
+        self.UpdateStatusPanel()
+
+    def UpdateTimingSummary(self, Profile=None):
+        """Update the compact timing line without resizing the plot area."""
+
+        PrfHz = float(self.SelectedPrfHz)
+        Pulses = int(self.SelectedPulsesPerCpi)
+        PriUs = 1.0e6 / PrfHz
+        CpiMs = 1.0e3 * Pulses / PrfHz
+        MaximumRangeKm = self.SelectedMaximumRangeM / 1000.0
+        RxText = ""
+
+        if Profile is not None:
+            Timing = Profile.Timing
+            PriUs = float(Timing.PriSec) * 1.0e6
+            CpiMs = float(Timing.CpiDurationSec) * 1.0e3
+            MaximumRangeKm = float(Timing.MaximumRangeM) / 1000.0
+            RxText = f"  |  RX {int(Timing.NumRxSamples)}"
+
+        if self.TimingSummaryLabel is not None:
+            self.TimingSummaryLabel.setText(
+                f"PRI {PriUs:.1f} us  |  CPI {CpiMs:.1f} ms{RxText}  |  "
+                f"R {MaximumRangeKm:.1f} km"
+            )
 
     # ------------------------------------------------------------------
     # Window construction
@@ -319,6 +426,7 @@ class RadarDisplay:
             "QPushButton { background-color: #202020; color: white; border: 1px solid #505050; padding: 3px 6px; }"
             "QPushButton:hover { background-color: #404040; }"
             "QLineEdit { background-color: #101010; color: white; border: 1px solid #505050; padding: 2px 4px; }"
+            "QComboBox, QSpinBox, QDoubleSpinBox { background-color: #101010; color: white; border: 1px solid #505050; padding: 2px 4px; }"
             "QLabel { color: white; }"
         )
 
@@ -513,9 +621,70 @@ class RadarDisplay:
         self.ControlWidgets["SaveDataEnabled"] = QtWidgets.QCheckBox("Save")
         self.ControlWidgets["SaveDataEnabled"].setChecked(self.SaveDataEnabled)
         self.ControlWidgets["SaveDataEnabled"].setMaximumWidth(70)
-        self.ControlWidgets["RangeProfileAutoMinDb"] = QtWidgets.QCheckBox("Auto min")
-        self.ControlWidgets["RangeProfileAutoMinDb"].setChecked(self.RangeProfileAutoMinDb)
-        self.ControlWidgets["RangeProfileAutoMinDb"].setMaximumWidth(90)
+
+        self.ControlWidgets["WaveformId"] = QtWidgets.QComboBox()
+        self.ControlWidgets["WaveformId"].addItems(
+            self.AvailableWaveformIds
+        )
+        self.ControlWidgets["WaveformId"].setCurrentText(
+            self.SelectedWaveformId
+        )
+        self.ControlWidgets["WaveformId"].setMinimumWidth(125)
+        self.ControlWidgets["WaveformId"].setMaximumWidth(145)
+
+        self.ControlWidgets["PrfKHz"] = QtWidgets.QDoubleSpinBox()
+        self.ControlWidgets["PrfKHz"].setRange(
+            self.MinPrfHz / 1000.0,
+            self.MaxPrfHz / 1000.0,
+        )
+        self.ControlWidgets["PrfKHz"].setDecimals(2)
+        self.ControlWidgets["PrfKHz"].setSingleStep(0.10)
+        self.ControlWidgets["PrfKHz"].setSuffix(" kHz")
+        self.ControlWidgets["PrfKHz"].setValue(
+            self.SelectedPrfHz / 1000.0
+        )
+        self.ControlWidgets["PrfKHz"].setMinimumWidth(92)
+        self.ControlWidgets["PrfKHz"].setMaximumWidth(105)
+
+        self.ControlWidgets["PulsesPerCpi"] = QtWidgets.QSpinBox()
+        self.ControlWidgets["PulsesPerCpi"].setRange(
+            self.MinPulsesPerCpi,
+            self.MaxPulsesPerCpi,
+        )
+        self.ControlWidgets["PulsesPerCpi"].setValue(
+            self.SelectedPulsesPerCpi
+        )
+        self.ControlWidgets["PulsesPerCpi"].setMinimumWidth(68)
+        self.ControlWidgets["PulsesPerCpi"].setMaximumWidth(80)
+
+        self.ControlWidgets["MaximumRangeKm"] = QtWidgets.QDoubleSpinBox()
+        self.ControlWidgets["MaximumRangeKm"].setRange(
+            self.MinSelectableRangeM / 1000.0,
+            self.MaxSelectableRangeM / 1000.0,
+        )
+        self.ControlWidgets["MaximumRangeKm"].setDecimals(1)
+        self.ControlWidgets["MaximumRangeKm"].setSingleStep(0.5)
+        self.ControlWidgets["MaximumRangeKm"].setSuffix(" km")
+        self.ControlWidgets["MaximumRangeKm"].setValue(
+            self.SelectedMaximumRangeM / 1000.0
+        )
+        self.ControlWidgets["MaximumRangeKm"].setMinimumWidth(92)
+        self.ControlWidgets["MaximumRangeKm"].setMaximumWidth(105)
+
+        TimingApplyButton = QtWidgets.QPushButton("Apply")
+        TimingApplyButton.setMinimumHeight(26)
+        TimingApplyButton.setMinimumWidth(68)
+        TimingApplyButton.setMaximumWidth(78)
+        TimingApplyButton.clicked.connect(self.OnTimingApply)
+
+        self.TimingFeedbackLabel = QtWidgets.QLabel(
+            self.TimingApplicationMessage
+        )
+        self.TimingFeedbackLabel.setStyleSheet("color: #bfbfbf;")
+        self.TimingSummaryLabel = QtWidgets.QLabel()
+        self.TimingSummaryLabel.setStyleSheet(
+            "color: #bfbfbf; font-family: Menlo, Consolas, monospace;"
+        )
 
         self.ControlWidgets["ScanStart"].editingFinished.connect(self.OnScanStartChanged)
         self.ControlWidgets["ScanStop"].editingFinished.connect(self.OnScanStopChanged)
@@ -523,13 +692,16 @@ class RadarDisplay:
         self.ControlWidgets["RangeProfileMaxDb"].editingFinished.connect(self.OnRangeProfileMaxDbChanged)
         self.ControlWidgets["DataLogFilename"].editingFinished.connect(self.OnDataLogFilenameChanged)
         self.ControlWidgets["SaveDataEnabled"].stateChanged.connect(self.OnSaveDataEnabledChanged)
-        self.ControlWidgets["RangeProfileAutoMinDb"].stateChanged.connect(self.OnRangeProfileAutoMinDbChanged)
 
         StartLabel = QtWidgets.QLabel("Start")
         StopLabel = QtWidgets.QLabel("Stop")
         StepLabel = QtWidgets.QLabel("Step")
         MaxDbLabel = QtWidgets.QLabel("Max dB")
         FileLabel = QtWidgets.QLabel("File")
+        WaveformLabel = QtWidgets.QLabel("Waveform")
+        PrfLabel = QtWidgets.QLabel("PRF")
+        PulsesLabel = QtWidgets.QLabel("Pulses/CPI")
+        MaximumRangeLabel = QtWidgets.QLabel("Max range")
 
         Layout.addWidget(StartLabel, 2, 0)
         Layout.addWidget(self.ControlWidgets["ScanStart"], 2, 1)
@@ -542,11 +714,27 @@ class RadarDisplay:
         Layout.addWidget(FileLabel, 4, 0)
         Layout.addWidget(self.ControlWidgets["DataLogFilename"], 4, 1, 1, 2)
         Layout.addWidget(self.ControlWidgets["SaveDataEnabled"], 4, 3)
-        Layout.addWidget(self.ControlWidgets["RangeProfileAutoMinDb"], 5, 2, 1, 2)
+
+        # A compact third functional column uses the previously empty width.
+        # The sixth row replaces the removed Auto-min control, keeping the
+        # Controls box at the same row count and preserving plot geometry.
+        Layout.addWidget(WaveformLabel, 0, 4)
+        Layout.addWidget(self.ControlWidgets["WaveformId"], 0, 5)
+        Layout.addWidget(PrfLabel, 1, 4)
+        Layout.addWidget(self.ControlWidgets["PrfKHz"], 1, 5)
+        Layout.addWidget(PulsesLabel, 2, 4)
+        Layout.addWidget(self.ControlWidgets["PulsesPerCpi"], 2, 5)
+        Layout.addWidget(MaximumRangeLabel, 3, 4)
+        Layout.addWidget(self.ControlWidgets["MaximumRangeKm"], 3, 5)
+        Layout.addWidget(TimingApplyButton, 4, 4)
+        Layout.addWidget(self.TimingFeedbackLabel, 4, 5)
+        Layout.addWidget(self.TimingSummaryLabel, 5, 0, 1, 6)
 
         # Prevent the grid columns expanding controls across the full side panel.
-        for Column in range(4):
+        for Column in range(6):
             Layout.setColumnStretch(Column, 0)
+
+        self.UpdateTimingSummary()
 
         return Box
 
@@ -1156,8 +1344,13 @@ class RadarDisplay:
             f"Scan:   {self.ScanEnabled}",
             f"Tx:     {self.TransmitEnabled}",
             f"Beam:   {self.BeamAngleDeg:.1f} deg",
-            f"Sector: {self.ScanStartDeg:.1f} to {self.ScanStopDeg:.1f} deg",
-            f"Step:   {self.ScanStepDeg:.1f} deg",
+            f"Wave:   {self.AppliedWaveformId}",
+            (
+                f"Timing: {self.AppliedPrfHz / 1000.0:.2f} kHz, "
+                f"{self.AppliedPulsesPerCpi} p, "
+                f"{self.AppliedCpiDurationSec * 1e3:.1f} ms, "
+                f"R{self.AppliedMaximumRangeM / 1000.0:.1f}k"
+            ),
             f"Dwell:  {self.UpdateCounter}",
             f"Dets:   {NumDetections} ({'shown' if self.ShowRawDetections else 'hidden'})",
             f"Plots:  {NumPlots} ({'shown' if self.ShowTrackerPlots else 'hidden'})",
@@ -1287,6 +1480,28 @@ class RadarDisplay:
         except ValueError:
             self.ControlWidgets["ScanStep"].setText(str(self.ScanStepDeg))
 
+    def OnTimingApply(self):
+        """Queue the visible timing selection for Main to validate."""
+
+        self.SelectedWaveformId = str(
+            self.ControlWidgets["WaveformId"].currentText()
+        )
+        self.SelectedPrfHz = float(
+            self.ControlWidgets["PrfKHz"].value()
+        ) * 1000.0
+        self.SelectedPulsesPerCpi = int(
+            self.ControlWidgets["PulsesPerCpi"].value()
+        )
+        self.SelectedMaximumRangeM = float(
+            self.ControlWidgets["MaximumRangeKm"].value()
+        ) * 1000.0
+        self.TimingSelectionRevision += 1
+        self.TimingApplicationMessage = "Pending next dwell"
+        self.TimingFeedbackLabel.setStyleSheet("color: #ffcc00;")
+        self.TimingFeedbackLabel.setText(self.TimingApplicationMessage)
+        self.UpdateTimingSummary()
+        self.UpdateStatusPanel()
+
     def OnRangeProfileMaxDbChanged(self):
         try:
             NewMaxDb = float(self.ControlWidgets["RangeProfileMaxDb"].text())
@@ -1303,15 +1518,6 @@ class RadarDisplay:
             self.UpdateStatusPanel()
         except ValueError:
             self.ControlWidgets["RangeProfileMaxDb"].setText(str(self.RangeProfileMaxDb))
-
-    def OnRangeProfileAutoMinDbChanged(self):
-        self.RangeProfileAutoMinDb = bool(self.ControlWidgets["RangeProfileAutoMinDb"].isChecked())
-        self.Config["RangeProfileAutoMinDb"] = self.RangeProfileAutoMinDb
-        self.RangeProfileAutoScale = False
-        self.Config["RangeProfileAutoScale"] = False
-        self.ApplyRangeProfileScale()
-        self.UpdateStatusPanel()
-
 
     def OnSaveDataEnabledChanged(self):
         """Update the operator logging request from the Save checkbox."""
