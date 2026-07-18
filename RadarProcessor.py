@@ -80,13 +80,13 @@ class RadarProcessor:
         FilterPadded[:SampledWaveformLength] = MatchedFilter
         MatchedFilterFft = np.fft.fft(FilterPadded).astype(np.complex64)
 
-        # np.convolve(..., mode="same") is the centred part of the full linear
-        # convolution. For NumSamples >= SampledWaveformLength this is the
-        # matching slice.
-        SameStart = (SampledWaveformLength - 1) // 2
-        SameEnd = SameStart + NumSamples
+        # The full matched-filter peak for an echo beginning at raw sample k
+        # occurs at k + L - 1. Slice from L - 1 so output sample k remains
+        # aligned with the echo leading-edge sample and therefore with range.
+        OutputStart = SampledWaveformLength - 1
+        OutputEnd = OutputStart + NumSamples
 
-        Cached = (MatchedFilterFft, Nfft, SameStart, SameEnd)
+        Cached = (MatchedFilterFft, Nfft, OutputStart, OutputEnd)
         self._FilterCache[CacheKey] = Cached
         return Cached
 
@@ -99,7 +99,12 @@ class RadarProcessor:
         """
         NumPulses, NumSamples = RawIq.shape
 
-        MatchedFilterFft, Nfft, SameStart, SameEnd = self._GetMatchedFilterFft(
+        (
+            MatchedFilterFft,
+            Nfft,
+            OutputStart,
+            OutputEnd,
+        ) = self._GetMatchedFilterFft(
             WaveformName,
             TxWaveform,
             NumSamples
@@ -112,7 +117,10 @@ class RadarProcessor:
         RawFft = np.fft.fft(RawPadded, axis=1)
         FullCompressed = np.fft.ifft(RawFft * MatchedFilterFft[np.newaxis, :], axis=1)
 
-        return FullCompressed[:, SameStart:SameEnd].astype(np.complex64, copy=False)
+        return FullCompressed[:, OutputStart:OutputEnd].astype(
+            np.complex64,
+            copy=False,
+        )
 
     def _GetDopplerWindow(self, NumPulses):
         Cached = self._DopplerWindowCache.get(NumPulses)
@@ -123,9 +131,23 @@ class RadarProcessor:
         self._DopplerWindowCache[NumPulses] = DopplerWindow
         return DopplerWindow
 
-    def _GetAxes(self, NumPulses, NumSamples, SampleRate, PRI):
+    def _GetAxes(
+        self,
+        NumPulses,
+        NumSamples,
+        SampleRate,
+        PRI,
+        RxStartDelaySec,
+    ):
         RfFrequency = self.Config["RfFrequency"]
-        CacheKey = (NumPulses, NumSamples, float(SampleRate), float(PRI), float(RfFrequency))
+        CacheKey = (
+            NumPulses,
+            NumSamples,
+            float(SampleRate),
+            float(PRI),
+            float(RxStartDelaySec),
+            float(RfFrequency),
+        )
         Cached = self._AxisCache.get(CacheKey)
         if Cached is not None:
             return Cached
@@ -134,7 +156,9 @@ class RadarProcessor:
         WavelengthM = SpeedOfLight / RfFrequency
 
         SampleNumbers = np.arange(NumSamples)
-        RangeAxisM = SampleNumbers * SpeedOfLight / (2.0 * SampleRate)
+        RangeAxisM = (
+            RxStartDelaySec + SampleNumbers / SampleRate
+        ) * SpeedOfLight / 2.0
 
         DopplerAxisHz = np.fft.fftshift(
             np.fft.fftfreq(NumPulses, d=PRI)
@@ -170,7 +194,7 @@ class RadarProcessor:
         """Validate that a planned dwell is suitable for the FFT fast path."""
 
         if not hasattr(ThisDwell, "PulsePlans"):
-            return str(ThisDwell.WaveformName), float(ThisDwell.PRI)
+            return str(ThisDwell.WaveformName), float(ThisDwell.PRI), 0.0
 
         if len(ThisDwell.PulsePlans) == 0:
             raise ValueError("DwellPlan contains no pulses")
@@ -181,6 +205,10 @@ class RadarProcessor:
             dtype=np.float64,
         )
         TxEnabled = [bool(pulse.TxEnabled) for pulse in ThisDwell.PulsePlans]
+        RxStartDelayValues = np.asarray(
+            [pulse.RxStartDelaySec for pulse in ThisDwell.PulsePlans],
+            dtype=np.float64,
+        )
 
         if len(set(WaveformIds)) != 1:
             raise ValueError(
@@ -192,17 +220,36 @@ class RadarProcessor:
             raise ValueError(
                 "UNIFORM_PRI_FFT currently requires every pulse to transmit"
             )
+        if not np.allclose(
+            RxStartDelayValues,
+            RxStartDelayValues[0],
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                "UNIFORM_PRI_FFT requires one RX start delay per dwell"
+            )
+        if RxStartDelayValues[0] < 0.0:
+            raise ValueError("RX start delay must not be negative")
 
         NominalPri = getattr(ThisDwell.Processing, "NominalPriSec", None)
         if NominalPri is None:
             NominalPri = float(PriValues[0])
 
-        return str(WaveformIds[0]), float(NominalPri)
+        return (
+            str(WaveformIds[0]),
+            float(NominalPri),
+            float(RxStartDelayValues[0]),
+        )
 
     def _ProcessUniformPri(self, Raw, ThisDwell):
         """Existing fixed-waveform, fixed-PRI pulse compression and Doppler FFT."""
 
-        WaveformName, PRI = self._ValidateUniformPriPlan(ThisDwell)
+        (
+            WaveformName,
+            PRI,
+            RxStartDelaySec,
+        ) = self._ValidateUniformPriPlan(ThisDwell)
         TxWaveform = self.TheWaveformLibrary.Get(WaveformName)
         WaveformMetadata = self.TheWaveformLibrary.GetMetadata(WaveformName)
         ChipCount = int(WaveformMetadata["ChipCount"])
@@ -237,6 +284,7 @@ class RadarProcessor:
             NumSamples,
             Raw.SampleRate,
             PRI,
+            RxStartDelaySec,
         )
 
         PeakDopplerBin, PeakRangeBin = np.unravel_index(
@@ -260,6 +308,8 @@ class RadarProcessor:
             ),
             "WaveformId": WaveformName,
             "NominalPriSec": PRI,
+            "RxStartDelaySec": RxStartDelaySec,
+            "FirstRxSampleRangeOffsetM": float(RangeAxisM[0]),
             # CodeLength is retained for compatibility and now unambiguously
             # means phase-code chip count. Matched-filter length is recorded
             # separately in complex samples.

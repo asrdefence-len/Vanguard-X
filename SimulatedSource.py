@@ -177,6 +177,12 @@ class SimulatedSource:
         return float(ThisDwell.PRI)
 
     @staticmethod
+    def _GetPulseRxStartDelaySec(ThisDwell, PulseIndex):
+        if hasattr(ThisDwell, "PulsePlans"):
+            return float(ThisDwell.PulsePlans[PulseIndex].RxStartDelaySec)
+        return 0.0
+
+    @staticmethod
     def _GetPulseEnabled(ThisDwell, PulseIndex):
         if hasattr(ThisDwell, "PulsePlans"):
             return bool(ThisDwell.PulsePlans[PulseIndex].TxEnabled)
@@ -214,6 +220,16 @@ class SimulatedSource:
         PulseTimesSec = np.zeros(NumPulses, dtype=np.float64)
         if NumPulses > 1:
             PulseTimesSec[1:] = np.cumsum(PulsePriSec[:-1])
+
+        PulseRxStartDelaySec = np.asarray(
+            [
+                self._GetPulseRxStartDelaySec(ThisDwell, i)
+                for i in range(NumPulses)
+            ],
+            dtype=np.float64,
+        )
+        if np.any(PulseRxStartDelaySec < 0.0):
+            raise ValueError("RX start delay must not be negative")
 
         PulseWaveformIds = [
             self._GetPulseWaveformId(ThisDwell, i)
@@ -289,19 +305,26 @@ class SimulatedSource:
             TargetAmplitude = np.sqrt(ReceivedPowerW)
             TotalReceivedPowerW += ReceivedPowerW
 
-            StartIndex = TargetDelaySamples
             Inserted = False
+            CaptureRelativeDelaySamples = []
 
             for PulseIndex in range(NumPulses):
                 if not self._GetPulseEnabled(ThisDwell, PulseIndex):
+                    CaptureRelativeDelaySamples.append(None)
                     continue
 
                 WaveformId = PulseWaveformIds[PulseIndex]
                 TxWaveform = self.TheWaveformLibrary.Get(WaveformId)
+                RelativeDelaySec = (
+                    TargetDelayS - PulseRxStartDelaySec[PulseIndex]
+                )
+                StartIndex = int(round(RelativeDelaySec * SampleRate))
                 EndIndex = StartIndex + len(TxWaveform)
+                CaptureRelativeDelaySamples.append(StartIndex)
 
-                if EndIndex >= NumSamples:
-                    PulseValid[PulseIndex] = False
+                # A target outside the configured receive window does not make
+                # the acquired pulse invalid. It simply contributes no return.
+                if StartIndex < 0 or EndIndex > NumSamples:
                     continue
 
                 Inserted = True
@@ -347,6 +370,9 @@ class SimulatedSource:
                     "received_power_dbm": 10.0 * np.log10(ReceivedPowerW / 1e-3 + 1e-30),
                     "target_amplitude": TargetAmplitude,
                     "delay_samples": TargetDelaySamples,
+                    "capture_relative_delay_samples": (
+                        CaptureRelativeDelaySamples
+                    ),
                     "inserted": Inserted,
                 }
             )
@@ -385,6 +411,12 @@ class SimulatedSource:
         Diagnostics["PulseWaveformIds"] = list(PulseWaveformIds)
         Diagnostics["PulsePriSec"] = PulsePriSec.copy()
         Diagnostics["PulseTimesSec"] = PulseTimesSec.copy()
+        Diagnostics["PulseRxStartDelaySec"] = (
+            PulseRxStartDelaySec.copy()
+        )
+        Diagnostics["FirstRxSampleRangeOffsetM"] = float(
+            SpeedOfLight * PulseRxStartDelaySec[0] / 2.0
+        )
         Diagnostics["PulseValid"] = PulseValid.copy()
 
         Raw = RawDwellData(
@@ -395,6 +427,7 @@ class SimulatedSource:
             TimeStamp=time.time(),
             PulseTimesSec=PulseTimesSec,
             PulsePriSec=PulsePriSec,
+            PulseRxStartDelaySec=PulseRxStartDelaySec,
             PulseWaveformIds=PulseWaveformIds,
             PulseValid=PulseValid,
             Diagnostics=Diagnostics,

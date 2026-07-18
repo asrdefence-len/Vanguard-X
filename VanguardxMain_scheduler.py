@@ -364,15 +364,26 @@ def Main():
     # -------------------------------------------------------------------------
 
     Config = {
-        "NumSamples": 4096,
-        "NumPulses": 32,
-        "PRI": 200e-6,
+        # Operator timing selections. PRI, CPI duration, RX start and receive
+        # sample count are derived by RadarTiming; they are not independent
+        # configuration inputs.
+        "MinPrfHz": 1000.0,
+        "MaxPrfHz": 4000.0,
+        "SelectedPrfHz": 2000.0,
+        "SelectedPulsesPerCpi": 32,
+        "InstrumentedMaxRangeM": 15000.0,
+
+        # Provisional RF recovery/margin values. These must be replaced by
+        # oscilloscope measurements before high-power timed transmission.
+        "ReceiverRecoveryTimeSec": 1.0e-6,
+        "RxEndMarginSec": 2.0e-6,
+        "NextTxGuardTimeSec": 2.0e-6,
 
         # ---------------------------------------------------------------------
         # Radar source
         # ---------------------------------------------------------------------
 
-        "RadarSource": "ETTUS",      # "SIM" or "ETTUS"
+        "RadarSource": "SIM",        # Validate SIM before "ETTUS"
 
         # Ettus configuration
         "EttusSerial": "34A0320",
@@ -703,7 +714,23 @@ def Main():
         source=Source,
         pointing_manager=Pointing,
         config=Config,
+        waveform_library=TheWaveformLibrary,
         debug=False,
+    )
+
+    SearchProfile = Executor.GetExecutionProfile(SearchTask)
+    SearchTiming = SearchProfile.Timing
+    print(
+        "Search timing: "
+        f"waveform={SearchProfile.WaveformId}, "
+        f"sample_rate={SearchProfile.SampleRate / 1e6:.1f} MS/s, "
+        f"PRF={SearchTiming.SelectedPrfHz:.0f} Hz, "
+        f"PRI={SearchTiming.PriSec * 1e6:.3f} us, "
+        f"pulses={SearchTiming.PulsesPerCpi}, "
+        f"CPI={SearchTiming.CpiDurationSec * 1e3:.3f} ms, "
+        f"RX_start={SearchTiming.RxStartDelaySec * 1e6:.3f} us, "
+        f"RX_samples={SearchTiming.NumRxSamples}, "
+        f"max_range={SearchTiming.MaximumRangeM / 1e3:.3f} km"
     )
     
     try:
@@ -1070,7 +1097,7 @@ def Main():
                 # Move targets forward by one dwell time.
                 # -------------------------------------------------------------
 
-                DwellTimeS = Config["NumPulses"] * Config["PRI"]
+                DwellTimeS = ThisDwell.NumPulses * ThisDwell.PRI
                 update_scene_objects(SceneObjects, DwellTimeS)
 
                 DwellId += 1

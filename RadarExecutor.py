@@ -39,6 +39,7 @@ from RadarPlans import DwellPlan, make_uniform_dwell_plan
 from RadarTasks import RadarTask, RadarTaskType, SearchTask, TrackTask
 from PointingManager import PointingManager, PointingState
 from NavigationState import PlatformAttitude
+from RadarTiming import CalculateRadarTiming, RadarTimingSolution
 
 
 @dataclass(frozen=True)
@@ -58,8 +59,10 @@ class ExecutionProfile:
     NumSamples: int
     NumPulses: int
     PriSec: float
+    RxStartDelaySec: float
     RxAttenuationDb: float
     TxAttenuationDb: float
+    Timing: RadarTimingSolution
     SDRProfile: str = "Default"
 
 
@@ -103,10 +106,16 @@ class RadarExecutor:
         pointing_manager: PointingManager,
         config: Dict,
         debug: bool = False,
+        waveform_library=None,
     ):
         self.Source = source
         self.PointingManager = pointing_manager
         self.Config = config
+        self.WaveformLibrary = (
+            waveform_library
+            if waveform_library is not None
+            else getattr(source, "TheWaveformLibrary", None)
+        )
         self.Debug = bool(debug)
 
         self._active_task_id: Optional[int] = None
@@ -225,6 +234,10 @@ class RadarExecutor:
             "ExecutionNumSamples": int(profile.NumSamples),
             "ExecutionNumPulses": int(profile.NumPulses),
             "ExecutionPriSec": float(profile.PriSec),
+            "ExecutionPrfHz": float(profile.Timing.SelectedPrfHz),
+            "ExecutionRxStartDelaySec": float(profile.RxStartDelaySec),
+            "ExecutionCpiDurationSec": float(profile.Timing.CpiDurationSec),
+            "ExecutionMaximumRangeM": float(profile.Timing.MaximumRangeM),
             "ExecutionRxAttenuationDb": float(profile.RxAttenuationDb),
             "ExecutionTxAttenuationDb": float(profile.TxAttenuationDb),
             "ExecutionSDRProfile": str(profile.SDRProfile),
@@ -240,6 +253,7 @@ class RadarExecutor:
             ),
             "PointingReady": bool(pointing.Ready),
             "PointingReachable": bool(pointing.Reachable),
+            "RadarTiming": profile.Timing.ToMetadata(),
         }
 
         if isinstance(task, SearchTask):
@@ -276,12 +290,18 @@ class RadarExecutor:
             num_samples=int(profile.NumSamples),
             num_pulses=int(profile.NumPulses),
             pri_sec=float(profile.PriSec),
+            rx_start_delay_sec=float(profile.RxStartDelaySec),
             azimuth_deg=float(pointing.BeamBearingTrueDeg),
             elevation_deg=float(pointing.BeamElevationTrueDeg),
             rx_attenuation_db=float(profile.RxAttenuationDb),
             tx_attenuation_db=float(profile.TxAttenuationDb),
             metadata=metadata,
         )
+
+    def GetExecutionProfile(self, task: RadarTask) -> ExecutionProfile:
+        """Return the validated timing/execution profile for a task."""
+
+        return self._profile_for_task(task)
 
     def ReleaseTask(self, task: Optional[RadarTask] = None) -> None:
         """
@@ -299,16 +319,12 @@ class RadarExecutor:
 
     def _profile_for_task(self, task: RadarTask) -> ExecutionProfile:
         if task.TaskType == RadarTaskType.SEARCH:
-            return ExecutionProfile(
+            return self._make_execution_profile(
                 Name="Search",
                 WaveformId=self.Config.get(
                     "SearchWaveformId",
                     "Frank10_20MHz",
                 ),
-                SampleRate=float(self.Config["EttusSampleRateHz"]),
-                NumSamples=int(self.Config["NumSamples"]),
-                NumPulses=int(self.Config["NumPulses"]),
-                PriSec=float(self.Config["PRI"]),
                 RxAttenuationDb=float(self.Config.get(
                     "TRMRxAttenuationDb",
                     0.0,
@@ -324,7 +340,7 @@ class RadarExecutor:
             )
 
         if task.TaskType == RadarTaskType.TRACK:
-            return ExecutionProfile(
+            return self._make_execution_profile(
                 Name="Track",
                 WaveformId=self.Config.get(
                     "TrackWaveformId",
@@ -333,19 +349,6 @@ class RadarExecutor:
                         "Barker13_20MHz",
                     ),
                 ),
-                SampleRate=float(self.Config["EttusSampleRateHz"]),
-                NumSamples=int(self.Config.get(
-                    "TrackNumSamples",
-                    self.Config["NumSamples"],
-                )),
-                NumPulses=int(self.Config.get(
-                    "TrackNumPulses",
-                    self.Config["NumPulses"],
-                )),
-                PriSec=float(self.Config.get(
-                    "TrackPRI",
-                    self.Config["PRI"],
-                )),
                 RxAttenuationDb=float(self.Config.get(
                     "TrackRxAttenuationDb",
                     self.Config.get("TRMRxAttenuationDb", 0.0),
@@ -362,6 +365,84 @@ class RadarExecutor:
 
         raise ValueError(
             f"No execution profile for task type {task.TaskType.value}"
+        )
+
+    def _make_execution_profile(
+        self,
+        Name: str,
+        WaveformId: str,
+        RxAttenuationDb: float,
+        TxAttenuationDb: float,
+        SDRProfile: str,
+    ) -> ExecutionProfile:
+        """Build a profile entirely from one validated timing solution."""
+
+        if self.WaveformLibrary is None:
+            raise RuntimeError(
+                "RadarExecutor requires WaveformLibrary to derive dwell timing"
+            )
+
+        Prefix = str(Name)
+        IsSearch = Prefix.upper() == "SEARCH"
+        WaveformMetadata = self.WaveformLibrary.GetMetadata(WaveformId)
+
+        Timing = CalculateRadarTiming(
+            WaveformMetadata,
+            SelectedPrfHz=float(self.Config.get(
+                f"{Prefix}PrfHz",
+                self.Config.get("SelectedPrfHz", 2000.0),
+            )),
+            PulsesPerCpi=int(self.Config.get(
+                f"{Prefix}PulsesPerCpi",
+                self.Config.get("SelectedPulsesPerCpi", 32),
+            )),
+            MaximumRangeM=float(self.Config.get(
+                f"{Prefix}MaximumRangeM",
+                self.Config.get(
+                    "InstrumentedMaxRangeM",
+                    self.Config.get("MaxRangeM", 15000.0),
+                ),
+            )),
+            ReceiverRecoveryTimeSec=float(self.Config.get(
+                "ReceiverRecoveryTimeSec",
+                1.0e-6,
+            )),
+            RxEndMarginSec=float(self.Config.get(
+                "RxEndMarginSec",
+                2.0e-6,
+            )),
+            NextTxGuardTimeSec=float(self.Config.get(
+                "NextTxGuardTimeSec",
+                2.0e-6,
+            )),
+            OperatorMinPrfHz=float(self.Config.get(
+                "MinPrfHz",
+                1000.0,
+            )),
+            OperatorMaxPrfHz=float(self.Config.get(
+                "MaxPrfHz",
+                4000.0,
+            )),
+            RfFrequencyHz=float(self.Config["RfFrequency"]),
+            AntennaScanRateDegPerSec=float(
+                self.Config.get("PTZScanSlewRateDegPerSec", 0.0)
+                if IsSearch
+                else self.Config.get("TrackAntennaRateDegPerSec", 0.0)
+            ),
+        )
+
+        return ExecutionProfile(
+            Name=Prefix,
+            WaveformId=str(WaveformId),
+            SampleRate=float(Timing.SampleRateHz),
+            NumSamples=int(Timing.NumRxSamples),
+            NumPulses=int(Timing.PulsesPerCpi),
+            PriSec=float(Timing.PriSec),
+            RxStartDelaySec=float(Timing.RxStartDelaySec),
+            RxAttenuationDb=float(RxAttenuationDb),
+            TxAttenuationDb=float(TxAttenuationDb),
+            Timing=Timing,
+            SDRProfile=str(SDRProfile),
         )
 
     def _allocate_dwell_id(self) -> int:
@@ -401,9 +482,14 @@ class RadarExecutor:
             "ExecutionNumSamples": int(profile.NumSamples),
             "ExecutionNumPulses": int(profile.NumPulses),
             "ExecutionPriSec": float(profile.PriSec),
+            "ExecutionPrfHz": float(profile.Timing.SelectedPrfHz),
+            "ExecutionRxStartDelaySec": float(profile.RxStartDelaySec),
+            "ExecutionCpiDurationSec": float(profile.Timing.CpiDurationSec),
+            "ExecutionMaximumRangeM": float(profile.Timing.MaximumRangeM),
             "ExecutionRxAttenuationDb": float(profile.RxAttenuationDb),
             "ExecutionTxAttenuationDb": float(profile.TxAttenuationDb),
             "ExecutionSDRProfile": str(profile.SDRProfile),
+            "RadarTiming": profile.Timing.ToMetadata(),
 
             "BoresightDeg": float(pointing.BeamBearingTrueDeg),
             "BeamBearingTrueDeg": float(pointing.BeamBearingTrueDeg),

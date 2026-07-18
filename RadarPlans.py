@@ -81,6 +81,17 @@ class DwellPlan:
             raise ValueError("DwellPlan contains no pulses")
         return float(self.PulsePlans[0].PriSec)
 
+    @property
+    def RxStartDelaySec(self) -> float:
+        """Return the uniform receive-window delay used by this dwell."""
+
+        if not self.PulsePlans:
+            raise ValueError("DwellPlan contains no pulses")
+        delays = [float(pulse.RxStartDelaySec) for pulse in self.PulsePlans]
+        if any(abs(delay - delays[0]) > 1e-12 for delay in delays[1:]):
+            raise ValueError("DwellPlan has non-uniform receive start delays")
+        return delays[0]
+
 
 def make_uniform_dwell_plan(
     dwell_id: int,
@@ -96,6 +107,7 @@ def make_uniform_dwell_plan(
     rx_attenuation_db: float = 0.0,
     tx_attenuation_db: float = 31.5,
     metadata: Optional[Dict[str, Any]] = None,
+    rx_start_delay_sec: float = 0.0,
 ) -> DwellPlan:
     """Create a fixed-waveform, fixed-PRI dwell matching legacy behaviour."""
 
@@ -107,6 +119,8 @@ def make_uniform_dwell_plan(
         raise ValueError("sample_rate must be greater than zero")
     if num_samples <= 0:
         raise ValueError("num_samples must be greater than zero")
+    if rx_start_delay_sec < 0.0:
+        raise ValueError("rx_start_delay_sec must not be negative")
 
     pulses = [
         PulsePlan(
@@ -114,6 +128,7 @@ def make_uniform_dwell_plan(
             WaveformId=str(waveform_id),
             PriSec=float(pri_sec),
             TxEnabled=True,
+            RxStartDelaySec=float(rx_start_delay_sec),
             NumRxSamples=int(num_samples),
         )
         for index in range(int(num_pulses))

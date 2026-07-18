@@ -93,6 +93,10 @@ class RawDwellData:
     Shape:
 
         NumPulses x NumSamples
+
+    PulseRxStartDelaySec stores the delay from each PRI origin to the first
+    captured receive sample. RadarProcessor uses the corresponding DwellPlan
+    value to restore the absolute range origin after pulse compression.
     """
 
     DwellId: int
@@ -108,6 +112,7 @@ class RawDwellData:
     PulseWaveformIds: list = None
     PulseValid: np.ndarray = None
     Diagnostics: dict = field(default_factory=dict)
+    PulseRxStartDelaySec: np.ndarray = None
 
 
 @dataclass

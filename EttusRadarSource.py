@@ -156,9 +156,9 @@ class EttusRadarSource:
                 "Call EttusRadarSource.Initialise() before ExecuteDwell()."
             )
 
-        sample_rate = float(
-            self.Config["EttusSampleRateHz"]
-            )
+        # RadarExecutor has already validated the waveform/timing solution.
+        # Consume the dwell value here so the UHD rate cannot diverge from it.
+        sample_rate = float(ThisDwell.SampleRate)
         num_samples = int(ThisDwell.NumSamples)
         num_pulses = self._get_num_pulses(ThisDwell)
 
@@ -187,6 +187,28 @@ class EttusRadarSource:
             self._get_pulse_waveform_id(ThisDwell, i)
             for i in range(num_pulses)
         ]
+        pulse_rx_start_delay_sec = np.asarray(
+            [
+                self._get_pulse_rx_start_delay_sec(ThisDwell, i)
+                for i in range(num_pulses)
+            ],
+            dtype=np.float64,
+        )
+        if np.any(pulse_rx_start_delay_sec < 0.0):
+            raise ValueError("RX start delay must not be negative")
+
+        pulse_num_rx_samples = np.asarray(
+            [
+                self._get_pulse_num_rx_samples(ThisDwell, i, num_samples)
+                for i in range(num_pulses)
+            ],
+            dtype=np.int64,
+        )
+        if np.any(pulse_num_rx_samples != num_samples):
+            raise ValueError(
+                "EttusRadarSource currently requires the same RX sample "
+                "count on every pulse in a dwell"
+            )
 
         iq = np.zeros(
             (num_pulses, num_samples),
@@ -204,8 +226,11 @@ class EttusRadarSource:
         # Queue every timed RX command before waiting for any samples.
         # CommandLeadTimeSec is applied once to hardware_start_sec above;
         # subsequent PRI times are derived only from the dwell PRI schedule.
-        scheduled_times_sec = hardware_start_sec + pulse_times_sec
-        for scheduled_time_sec in scheduled_times_sec:
+        scheduled_pri_times_sec = hardware_start_sec + pulse_times_sec
+        scheduled_rx_times_sec = (
+            scheduled_pri_times_sec + pulse_rx_start_delay_sec
+        )
+        for scheduled_time_sec in scheduled_rx_times_sec:
             self._issue_receive_command(
                 num_samples=num_samples,
                 scheduled_time_sec=float(scheduled_time_sec),
@@ -215,7 +240,12 @@ class EttusRadarSource:
         # This structure also leaves room to queue timed TX commands between
         # the RX-command loop above and the blocking receive loop below.
         for pulse_index in range(num_pulses):
-            scheduled_time_sec = float(scheduled_times_sec[pulse_index])
+            scheduled_pri_time_sec = float(
+                scheduled_pri_times_sec[pulse_index]
+            )
+            scheduled_time_sec = float(
+                scheduled_rx_times_sec[pulse_index]
+            )
 
             pulse_iq, diag = self._receive_scheduled_pri(
                 num_samples=num_samples,
@@ -228,9 +258,13 @@ class EttusRadarSource:
                 pulse_valid[pulse_index] = False
 
             context = {
+                "ScheduledPriHardwareTimeSec": scheduled_pri_time_sec,
                 "ScheduledHardwareTimeSec": float(scheduled_time_sec),
                 "PulseTimeSec": float(pulse_times_sec[pulse_index]),
                 "PriSec": float(pulse_pri_sec[pulse_index]),
+                "RxStartDelaySec": float(
+                    pulse_rx_start_delay_sec[pulse_index]
+                ),
                 "WaveformId": str(pulse_waveform_ids[pulse_index]),
                 "ValidBeforeInjection": bool(pulse_valid[pulse_index]),
             }
@@ -271,6 +305,11 @@ class EttusRadarSource:
             "ActualSampleRate": actual_sample_rate,
             "NumSamplesPerPulse": num_samples,
             "NumPulses": num_pulses,
+            "PulseRxStartDelaySec": pulse_rx_start_delay_sec.copy(),
+            "ScheduledPriHardwareTimesSec": (
+                scheduled_pri_times_sec.copy()
+            ),
+            "ScheduledRxHardwareTimesSec": scheduled_rx_times_sec.copy(),
             "RxFrequencyHz": float(self.Usrp.get_rx_freq(self.Channel)),
             "RxGainDb": float(self.Usrp.get_rx_gain(self.Channel)),
             "RxAntenna": str(self.Usrp.get_rx_antenna(self.Channel)),
@@ -290,6 +329,7 @@ class EttusRadarSource:
             TimeStamp=float(wall_end),
             PulseTimesSec=pulse_times_sec,
             PulsePriSec=pulse_pri_sec,
+            PulseRxStartDelaySec=pulse_rx_start_delay_sec,
             PulseWaveformIds=pulse_waveform_ids,
             PulseValid=pulse_valid,
             Diagnostics=diagnostics,
@@ -491,6 +531,22 @@ class EttusRadarSource:
         if hasattr(ThisDwell, "PulsePlans"):
             return float(ThisDwell.PulsePlans[pulse_index].PriSec)
         return float(ThisDwell.PRI)
+
+    @staticmethod
+    def _get_pulse_rx_start_delay_sec(ThisDwell, pulse_index):
+        if hasattr(ThisDwell, "PulsePlans"):
+            return float(
+                ThisDwell.PulsePlans[pulse_index].RxStartDelaySec
+            )
+        return 0.0
+
+    @staticmethod
+    def _get_pulse_num_rx_samples(ThisDwell, pulse_index, default_value):
+        if hasattr(ThisDwell, "PulsePlans"):
+            value = ThisDwell.PulsePlans[pulse_index].NumRxSamples
+            if value is not None:
+                return int(value)
+        return int(default_value)
 
     @staticmethod
     def _error_name(error_code):
