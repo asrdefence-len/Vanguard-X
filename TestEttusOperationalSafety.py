@@ -1,22 +1,7 @@
-"""Hardware-free regression tests for the Stage 3E0 safety boundary."""
+"""Hardware-free regression tests for the Stage 3E1 safety boundary."""
 
 from pathlib import Path
-import sys
-import types
 import unittest
-
-
-# EttusRadarSource only needs this type while constructing returned dwell data.
-# Supplying a small import stub keeps these configuration tests independent of
-# the rest of the application and of UHD hardware/Python bindings.
-if "DataTypes" not in sys.modules:
-    data_types = types.ModuleType("DataTypes")
-
-    class RawDwellData:  # pragma: no cover - not instantiated by these tests
-        pass
-
-    data_types.RawDwellData = RawDwellData
-    sys.modules["DataTypes"] = data_types
 
 from EttusRadarSource import EttusRadarSource
 
@@ -35,13 +20,60 @@ class TestEttusOperationalSafety(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EttusOperatingMode"):
             EttusRadarSource({"EttusOperatingMode": "UNKNOWN"})
 
-    def test_timed_tx_rx_mode_fails_closed(self):
-        with self.assertRaisesRegex(RuntimeError, "not integrated"):
+    def test_timed_mode_requires_enable_flag(self):
+        with self.assertRaisesRegex(ValueError, "requires"):
             EttusRadarSource({"EttusOperatingMode": "TIMED_TX_RX"})
 
-    def test_transmit_enable_flag_fails_closed(self):
-        with self.assertRaisesRegex(RuntimeError, "not integrated"):
+    def test_enable_flag_is_rejected_in_receive_only_mode(self):
+        with self.assertRaisesRegex(ValueError, "RECEIVE_ONLY"):
             EttusRadarSource({"EttusTimedTransmitEnabled": True})
+
+    def test_timed_mode_requires_rf_acknowledgement(self):
+        with self.assertRaisesRegex(RuntimeError, "acknowledgement"):
+            EttusRadarSource({
+                "EttusOperatingMode": "TIMED_TX_RX",
+                "EttusTimedTransmitEnabled": True,
+            })
+
+    def test_timed_mode_requires_loopback_confirmation(self):
+        with self.assertRaisesRegex(RuntimeError, "loopback"):
+            EttusRadarSource({
+                "EttusOperatingMode": "TIMED_TX_RX",
+                "EttusTimedTransmitEnabled": True,
+                "EttusRfOutputAcknowledged": True,
+            })
+
+    def test_timed_mode_requires_minimum_attenuation(self):
+        with self.assertRaisesRegex(RuntimeError, "external attenuation"):
+            EttusRadarSource({
+                "EttusOperatingMode": "TIMED_TX_RX",
+                "EttusTimedTransmitEnabled": True,
+                "EttusRfOutputAcknowledged": True,
+                "EttusLoopbackConfirmed": True,
+                "EttusExternalAttenuationDb": 29.9,
+            })
+
+    def test_stage3e1_timed_mode_rejects_atr(self):
+        with self.assertRaisesRegex(RuntimeError, "keeps ATR disabled"):
+            EttusRadarSource({
+                "EttusOperatingMode": "TIMED_TX_RX",
+                "EttusTimedTransmitEnabled": True,
+                "EttusRfOutputAcknowledged": True,
+                "EttusLoopbackConfirmed": True,
+                "EttusExternalAttenuationDb": 30.0,
+                "EttusAtrGpioEnabled": True,
+            })
+
+    def test_stage3e1_timed_mode_rejects_queue_above_proven_depth(self):
+        with self.assertRaisesRegex(ValueError, "must not exceed 20"):
+            EttusRadarSource({
+                "EttusOperatingMode": "TIMED_TX_RX",
+                "EttusTimedTransmitEnabled": True,
+                "EttusRfOutputAcknowledged": True,
+                "EttusLoopbackConfirmed": True,
+                "EttusExternalAttenuationDb": 30.0,
+                "EttusCommandQueueDepth": 21,
+            })
 
     def test_nonpositive_command_lead_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be positive"):
@@ -58,7 +90,7 @@ class TestEttusOperationalSafety(unittest.TestCase):
             .read_text(encoding="utf-8")
         )
 
-        self.assertIn('"RadarSource": "SIM"', main_text)
+        self.assertIn('"RadarSource": "ETTUS"', main_text)
         self.assertIn('"EttusOperatingMode": "RECEIVE_ONLY"', main_text)
         self.assertIn('"EttusTimedTransmitEnabled": False', main_text)
         self.assertIn('"EttusAtrGpioEnabled": False', main_text)

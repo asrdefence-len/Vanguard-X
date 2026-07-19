@@ -1,7 +1,7 @@
 """
 Vanguard X - EttusRadarSource.py
 
-Stage 3E0 fail-closed individual-PRI receive-only source for an Ettus B200mini.
+Stage 3E1 guarded bounded timed-TX/RX source for an Ettus B200mini.
 
 The setup now runs automatically during Initialise() and configures:
 
@@ -19,8 +19,14 @@ Key behaviour:
 - Every TX hook and RX command remains finite and pulse-specific.
 - No dwell-length command queue and no continuous RX are used.
 - Returned IQ shape is NumPulses x NumSamples.
-- Stage 3E0 leaves the timed-TX hook disabled and rejects any configuration
-  that attempts to enable operational transmit.
+- Receive-only remains the default and creates no TX streamer.
+- Stage 3E1 timed TX/RX is available only behind explicit RF-output,
+  attenuated-loopback, and minimum-attenuation safety acknowledgements.
+- Each enabled pulse is one finite timed TX burst paired with one finite RX
+  window on the same fixed absolute PRI grid.
+- TX asynchronous events are drained only after replenishing the bounded
+  scheduling horizon; remaining burst acknowledgements are collected after
+  the complete CPI capture.
 - ATR GPIO is disabled by default and must be enabled explicitly only after
   its separate oscilloscope-verification stage.
 - Optional software IQ injection can add synthetic targets to each received PRI.
@@ -47,8 +53,18 @@ else:
 IqInjector = Callable[[np.ndarray, int, object, dict], np.ndarray]
 
 
+TX_EVENT_NAMES = {
+    0x01: "burst_ack",
+    0x02: "underflow",
+    0x04: "sequence_error",
+    0x08: "time_error",
+    0x10: "underflow_in_packet",
+    0x20: "sequence_error_in_burst",
+}
+
+
 class EttusRadarSource:
-    """Receive-only validation of a fixed-depth individual-PRI pipeline."""
+    """Guarded fixed-depth individual-PRI TX/RX pipeline."""
 
     def __init__(
         self,
@@ -71,23 +87,76 @@ class EttusRadarSource:
                 "EttusOperatingMode must be RECEIVE_ONLY or TIMED_TX_RX"
             )
         if (
-            self.OperatingMode != "RECEIVE_ONLY"
-            or self.TimedTransmitEnabled
+            self.OperatingMode == "RECEIVE_ONLY"
+            and self.TimedTransmitEnabled
         ):
-            raise RuntimeError(
-                "Operational Ettus timed transmit is not integrated yet. "
-                "Use EttusOperatingMode='RECEIVE_ONLY' and "
-                "EttusTimedTransmitEnabled=False."
+            raise ValueError(
+                "RECEIVE_ONLY requires EttusTimedTransmitEnabled=False"
             )
+        if (
+            self.OperatingMode == "TIMED_TX_RX"
+            and not self.TimedTransmitEnabled
+        ):
+            raise ValueError(
+                "TIMED_TX_RX requires EttusTimedTransmitEnabled=True"
+            )
+
+        self.RfOutputAcknowledged = bool(
+            Config.get("EttusRfOutputAcknowledged", False)
+        )
+        self.LoopbackConfirmed = bool(
+            Config.get("EttusLoopbackConfirmed", False)
+        )
+        self.ExternalAttenuationDb = float(
+            Config.get("EttusExternalAttenuationDb", 0.0)
+        )
+        self.MinimumLoopbackAttenuationDb = float(
+            Config.get("EttusMinimumLoopbackAttenuationDb", 30.0)
+        )
+        if self.TimedTransmitEnabled:
+            if not self.RfOutputAcknowledged:
+                raise RuntimeError(
+                    "Timed TX/RX requires explicit RF-output acknowledgement"
+                )
+            if not self.LoopbackConfirmed:
+                raise RuntimeError(
+                    "Stage 3E1 timed TX/RX requires confirmation of the "
+                    "TX/RX-to-attenuator-to-RX2 loopback"
+                )
+            if (
+                self.ExternalAttenuationDb
+                < self.MinimumLoopbackAttenuationDb
+            ):
+                raise RuntimeError(
+                    "Stage 3E1 timed TX/RX requires at least "
+                    f"{self.MinimumLoopbackAttenuationDb:.1f} dB "
+                    "external attenuation"
+                )
 
         self.Usrp = None
         self.RxStreamer = None
+        self.TxStreamer = None
         self.Channel = int(Config.get("EttusRxChannel", 0))
+        self.TxChannel = int(Config.get("EttusTxChannel", self.Channel))
         self.CpuFormat = str(Config.get("EttusCpuFormat", "fc32"))
         self.WireFormat = str(Config.get("EttusWireFormat", "sc16"))
         self.ReceiveTimeoutSec = float(
             Config.get("EttusReceiveTimeoutSec", 1.0)
         )
+        self.TxSendTimeoutSec = float(
+            Config.get("EttusTxSendTimeoutSec", self.ReceiveTimeoutSec)
+        )
+        self.TxAsyncTimeoutSec = float(
+            Config.get("EttusTxAsyncTimeoutSec", self.ReceiveTimeoutSec)
+        )
+        self.TxAmplitudeScale = float(
+            Config.get("EttusTxAmplitudeScale", 1.0)
+        )
+        self.MaximumStage3E1TxGainDb = float(
+            Config.get("EttusMaximumStage3E1TxGainDb", 50.0)
+        )
+        if not 0.0 < self.TxAmplitudeScale <= 1.0:
+            raise ValueError("EttusTxAmplitudeScale must be in (0, 1]")
         self.CommandLeadTimeSec = float(
             Config.get("EttusCommandLeadTimeSec", 0.05)
         )
@@ -104,6 +173,10 @@ class EttusRadarSource:
             raise ValueError(
                 "EttusCommandQueueDepth must be between 1 and 32"
             )
+        if self.TimedTransmitEnabled and self.CommandQueueDepth > 20:
+            raise ValueError(
+                "Stage 3E1 timed TX/RX queue depth must not exceed 20"
+            )
 
         # B200mini front-panel GPIO/ATR configuration.  The configuration
         # values are logical GPIO bit numbers, not physical connector pins:
@@ -112,6 +185,10 @@ class EttusRadarSource:
         self.AtrGpioEnabled = bool(
             Config.get("EttusAtrGpioEnabled", False)
         )
+        if self.TimedTransmitEnabled and self.AtrGpioEnabled:
+            raise RuntimeError(
+                "Stage 3E1 keeps ATR disabled; verify ATR separately later"
+            )
         self.GpioBank = str(Config.get("EttusGPIOBank", "FP0"))
         self.TxAtrGpioBit = int(Config.get("EttusTxAtrGPIO", 1))
         self.RxAtrGpioBit = int(Config.get("EttusRxAtrGPIO", 2))
@@ -149,12 +226,61 @@ class EttusRadarSource:
         self.Usrp.set_rx_gain(gain_db, self.Channel)
         self.Usrp.set_rx_antenna(antenna, self.Channel)
 
+        tx_frequency_hz = float(
+            self.Config.get("EttusTxFrequencyHz", frequency_hz)
+        )
+        tx_gain_db = float(self.Config.get("EttusTxGainDb", 0.0))
+        tx_antenna = str(
+            self.Config.get("EttusTxAntenna", "TX/RX")
+        )
+        if not 0.0 <= tx_gain_db <= self.MaximumStage3E1TxGainDb:
+            raise ValueError(
+                "EttusTxGainDb must be between 0 and "
+                f"{self.MaximumStage3E1TxGainDb:.1f} dB in Stage 3E1"
+            )
+
         stream_args = uhd.usrp.StreamArgs(
             self.CpuFormat,
             self.WireFormat,
         )
         stream_args.channels = [self.Channel]
         self.RxStreamer = self.Usrp.get_rx_stream(stream_args)
+
+        if self.TimedTransmitEnabled:
+            initial_tx_rate_hz = float(
+                self.Config.get("EttusSampleRateHz", 40.0e6)
+            )
+            self.Usrp.set_tx_rate(
+                initial_tx_rate_hz,
+                self.TxChannel,
+            )
+            self.Usrp.set_tx_freq(
+                uhd.types.TuneRequest(tx_frequency_hz),
+                self.TxChannel,
+            )
+            self.Usrp.set_tx_gain(tx_gain_db, self.TxChannel)
+            self.Usrp.set_tx_antenna(tx_antenna, self.TxChannel)
+
+            actual_tx_gain_db = float(
+                self.Usrp.get_tx_gain(self.TxChannel)
+            )
+            if not np.isclose(
+                actual_tx_gain_db,
+                tx_gain_db,
+                rtol=0.0,
+                atol=0.26,
+            ):
+                raise RuntimeError(
+                    f"UHD coerced TX gain to {actual_tx_gain_db:.2f} dB; "
+                    f"requested {tx_gain_db:.2f} dB"
+                )
+
+            tx_stream_args = uhd.usrp.StreamArgs(
+                self.CpuFormat,
+                self.WireFormat,
+            )
+            tx_stream_args.channels = [self.TxChannel]
+            self.TxStreamer = self.Usrp.get_tx_stream(tx_stream_args)
 
         if self.AtrGpioEnabled:
             self._configure_atr_gpio()
@@ -170,6 +296,14 @@ class EttusRadarSource:
             f"timed TX={'enabled' if self.TimedTransmitEnabled else 'disabled'}, "
             f"ATR GPIO={'enabled' if self.AtrGpioEnabled else 'disabled'}"
         )
+        if self.TimedTransmitEnabled:
+            print(
+                "Ettus Stage 3E1 TX configured: "
+                f"TX={self.Usrp.get_tx_freq(self.TxChannel):.3f} Hz, "
+                f"gain={self.Usrp.get_tx_gain(self.TxChannel):.2f} dB, "
+                f"antenna={self.Usrp.get_tx_antenna(self.TxChannel)}, "
+                f"external attenuation={self.ExternalAttenuationDb:.1f} dB"
+            )
 
     def Shutdown(self):
         if self.RxStreamer is not None and uhd is not None:
@@ -182,6 +316,7 @@ class EttusRadarSource:
                 pass
 
         self.RxStreamer = None
+        self.TxStreamer = None
         self.Usrp = None
         self._configured_sample_rate = None
         self._receive_path_warmed = False
@@ -291,10 +426,14 @@ class EttusRadarSource:
         outstanding_receive_commands = 0
         outstanding_after_issue = np.zeros(num_pulses, dtype=np.int64)
         transmit_queued_by_pulse = np.zeros(num_pulses, dtype=bool)
+        transmit_command_count = 0
+        transmit_acknowledgement_count = 0
+        transmit_event_errors = []
 
         def queue_pulse(queue_index):
             nonlocal outstanding_receive_commands
             nonlocal maximum_outstanding_receive_commands
+            nonlocal transmit_command_count
 
             if outstanding_receive_commands >= queue_depth:
                 raise RuntimeError(
@@ -315,6 +454,8 @@ class EttusRadarSource:
                 pulse_index=queue_index,
                 scheduled_pri_time_sec=scheduled_pri_time_sec,
             )
+            if transmit_queued:
+                transmit_command_count += 1
             self._issue_receive_command(
                 num_samples=num_samples,
                 scheduled_time_sec=scheduled_time_sec,
@@ -357,6 +498,15 @@ class EttusRadarSource:
             ):
                 queue_pulse(next_queue_index)
                 next_queue_index += 1
+
+            # Replenish the scheduling horizon before touching TX diagnostic
+            # events. This ordering was proven by the Stage 3D loopback test.
+            if self.TimedTransmitEnabled:
+                acknowledged, errors = (
+                    self._drain_tx_events_nonblocking()
+                )
+                transmit_acknowledgement_count += acknowledged
+                transmit_event_errors.extend(errors)
 
             copied = min(len(pulse_iq), num_samples)
             if copied:
@@ -404,12 +554,35 @@ class EttusRadarSource:
             diag.update(context)
             pulse_diagnostics.append(diag)
 
+        if self.TimedTransmitEnabled:
+            acknowledged, errors = self._wait_for_tx_events(
+                expected_acknowledgements=(
+                    transmit_command_count
+                    - transmit_acknowledgement_count
+                ),
+                timeout_sec=self.TxAsyncTimeoutSec,
+            )
+            transmit_acknowledgement_count += acknowledged
+            transmit_event_errors.extend(errors)
+
+            if transmit_acknowledgement_count != transmit_command_count:
+                transmit_event_errors.append(
+                    "burst acknowledgements "
+                    f"{transmit_acknowledgement_count}/"
+                    f"{transmit_command_count}"
+                )
+            if transmit_event_errors:
+                raise RuntimeError(
+                    "Ettus timed-TX dwell failed after CPI capture: "
+                    + "; ".join(transmit_event_errors)
+                )
+
         wall_end = time.time()
 
         diagnostics = {
             "SourceType": "EttusRadarSource",
             "OperatingMode": str(self.OperatingMode),
-            "ReceiveOnly": True,
+            "ReceiveOnly": not self.TimedTransmitEnabled,
             "ReceiveCommandPerPri": True,
             "SBandStylePerPriLoop": True,
             "AdaptiveIndividualPriPipeline": False,
@@ -435,6 +608,17 @@ class EttusRadarSource:
             ),
             "CommandLeadTimeAppliedOncePerDwell": True,
             "TimedTransmitEnabled": bool(self.TimedTransmitEnabled),
+            "RfOutputAcknowledged": bool(self.RfOutputAcknowledged),
+            "LoopbackConfirmed": bool(self.LoopbackConfirmed),
+            "ExternalAttenuationDb": float(self.ExternalAttenuationDb),
+            "TransmitCommandCount": int(transmit_command_count),
+            "TransmitBurstAcknowledgementCount": int(
+                transmit_acknowledgement_count
+            ),
+            "TransmitEventErrors": list(transmit_event_errors),
+            "MaximumOutstandingTimedPairs": int(
+                maximum_outstanding_receive_commands
+            ),
             "SecondTransmitPulseEnabled": False,
             "SoftwareIqInjectionEnabled": self.IqInjector is not None,
             "RequestedSampleRate": sample_rate,
@@ -446,6 +630,11 @@ class EttusRadarSource:
                 scheduled_pri_times_sec.copy()
             ),
             "ScheduledRxHardwareTimesSec": scheduled_rx_times_sec.copy(),
+            "ScheduledTxHardwareTimesSec": np.where(
+                transmit_queued_by_pulse,
+                scheduled_pri_times_sec,
+                np.nan,
+            ),
             "RxFrequencyHz": float(self.Usrp.get_rx_freq(self.Channel)),
             "RxGainDb": float(self.Usrp.get_rx_gain(self.Channel)),
             "RxAntenna": str(self.Usrp.get_rx_antenna(self.Channel)),
@@ -456,6 +645,18 @@ class EttusRadarSource:
             "PulseDiagnostics": pulse_diagnostics,
             "CaptureElapsedSec": wall_end - wall_start,
         }
+        if self.TimedTransmitEnabled:
+            diagnostics.update({
+                "TxFrequencyHz": float(
+                    self.Usrp.get_tx_freq(self.TxChannel)
+                ),
+                "TxGainDb": float(
+                    self.Usrp.get_tx_gain(self.TxChannel)
+                ),
+                "TxAntenna": str(
+                    self.Usrp.get_tx_antenna(self.TxChannel)
+                ),
+            })
 
         return RawDwellData(
             DwellId=int(ThisDwell.DwellId),
@@ -477,21 +678,148 @@ class EttusRadarSource:
         pulse_index,
         scheduled_pri_time_sec,
     ):
-        """Stage 3E insertion point for one finite timed TX burst.
+        """Queue one finite waveform burst at the absolute PRI origin."""
 
-        Stage 3E0 remains fail-closed receive-only and therefore creates no TX
-        streamer and queues no samples. The production implementation will use
-        this hook to send exactly one waveform at the supplied absolute PRI
-        time after the bounded paired path is integrated and enabled.
-        """
+        if not self.TimedTransmitEnabled:
+            return False
+        if self.OperatingMode != "TIMED_TX_RX":
+            raise RuntimeError("Timed TX reached a non-transmit mode")
+        if self.TxStreamer is None:
+            raise RuntimeError("Timed TX is enabled but no TX streamer exists")
+        if not self._get_pulse_tx_enabled(ThisDwell, pulse_index):
+            return False
+        if self.TheWaveformLibrary is None:
+            raise RuntimeError("Timed TX requires WaveformLibrary")
+        if self._configured_sample_rate is None:
+            raise RuntimeError("TX sample rate has not been configured")
 
-        if self.TimedTransmitEnabled or self.OperatingMode != "RECEIVE_ONLY":
-            raise RuntimeError(
-                "Timed transmit reached the Stage 3E0 receive-only hook"
+        waveform_id = self._get_pulse_waveform_id(
+            ThisDwell,
+            pulse_index,
+        )
+        waveform = np.asarray(
+            self.TheWaveformLibrary.Get(waveform_id),
+            dtype=np.complex64,
+        )
+        if waveform.ndim != 1 or waveform.size == 0:
+            raise ValueError(
+                f"Waveform {waveform_id} must be a non-empty 1D array"
             )
 
-        del ThisDwell, pulse_index, scheduled_pri_time_sec
-        return False
+        pulse_plan = self._get_pulse_plan(ThisDwell, pulse_index)
+        amplitude_scale = self.TxAmplitudeScale
+        phase_offset_rad = 0.0
+        frequency_offset_hz = 0.0
+        if pulse_plan is not None:
+            amplitude_scale *= float(
+                getattr(pulse_plan, "AmplitudeScale", 1.0)
+            )
+            phase_offset_rad = float(
+                getattr(pulse_plan, "PhaseOffsetRad", 0.0)
+            )
+            frequency_offset_hz = float(
+                getattr(pulse_plan, "FrequencyOffsetHz", 0.0)
+            )
+        if not 0.0 < amplitude_scale <= 1.0:
+            raise ValueError(
+                "Combined TX amplitude scale must be in (0, 1]"
+            )
+
+        if phase_offset_rad != 0.0 or frequency_offset_hz != 0.0:
+            sample_number = np.arange(waveform.size, dtype=np.float64)
+            phase = (
+                phase_offset_rad
+                + 2.0
+                * np.pi
+                * frequency_offset_hz
+                * sample_number
+                / float(self._configured_sample_rate)
+            )
+            waveform = waveform * np.exp(1j * phase).astype(np.complex64)
+        waveform = np.asarray(
+            waveform * amplitude_scale,
+            dtype=np.complex64,
+        )
+
+        pulse_duration_sec = (
+            waveform.size / float(self._configured_sample_rate)
+        )
+        pri_sec = self._get_pulse_pri_sec(ThisDwell, pulse_index)
+        rx_start_delay_sec = self._get_pulse_rx_start_delay_sec(
+            ThisDwell,
+            pulse_index,
+        )
+        if pulse_duration_sec > pri_sec:
+            raise ValueError("TX waveform does not fit within the PRI")
+        if pulse_duration_sec > rx_start_delay_sec + 1.0e-12:
+            raise ValueError(
+                "Operational RX starts before the TX waveform has ended"
+            )
+
+        metadata = uhd.types.TXMetadata()
+        metadata.has_time_spec = True
+        metadata.time_spec = uhd.types.TimeSpec(
+            float(scheduled_pri_time_sec)
+        )
+        metadata.start_of_burst = True
+        metadata.end_of_burst = True
+
+        sent = int(
+            self.TxStreamer.send(
+                waveform,
+                metadata,
+                self.TxSendTimeoutSec,
+            )
+        )
+        if sent != waveform.size:
+            raise RuntimeError(
+                f"Pulse {pulse_index}: short TX send "
+                f"{sent}/{waveform.size} samples"
+            )
+        return True
+
+    def _drain_tx_events_nonblocking(self):
+        """Drain available TX events without consuming scheduling horizon."""
+
+        metadata = uhd.types.TXAsyncMetadata()
+        acknowledgements = 0
+        errors = []
+        while self.TxStreamer.recv_async_msg(metadata, 0.0):
+            code = self._error_value(metadata.event_code)
+            if code == 0x01:
+                acknowledgements += 1
+            else:
+                errors.append(
+                    f"TX async event {TX_EVENT_NAMES.get(code, f'unknown_{code}')}"
+                )
+        return acknowledgements, errors
+
+    def _wait_for_tx_events(self, expected_acknowledgements, timeout_sec):
+        """Collect remaining burst ACKs once the complete CPI is captured."""
+
+        expected_acknowledgements = int(expected_acknowledgements)
+        if expected_acknowledgements <= 0:
+            return 0, []
+
+        metadata = uhd.types.TXAsyncMetadata()
+        acknowledgements = 0
+        errors = []
+        deadline = time.monotonic() + float(timeout_sec)
+        while (
+            acknowledgements < expected_acknowledgements
+            and time.monotonic() < deadline
+        ):
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self.TxStreamer.recv_async_msg(metadata, remaining):
+                break
+            code = self._error_value(metadata.event_code)
+            if code == 0x01:
+                acknowledgements += 1
+            else:
+                errors.append(
+                    f"TX async event {TX_EVENT_NAMES.get(code, f'unknown_{code}')}"
+                )
+        return acknowledgements, errors
 
     def _configure_atr_gpio(self):
         """Configure J6 pins 3 and 4 as FPGA-controlled ATR outputs."""
@@ -718,9 +1046,28 @@ class EttusRadarSource:
         if self._configured_sample_rate != requested_rate:
             self._receive_path_warmed = False
             self.Usrp.set_rx_rate(float(requested_rate), self.Channel)
-            self._configured_sample_rate = float(
+            actual_rx_rate = float(
                 self.Usrp.get_rx_rate(self.Channel)
             )
+            if self.TimedTransmitEnabled:
+                self.Usrp.set_tx_rate(
+                    float(requested_rate),
+                    self.TxChannel,
+                )
+                actual_tx_rate = float(
+                    self.Usrp.get_tx_rate(self.TxChannel)
+                )
+                if not np.isclose(
+                    actual_tx_rate,
+                    actual_rx_rate,
+                    rtol=0.0,
+                    atol=1.0,
+                ):
+                    raise RuntimeError(
+                        f"RX/TX sample rates differ: "
+                        f"{actual_rx_rate:g}/{actual_tx_rate:g} Hz"
+                    )
+            self._configured_sample_rate = actual_rx_rate
         return self._configured_sample_rate
 
     def _build_device_args(self):
@@ -740,6 +1087,22 @@ class EttusRadarSource:
         if hasattr(ThisDwell, "PulsePlans"):
             return len(ThisDwell.PulsePlans)
         return int(ThisDwell.NumPulses)
+
+    @staticmethod
+    def _get_pulse_plan(ThisDwell, pulse_index):
+        if hasattr(ThisDwell, "PulsePlans"):
+            return ThisDwell.PulsePlans[pulse_index]
+        return None
+
+    @staticmethod
+    def _get_pulse_tx_enabled(ThisDwell, pulse_index):
+        pulse_plan = EttusRadarSource._get_pulse_plan(
+            ThisDwell,
+            pulse_index,
+        )
+        if pulse_plan is not None:
+            return bool(pulse_plan.TxEnabled)
+        return True
 
     @staticmethod
     def _get_pulse_waveform_id(ThisDwell, pulse_index):
