@@ -399,7 +399,16 @@ def Main():
         "EttusSampleRateHz": 40.0e6,
         "EttusMaxSampleRateHz": 40.0e6,
         "EttusReceiveTimeoutSec": 1.0,
-        "EttusCommandLeadTimeSec": 0.005,
+        # Stage 3E0 is deliberately fail-closed. The first operational Ettus
+        # run remains receive-only with the same 50 ms lead used by the proven
+        # hardware harness. Timed TX and ATR are enabled only in later,
+        # separately verified stages.
+        "EttusOperatingMode": "RECEIVE_ONLY",
+        "EttusTimedTransmitEnabled": False,
+        "EttusAtrGpioEnabled": False,
+        "EttusCommandLeadTimeSec": 0.050,
+        "EttusCommandQueueDepth": 20,
+        "EttusRxWarmupEnabled": True,
         "EttusDebug": True,
 
         # Initial pulse-plan architecture. Search and track waveform selectors

@@ -1,7 +1,7 @@
 """
 Vanguard X - EttusRadarSource.py
 
-Stage 4A.2 receive-only source for an Ettus B200mini.
+Stage 3E0 fail-closed individual-PRI receive-only source for an Ettus B200mini.
 
 The setup now runs automatically during Initialise() and configures:
 
@@ -13,10 +13,16 @@ ATR_TX: TX high, RX low
 ATR_XX: both low
 
 Key behaviour:
-- One finite UHD receive command is issued for each PRI.
-- Each command captures exactly NumSamples IQ samples.
+- The hardware clock is read once to establish the absolute dwell start.
+- A bounded queue holds at most 20 individual finite PRI pairs.
+- One future pair is appended after each collected RX window.
+- Every TX hook and RX command remains finite and pulse-specific.
+- No dwell-length command queue and no continuous RX are used.
 - Returned IQ shape is NumPulses x NumSamples.
-- No second RF pulse is transmitted.
+- Stage 3E0 leaves the timed-TX hook disabled and rejects any configuration
+  that attempts to enable operational transmit.
+- ATR GPIO is disabled by default and must be enabled explicitly only after
+  its separate oscilloscope-verification stage.
 - Optional software IQ injection can add synthetic targets to each received PRI.
 """
 
@@ -42,7 +48,7 @@ IqInjector = Callable[[np.ndarray, int, object, dict], np.ndarray]
 
 
 class EttusRadarSource:
-    """Receive-only Ettus source with one finite RX command per PRI."""
+    """Receive-only validation of a fixed-depth individual-PRI pipeline."""
 
     def __init__(
         self,
@@ -53,6 +59,26 @@ class EttusRadarSource:
         self.Config = Config
         self.TheWaveformLibrary = TheWaveformLibrary
         self.IqInjector = iq_injector
+
+        self.OperatingMode = str(
+            Config.get("EttusOperatingMode", "RECEIVE_ONLY")
+        ).strip().upper()
+        self.TimedTransmitEnabled = bool(
+            Config.get("EttusTimedTransmitEnabled", False)
+        )
+        if self.OperatingMode not in ("RECEIVE_ONLY", "TIMED_TX_RX"):
+            raise ValueError(
+                "EttusOperatingMode must be RECEIVE_ONLY or TIMED_TX_RX"
+            )
+        if (
+            self.OperatingMode != "RECEIVE_ONLY"
+            or self.TimedTransmitEnabled
+        ):
+            raise RuntimeError(
+                "Operational Ettus timed transmit is not integrated yet. "
+                "Use EttusOperatingMode='RECEIVE_ONLY' and "
+                "EttusTimedTransmitEnabled=False."
+            )
 
         self.Usrp = None
         self.RxStreamer = None
@@ -65,14 +91,26 @@ class EttusRadarSource:
         self.CommandLeadTimeSec = float(
             Config.get("EttusCommandLeadTimeSec", 0.05)
         )
+        if self.CommandLeadTimeSec <= 0.0:
+            raise ValueError("EttusCommandLeadTimeSec must be positive")
         self.Debug = bool(Config.get("EttusDebug", False))
+        self.CommandQueueDepth = int(
+            Config.get("EttusCommandQueueDepth", 20)
+        )
+        self.RxWarmupEnabled = bool(
+            Config.get("EttusRxWarmupEnabled", True)
+        )
+        if not 1 <= self.CommandQueueDepth <= 32:
+            raise ValueError(
+                "EttusCommandQueueDepth must be between 1 and 32"
+            )
 
         # B200mini front-panel GPIO/ATR configuration.  The configuration
         # values are logical GPIO bit numbers, not physical connector pins:
         # J6 pin 3 -> GPIO_1 -> bit 1 (TX ATR)
         # J6 pin 4 -> GPIO_2 -> bit 2 (RX ATR)
         self.AtrGpioEnabled = bool(
-            Config.get("EttusAtrGpioEnabled", True)
+            Config.get("EttusAtrGpioEnabled", False)
         )
         self.GpioBank = str(Config.get("EttusGPIOBank", "FP0"))
         self.TxAtrGpioBit = int(Config.get("EttusTxAtrGPIO", 1))
@@ -82,6 +120,7 @@ class EttusRadarSource:
         self.AtrGpioMask = self.TxAtrMask | self.RxAtrMask
 
         self._configured_sample_rate = None
+        self._receive_path_warmed = False
         self._initialised = False
 
     def Initialise(self):
@@ -127,6 +166,8 @@ class EttusRadarSource:
             f"RX={self.Usrp.get_rx_freq(self.Channel):.3f} Hz, "
             f"gain={self.Usrp.get_rx_gain(self.Channel):.2f} dB, "
             f"antenna={self.Usrp.get_rx_antenna(self.Channel)}, "
+            f"mode={self.OperatingMode}, "
+            f"timed TX={'enabled' if self.TimedTransmitEnabled else 'disabled'}, "
             f"ATR GPIO={'enabled' if self.AtrGpioEnabled else 'disabled'}"
         )
 
@@ -143,6 +184,7 @@ class EttusRadarSource:
         self.RxStreamer = None
         self.Usrp = None
         self._configured_sample_rate = None
+        self._receive_path_warmed = False
         self._initialised = False
         print("Ettus source shutdown")
 
@@ -170,6 +212,13 @@ class EttusRadarSource:
             raise ValueError("NumPulses must be positive")
 
         actual_sample_rate = self._configure_sample_rate(sample_rate)
+
+        warmup_performed = False
+        warmup_diagnostics = None
+        if self.RxWarmupEnabled and not self._receive_path_warmed:
+            warmup_diagnostics = self._warm_up_receive_path(num_samples)
+            self._receive_path_warmed = True
+            warmup_performed = True
 
         pulse_pri_sec = np.asarray(
             [
@@ -217,28 +266,75 @@ class EttusRadarSource:
         pulse_valid = np.ones(num_pulses, dtype=bool)
         pulse_diagnostics = []
 
-        hardware_start_sec = (
-            self.Usrp.get_time_now().get_real_secs()
-            + self.CommandLeadTimeSec
-        )
+        # Match the proven S-band implementation: read device time once to
+        # establish T0, then derive every PRI from the fixed absolute grid.
+        # Per-PRI get_time_now() calls add a slow USB control transaction and
+        # can themselves make the next command late.
+        hardware_now_sec = self.Usrp.get_time_now().get_real_secs()
+        hardware_time_query_count = 1
+        hardware_start_sec = hardware_now_sec + self.CommandLeadTimeSec
         wall_start = time.time()
 
-        # Queue every timed RX command before waiting for any samples.
-        # CommandLeadTimeSec is applied once to hardware_start_sec above;
-        # subsequent PRI times are derived only from the dwell PRI schedule.
+        # CommandLeadTimeSec is applied once. Subsequent pulse times are always
+        # T0 + n*PRI; they are never retimed from host execution time.
         scheduled_pri_times_sec = hardware_start_sec + pulse_times_sec
         scheduled_rx_times_sec = (
             scheduled_pri_times_sec + pulse_rx_start_delay_sec
         )
-        for scheduled_time_sec in scheduled_rx_times_sec:
-            self._issue_receive_command(
-                num_samples=num_samples,
-                scheduled_time_sec=float(scheduled_time_sec),
+        if np.any(np.diff(scheduled_rx_times_sec) < 0.0):
+            raise ValueError("RX windows must be scheduled in time order")
+
+        minimum_pri_sec = float(np.min(pulse_pri_sec))
+        queue_depth = min(self.CommandQueueDepth, num_pulses)
+
+        maximum_outstanding_receive_commands = 0
+        outstanding_receive_commands = 0
+        outstanding_after_issue = np.zeros(num_pulses, dtype=np.int64)
+        transmit_queued_by_pulse = np.zeros(num_pulses, dtype=bool)
+
+        def queue_pulse(queue_index):
+            nonlocal outstanding_receive_commands
+            nonlocal maximum_outstanding_receive_commands
+
+            if outstanding_receive_commands >= queue_depth:
+                raise RuntimeError(
+                    "Individual PRI pipeline exceeded its bounded horizon"
+                )
+            scheduled_pri_time_sec = float(
+                scheduled_pri_times_sec[queue_index]
+            )
+            scheduled_time_sec = float(
+                scheduled_rx_times_sec[queue_index]
             )
 
-        # After all receive windows are armed, collect one window per PRI.
-        # This structure also leaves room to queue timed TX commands between
-        # the RX-command loop above and the blocking receive loop below.
+            # Individual-pair ordering inherited from S-band:
+            #   1. queue finite timed TX at Tn (disabled here);
+            #   2. arm finite RX at Tn + RxStartDelay.
+            transmit_queued = self._queue_transmit_for_pri(
+                ThisDwell=ThisDwell,
+                pulse_index=queue_index,
+                scheduled_pri_time_sec=scheduled_pri_time_sec,
+            )
+            self._issue_receive_command(
+                num_samples=num_samples,
+                scheduled_time_sec=scheduled_time_sec,
+            )
+            outstanding_receive_commands += 1
+            maximum_outstanding_receive_commands = max(
+                maximum_outstanding_receive_commands,
+                outstanding_receive_commands,
+            )
+
+            outstanding_after_issue[queue_index] = (
+                outstanding_receive_commands
+            )
+            transmit_queued_by_pulse[queue_index] = bool(transmit_queued)
+
+        next_queue_index = 0
+        while next_queue_index < queue_depth:
+            queue_pulse(next_queue_index)
+            next_queue_index += 1
+
         for pulse_index in range(num_pulses):
             scheduled_pri_time_sec = float(
                 scheduled_pri_times_sec[pulse_index]
@@ -246,10 +342,21 @@ class EttusRadarSource:
             scheduled_time_sec = float(
                 scheduled_rx_times_sec[pulse_index]
             )
+            try:
+                pulse_iq, diag = self._receive_scheduled_pri(
+                    num_samples=num_samples,
+                )
+            finally:
+                outstanding_receive_commands -= 1
 
-            pulse_iq, diag = self._receive_scheduled_pri(
-                num_samples=num_samples,
-            )
+            # Restore the time-based horizon immediately after collection,
+            # before IQ copying or diagnostic formatting consumes host time.
+            if (
+                next_queue_index < num_pulses
+                and outstanding_receive_commands < queue_depth
+            ):
+                queue_pulse(next_queue_index)
+                next_queue_index += 1
 
             copied = min(len(pulse_iq), num_samples)
             if copied:
@@ -267,6 +374,13 @@ class EttusRadarSource:
                 ),
                 "WaveformId": str(pulse_waveform_ids[pulse_index]),
                 "ValidBeforeInjection": bool(pulse_valid[pulse_index]),
+                "ReceiveCommandOrdinal": pulse_index + 1,
+                "OutstandingReceiveCommandsAfterIssue": int(
+                    outstanding_after_issue[pulse_index]
+                ),
+                "TransmitQueued": bool(
+                    transmit_queued_by_pulse[pulse_index]
+                ),
             }
 
             if self.IqInjector is not None:
@@ -294,11 +408,33 @@ class EttusRadarSource:
 
         diagnostics = {
             "SourceType": "EttusRadarSource",
+            "OperatingMode": str(self.OperatingMode),
             "ReceiveOnly": True,
             "ReceiveCommandPerPri": True,
-            "AllReceiveCommandsQueuedBeforeCollection": True,
+            "SBandStylePerPriLoop": True,
+            "AdaptiveIndividualPriPipeline": False,
+            "BoundedIndividualPriPipeline": True,
+            "AllReceiveCommandsQueuedBeforeCollection": (
+                queue_depth == num_pulses
+            ),
+            "ReceiveCommandCount": num_pulses,
+            "ConfiguredCommandQueueDepth": self.CommandQueueDepth,
+            "ActiveCommandQueueDepth": queue_depth,
+            "CommandQueueHorizonSec": queue_depth * minimum_pri_sec,
+            "MaximumOutstandingReceiveCommands": (
+                maximum_outstanding_receive_commands
+            ),
+            "HardwareTimeQueriesPerDwell": hardware_time_query_count,
+            "RxWarmupEnabled": self.RxWarmupEnabled,
+            "RxWarmupPerformed": warmup_performed,
+            "RxWarmupDiagnostics": warmup_diagnostics,
+            "FixedAbsolutePriSchedule": True,
+            "PerPriOperationOrder": (
+                "QUEUE_BOUNDED_INDIVIDUAL_PAIRS; COLLECT_OLDEST; "
+                "REPLENISH_ONE"
+            ),
             "CommandLeadTimeAppliedOncePerDwell": True,
-            "TimedTransmitEnabled": False,
+            "TimedTransmitEnabled": bool(self.TimedTransmitEnabled),
             "SecondTransmitPulseEnabled": False,
             "SoftwareIqInjectionEnabled": self.IqInjector is not None,
             "RequestedSampleRate": sample_rate,
@@ -334,6 +470,28 @@ class EttusRadarSource:
             PulseValid=pulse_valid,
             Diagnostics=diagnostics,
         )
+
+    def _queue_transmit_for_pri(
+        self,
+        ThisDwell,
+        pulse_index,
+        scheduled_pri_time_sec,
+    ):
+        """Stage 3E insertion point for one finite timed TX burst.
+
+        Stage 3E0 remains fail-closed receive-only and therefore creates no TX
+        streamer and queues no samples. The production implementation will use
+        this hook to send exactly one waveform at the supplied absolute PRI
+        time after the bounded paired path is integrated and enabled.
+        """
+
+        if self.TimedTransmitEnabled or self.OperatingMode != "RECEIVE_ONLY":
+            raise RuntimeError(
+                "Timed transmit reached the Stage 3E0 receive-only hook"
+            )
+
+        del ThisDwell, pulse_index, scheduled_pri_time_sec
+        return False
 
     def _configure_atr_gpio(self):
         """Configure J6 pins 3 and 4 as FPGA-controlled ATR outputs."""
@@ -411,6 +569,41 @@ class EttusRadarSource:
         )
         self.RxStreamer.issue_stream_cmd(command)
 
+    def _warm_up_receive_path(self, num_samples):
+        """Prime the RX streamer once before establishing the first dwell T0."""
+
+        command = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
+        command.num_samps = int(num_samples)
+        command.stream_now = True
+        self.RxStreamer.issue_stream_cmd(command)
+
+        _, diagnostics = self._receive_scheduled_pri(
+            num_samples=int(num_samples),
+        )
+        error_count = sum(
+            int(diagnostics.get(Name, 0))
+            for Name in (
+                "TimeoutCount",
+                "OverflowCount",
+                "LateCommandCount",
+                "BrokenChainCount",
+                "AlignmentErrorCount",
+                "BadPacketCount",
+                "OtherErrorCount",
+            )
+        )
+        if (
+            int(diagnostics.get("ReceivedSamples", 0)) != int(num_samples)
+            or error_count != 0
+        ):
+            raise RuntimeError(
+                "Ettus RX warm-up failed: "
+                f"{diagnostics.get('ReceivedSamples', 0)}/{num_samples} "
+                "samples, metadata="
+                f"{diagnostics.get('LastMetadataError', 'unknown')}"
+            )
+        return diagnostics
+
     def _receive_scheduled_pri(self, num_samples):
         """Collect samples from the next previously queued RX window."""
         metadata = uhd.types.RXMetadata()
@@ -424,8 +617,14 @@ class EttusRadarSource:
         timeout_count = 0
         overflow_count = 0
         late_command_count = 0
+        broken_chain_count = 0
+        alignment_error_count = 0
+        bad_packet_count = 0
         other_error_count = 0
         last_error = "none"
+        last_error_code_value = 0
+        last_error_text = ""
+        metadata_error_events = []
         first_sample_time_sec = None
 
         while received_total < num_samples:
@@ -443,9 +642,22 @@ class EttusRadarSource:
                 )
             )
 
-            last_error = self._error_name(metadata.error_code)
+            error_code_value = self._error_value(metadata.error_code)
+            error_name = self._error_name(metadata.error_code)
+            error_text = self._metadata_error_text(metadata)
 
-            if metadata.error_code == uhd.types.RXMetadataErrorCode.none:
+            if error_code_value not in (None, 0):
+                last_error = error_name
+                last_error_code_value = error_code_value
+                last_error_text = error_text
+                metadata_error_events.append({
+                    "CodeValue": error_code_value,
+                    "Name": error_name,
+                    "Text": error_text,
+                    "ReceivedSamplesThisCall": received_now,
+                })
+
+            if error_code_value == 0:
                 if received_now > 0:
                     output[
                         received_total:received_total + received_now
@@ -460,24 +672,26 @@ class EttusRadarSource:
                         )
                 continue
 
-            if metadata.error_code == uhd.types.RXMetadataErrorCode.timeout:
+            if error_code_value == 1:
                 timeout_count += 1
                 break
 
-            if metadata.error_code == uhd.types.RXMetadataErrorCode.overflow:
+            if error_code_value == 8:
                 overflow_count += 1
                 continue
 
-            late_code = getattr(
-                uhd.types.RXMetadataErrorCode,
-                "late_command",
-                None,
-            )
-            if late_code is not None and metadata.error_code == late_code:
+            if error_code_value == 2:
                 late_command_count += 1
                 break
 
-            other_error_count += 1
+            if error_code_value == 4:
+                broken_chain_count += 1
+            elif error_code_value == 12:
+                alignment_error_count += 1
+            elif error_code_value == 15:
+                bad_packet_count += 1
+            else:
+                other_error_count += 1
             break
 
         diagnostics = {
@@ -487,8 +701,14 @@ class EttusRadarSource:
             "TimeoutCount": int(timeout_count),
             "OverflowCount": int(overflow_count),
             "LateCommandCount": int(late_command_count),
+            "BrokenChainCount": int(broken_chain_count),
+            "AlignmentErrorCount": int(alignment_error_count),
+            "BadPacketCount": int(bad_packet_count),
             "OtherErrorCount": int(other_error_count),
             "LastMetadataError": str(last_error),
+            "LastMetadataErrorCodeValue": last_error_code_value,
+            "LastMetadataErrorText": str(last_error_text),
+            "MetadataErrorEvents": metadata_error_events,
             "FirstSampleHardwareTimeSec": first_sample_time_sec,
         }
 
@@ -496,6 +716,7 @@ class EttusRadarSource:
 
     def _configure_sample_rate(self, requested_rate):
         if self._configured_sample_rate != requested_rate:
+            self._receive_path_warmed = False
             self.Usrp.set_rx_rate(float(requested_rate), self.Channel)
             self._configured_sample_rate = float(
                 self.Usrp.get_rx_rate(self.Channel)
@@ -550,4 +771,32 @@ class EttusRadarSource:
 
     @staticmethod
     def _error_name(error_code):
-        return str(error_code).split(".")[-1].lower()
+        value = EttusRadarSource._error_value(error_code)
+        names = {
+            0: "none",
+            1: "timeout",
+            2: "late_command",
+            4: "broken_chain",
+            8: "overflow",
+            12: "alignment",
+            15: "bad_packet",
+        }
+        return names.get(value, str(error_code).split(".")[-1].lower())
+
+    @staticmethod
+    def _error_value(error_code):
+        raw_value = getattr(error_code, "value", error_code)
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _metadata_error_text(metadata):
+        strerror = getattr(metadata, "strerror", None)
+        if callable(strerror):
+            try:
+                return str(strerror())
+            except Exception:
+                return ""
+        return ""
