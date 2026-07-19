@@ -36,6 +36,8 @@ import math
 import os
 import numpy as np
 
+from RangeProfileScaling import CalculateNoiseReferencedRangeProfileLimits
+
 DISPLAY_VERSION = "tracks-white-surface-symbol-v7-side-by-side-target"
 
 # Force pyqtgraph to use the conda PyQt5 binding.
@@ -177,8 +179,9 @@ class RadarDisplay:
         self.DecimateRangeProfile = int(Config.get("QtRangeProfileDecimation", 2))
         self.MaxRangeProfilePoints = int(Config.get("QtMaxRangeProfilePoints", 1500))
 
-        # Fixed range-profile vertical scale. This avoids the target peak
-        # appearing to jump around as the noise floor/autoscale changes.
+        # Range-profile vertical scale. By default both limits follow a robust
+        # estimate of the displayed noise floor and the current strongest
+        # return. Editing Max dB switches only the upper limit to manual.
         self.RangeProfileMinDb = float(Config.get("RangeProfileMinDb", -110.0))
         self.RangeProfileMaxDb = float(Config.get("RangeProfileMaxDb", -20.0))
         self.RangeProfileAutoScale = bool(Config.get("RangeProfileAutoScale", False))
@@ -186,12 +189,22 @@ class RadarDisplay:
         # Optional robust automatic lower Y-limit based on estimated noise floor.
         # This is different from full autoscale: the max remains operator-set,
         # while the min follows the estimated noise floor.
-        self.RangeProfileAutoMinDb = bool(Config.get("RangeProfileAutoMinDb", False))
+        self.RangeProfileAutoMinDb = bool(Config.get("RangeProfileAutoMinDb", True))
+        self.RangeProfileAutoMaxDb = bool(Config.get("RangeProfileAutoMaxDb", True))
         self.RangeProfileNoiseMarginDb = float(Config.get("RangeProfileNoiseMarginDb", 5.0))
+        self.RangeProfileMinimumSpanAboveNoiseDb = float(
+            Config.get("RangeProfileMinimumSpanAboveNoiseDb", 20.0)
+        )
+        self.RangeProfilePeakHeadroomDb = float(
+            Config.get("RangeProfilePeakHeadroomDb", 3.0)
+        )
         self.RangeProfileNoisePercentile = float(Config.get("RangeProfileNoisePercentile", 70.0))
         self.RangeProfileNoiseAlpha = float(Config.get("RangeProfileNoiseAlpha", 0.15))
         self.RangeProfileDetectionExclusionBins = int(Config.get("RangeProfileDetectionExclusionBins", 6))
         self.EstimatedNoiseFloorDb = None
+        self.EstimatedRangeProfilePeakDb = None
+        self.RangeProfileDisplayMinDb = self.RangeProfileMinDb
+        self.RangeProfileDisplayMaxDb = self.RangeProfileMaxDb
 
         self.PolarDetectionHistory = []
         self.LatestProcessed = None
@@ -609,7 +622,7 @@ class RadarDisplay:
         StopTxButton.clicked.connect(self.OnStopTransmit)
         ExitButton.clicked.connect(self.OnExit)
         ScanButton.clicked.connect(self.OnStartScan)
-        StareButton.clicked.connect(lambda: self.OnModeChanged("STARE"))
+        StareButton.clicked.connect(self.OnStartStare)
         LeftButton.clicked.connect(self.OnBeamLeft)
         RightButton.clicked.connect(self.OnBeamRight)
 
@@ -1024,7 +1037,7 @@ class RadarDisplay:
             self.ConfirmedTrackScatter.setData(ConfX, ConfY)
 
     def ApplyRangeProfileScale(self):
-        """Apply fixed or automatic Y scaling to the range-profile plot."""
+        """Apply manual or noise-referenced range-profile Y limits."""
         if self.RangePlot is None:
             return
 
@@ -1037,15 +1050,63 @@ class RadarDisplay:
         if self.RangeProfileAutoMinDb and self.EstimatedNoiseFloorDb is not None:
             DisplayMinDb = float(self.EstimatedNoiseFloorDb) - self.RangeProfileNoiseMarginDb
 
+        DisplayMaxDb = self.RangeProfileMaxDb
+        if (
+            self.RangeProfileAutoMaxDb
+            and self.EstimatedNoiseFloorDb is not None
+            and self.EstimatedRangeProfilePeakDb is not None
+        ):
+            DisplayMinDb, DisplayMaxDb = (
+                self.CalculateNoiseReferencedRangeProfileLimits(
+                    NoiseFloorDb=self.EstimatedNoiseFloorDb,
+                    PeakDb=self.EstimatedRangeProfilePeakDb,
+                    NoiseMarginDb=self.RangeProfileNoiseMarginDb,
+                    MinimumSpanAboveNoiseDb=(
+                        self.RangeProfileMinimumSpanAboveNoiseDb
+                    ),
+                    PeakHeadroomDb=self.RangeProfilePeakHeadroomDb,
+                )
+            )
+
         # Guard against accidental reversed/zero span limits.
-        if self.RangeProfileMaxDb <= DisplayMinDb:
-            self.RangeProfileMaxDb = DisplayMinDb + 10.0
+        if DisplayMaxDb <= DisplayMinDb:
+            DisplayMaxDb = DisplayMinDb + 10.0
+
+        self.RangeProfileDisplayMinDb = float(DisplayMinDb)
+        self.RangeProfileDisplayMaxDb = float(DisplayMaxDb)
 
         self.RangePlot.enableAutoRange(axis="y", enable=False)
         self.RangePlot.setYRange(
             DisplayMinDb,
-            self.RangeProfileMaxDb,
+            DisplayMaxDb,
             padding=0.0,
+        )
+
+        # Show the active automatic upper limit in the existing Max dB box.
+        # Do not overwrite text while the operator is editing it.
+        MaxWidget = self.ControlWidgets.get("RangeProfileMaxDb")
+        if (
+            self.RangeProfileAutoMaxDb
+            and MaxWidget is not None
+            and not MaxWidget.hasFocus()
+        ):
+            MaxWidget.setText(f"{DisplayMaxDb:.1f}")
+
+    @staticmethod
+    def CalculateNoiseReferencedRangeProfileLimits(
+        NoiseFloorDb,
+        PeakDb,
+        NoiseMarginDb=5.0,
+        MinimumSpanAboveNoiseDb=20.0,
+        PeakHeadroomDb=3.0,
+    ):
+        """Return stable display limits referenced to noise and current peak."""
+        return CalculateNoiseReferencedRangeProfileLimits(
+            NoiseFloorDb=NoiseFloorDb,
+            PeakDb=PeakDb,
+            NoiseMarginDb=NoiseMarginDb,
+            MinimumSpanAboveNoiseDb=MinimumSpanAboveNoiseDb,
+            PeakHeadroomDb=PeakHeadroomDb,
         )
 
     def EstimateRangeProfileNoiseFloorDb(self, RangeAxisM, RangeProfileDb):
@@ -1171,8 +1232,14 @@ class RadarDisplay:
 
         # Estimate the noise floor from the full-resolution visible profile,
         # not from the downsampled display curve.
-        if self.RangeProfileAutoMinDb:
+        if self.RangeProfileAutoMinDb or self.RangeProfileAutoMaxDb:
             self.EstimateRangeProfileNoiseFloorDb(RangeAxisM, RangeProfileDb)
+
+        FiniteProfile = RangeProfileDb[np.isfinite(RangeProfileDb)]
+        if FiniteProfile.size > 0:
+            self.EstimatedRangeProfilePeakDb = float(
+                np.max(FiniteProfile)
+            )
 
         self.RangeProfileCurve.setData(X, Y)
         self.ApplyRangeProfileScale()
@@ -1384,7 +1451,10 @@ class RadarDisplay:
 
         if self.EstimatedNoiseFloorDb is not None:
             Lines.append(f"Noise:  {self.EstimatedNoiseFloorDb:.1f} dB")
-            Lines.append(f"Y-min:  {self.EstimatedNoiseFloorDb - self.RangeProfileNoiseMarginDb:.1f} dB")
+            Lines.append(
+                f"Y-axis: {self.RangeProfileDisplayMinDb:.1f} to "
+                f"{self.RangeProfileDisplayMaxDb:.1f} dB"
+            )
 
         self.StatusLabel.setText("\n".join(Lines))
 
@@ -1429,6 +1499,17 @@ class RadarDisplay:
         self.ManualNudgeDeltaDeg = 0.0
         self.UpdateStatusPanel()
 
+    def OnStartStare(self):
+        # STARE is an explicit radar operating command, parallel to SCAN.
+        # Hold the measured beam position and arm RF only when the configured
+        # source has declared transmit capability.
+        self.DisplayMode = "STARE"
+        self.ScanEnabled = False
+        if self.TransmitAvailable:
+            self.TransmitEnabled = True
+        self.ManualNudgeDeltaDeg = 0.0
+        self.UpdateStatusPanel()
+
     def OnStop(self):
         # STOP is a hard one-shot operator event. The main loop uses
         # StopCommandId to send a real PTZ stop and then remains in idle.
@@ -1450,6 +1531,7 @@ class RadarDisplay:
         self.Window.close()
 
     def OnModeChanged(self, Label):
+        # Retained for compatibility with callers outside this display.
         self.DisplayMode = Label
         self.ScanEnabled = True if Label == "SCAN" else False
         self.UpdateStatusPanel()
@@ -1457,10 +1539,14 @@ class RadarDisplay:
     def OnBeamLeft(self):
         # One-shot manual nudge event. BeamAngleDeg is display state and may be
         # overwritten by measured PTZ angle, so the main loop must consume this
-        # explicit delta instead of inferring from BeamAngleDeg.
+        # explicit delta instead of inferring from BeamAngleDeg.  The visible
+        # Step control is the operator's nudge increment as well as the sector
+        # scan step setting.
         self.DisplayMode = "STARE"
         self.ScanEnabled = False
-        self.ManualNudgeDeltaDeg = -float(self.ManualBeamStepDeg)
+        if self.TransmitAvailable:
+            self.TransmitEnabled = True
+        self.ManualNudgeDeltaDeg = -abs(float(self.ScanStepDeg))
         self.ManualNudgeCommandId += 1
         self.UpdateStatusPanel()
 
@@ -1468,7 +1554,9 @@ class RadarDisplay:
         # One-shot manual nudge event.
         self.DisplayMode = "STARE"
         self.ScanEnabled = False
-        self.ManualNudgeDeltaDeg = float(self.ManualBeamStepDeg)
+        if self.TransmitAvailable:
+            self.TransmitEnabled = True
+        self.ManualNudgeDeltaDeg = abs(float(self.ScanStepDeg))
         self.ManualNudgeCommandId += 1
         self.UpdateStatusPanel()
 
@@ -1535,6 +1623,8 @@ class RadarDisplay:
             self.Config["RangeProfileMaxDb"] = self.RangeProfileMaxDb
             self.RangeProfileAutoScale = False
             self.Config["RangeProfileAutoScale"] = False
+            self.RangeProfileAutoMaxDb = False
+            self.Config["RangeProfileAutoMaxDb"] = False
             self.ApplyRangeProfileScale()
             self.UpdateStatusPanel()
         except ValueError:

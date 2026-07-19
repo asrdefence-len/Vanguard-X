@@ -1,7 +1,7 @@
 """
 Vanguard X - EttusRadarSource.py
 
-Stage 3E1 guarded bounded timed-TX/RX source for an Ettus B200mini.
+Stage 3F guarded bounded timed-TX/RX source for an Ettus B200mini.
 
 The setup now runs automatically during Initialise() and configures:
 
@@ -24,6 +24,11 @@ Key behaviour:
   attenuated-loopback, and minimum-attenuation safety acknowledgements.
 - Each enabled pulse is one finite timed TX burst paired with one finite RX
   window on the same fixed absolute PRI grid.
+- In the RF target-emulator profile, TargetScenario selects the strongest
+  in-gate parent object each dwell. The main pulse is moved (never copied) by
+  that object's calibrated range delay while boresight is within +/-2 deg;
+  its live radial velocity supplies the pulse-to-pulse Doppler phase.
+- Matched filtering and all downstream processing remain after the full CPI.
 - TX asynchronous events are drained only after replenishing the bounded
   scheduling horizon; remaining burst acknowledgements are collected after
   the complete CPI capture.
@@ -40,6 +45,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from DataTypes import RawDwellData
+from RfScenarioTarget import SelectStrongestScenarioTarget
 
 try:
     import uhd
@@ -157,8 +163,61 @@ class EttusRadarSource:
         )
         if not 0.0 < self.TxAmplitudeScale <= 1.0:
             raise ValueError("EttusTxAmplitudeScale must be in (0, 1]")
+
+        self.RfTargetEmulatorEnabled = bool(
+            Config.get("EttusRfTargetEmulatorEnabled", False)
+        )
+        self.RfTargetUseScenario = bool(
+            Config.get("EttusRfTargetUseScenario", False)
+        )
+        self.RfTargetRangeM = float(
+            Config.get("EttusRfTargetRangeM", 6000.0)
+        )
+        self.RfTargetBearingDeg = float(
+            Config.get("EttusRfTargetBearingDeg", 80.0)
+        )
+        self.RfTargetAngleHalfWidthDeg = float(
+            Config.get("EttusRfTargetAngleHalfWidthDeg", 2.0)
+        )
+        self.RfTargetRadialVelocityMps = float(
+            Config.get("EttusRfTargetRadialVelocityMps", 0.0)
+        )
+        self.LoopbackHardwareDelaySamples = int(
+            Config.get("EttusLoopbackHardwareDelaySamples", 166)
+        )
+        self.RfTargetAmplitudeScale = float(
+            Config.get("EttusRfTargetAmplitudeScale", 1.0)
+        )
+        if self.RfTargetEmulatorEnabled:
+            if not self.TimedTransmitEnabled:
+                raise ValueError(
+                    "RF target emulation requires timed TX/RX"
+                )
+            if self.RfTargetRangeM <= 0.0:
+                raise ValueError("RF target range must be positive")
+            if not np.isclose(
+                self.RfTargetAngleHalfWidthDeg,
+                2.0,
+                rtol=0.0,
+                atol=1.0e-12,
+            ):
+                raise ValueError(
+                    "Stage 3F target bearing gate is fixed at theta +/-2 deg"
+                )
+            if self.LoopbackHardwareDelaySamples < 0:
+                raise ValueError(
+                    "Loopback hardware delay samples must not be negative"
+                )
+            if not 0.0 < self.RfTargetAmplitudeScale <= 1.0:
+                raise ValueError(
+                    "RF target amplitude scale must be in (0, 1]"
+                )
+        elif self.RfTargetUseScenario:
+            raise ValueError(
+                "Scenario RF targets require RF target emulation"
+            )
         self.CommandLeadTimeSec = float(
-            Config.get("EttusCommandLeadTimeSec", 0.05)
+            Config.get("EttusCommandLeadTimeSec", 0.005)
         )
         if self.CommandLeadTimeSec <= 0.0:
             raise ValueError("EttusCommandLeadTimeSec must be positive")
@@ -304,6 +363,24 @@ class EttusRadarSource:
                 f"antenna={self.Usrp.get_tx_antenna(self.TxChannel)}, "
                 f"external attenuation={self.ExternalAttenuationDb:.1f} dB"
             )
+        if self.RfTargetEmulatorEnabled:
+            if self.RfTargetUseScenario:
+                print(
+                    "Ettus Stage 3F RF target emulator: "
+                    "TargetScenario strongest in-gate parent, "
+                    "true bearing +/-2.00 deg, one delayed pulse per PRI"
+                )
+            else:
+                target_offset_us = 1.0e6 * self._target_tx_offset_sec(
+                    float(self.Config.get("EttusSampleRateHz", 40.0e6))
+                )
+                print(
+                    "Ettus Stage 3F RF target emulator: "
+                    f"range={self.RfTargetRangeM / 1000.0:.3f} km, "
+                    f"bearing={self.RfTargetBearingDeg:.2f} +/-2.00 deg, "
+                    f"velocity={self.RfTargetRadialVelocityMps:.2f} m/s, "
+                    f"TX offset={target_offset_us:.3f} us"
+                )
 
     def Shutdown(self):
         if self.RxStreamer is not None and uhd is not None:
@@ -394,6 +471,27 @@ class EttusRadarSource:
                 "count on every pulse in a dwell"
             )
 
+        rf_target = self._resolve_rf_target_for_dwell(
+            ThisDwell=ThisDwell,
+            sample_rate_hz=actual_sample_rate,
+            num_samples=num_samples,
+            waveform_id=pulse_waveform_ids[0],
+            rx_start_delay_sec=float(pulse_rx_start_delay_sec[0]),
+        )
+        rf_target_active = bool(rf_target["Active"])
+        rf_target_angle_error_deg = float(rf_target["AngleErrorDeg"])
+        rf_target_tx_offset_sec = 0.0
+        if rf_target_active:
+            rf_target_tx_offset_sec = self._target_tx_offset_sec(
+                actual_sample_rate,
+                target_range_m=rf_target["RangeM"],
+            )
+        pulse_tx_offset_sec = np.full(
+            num_pulses,
+            rf_target_tx_offset_sec,
+            dtype=np.float64,
+        )
+
         iq = np.zeros(
             (num_pulses, num_samples),
             dtype=np.complex64,
@@ -453,6 +551,10 @@ class EttusRadarSource:
                 ThisDwell=ThisDwell,
                 pulse_index=queue_index,
                 scheduled_pri_time_sec=scheduled_pri_time_sec,
+                tx_time_offset_sec=float(
+                    pulse_tx_offset_sec[queue_index]
+                ),
+                rf_target=rf_target,
             )
             if transmit_queued:
                 transmit_command_count += 1
@@ -531,6 +633,11 @@ class EttusRadarSource:
                 "TransmitQueued": bool(
                     transmit_queued_by_pulse[pulse_index]
                 ),
+                "TransmitTimeOffsetSec": float(
+                    pulse_tx_offset_sec[pulse_index]
+                ),
+                "RfTargetEmulatorActive": bool(rf_target_active),
+                "RfTargetName": str(rf_target["Name"]),
             }
 
             if self.IqInjector is not None:
@@ -611,6 +718,33 @@ class EttusRadarSource:
             "RfOutputAcknowledged": bool(self.RfOutputAcknowledged),
             "LoopbackConfirmed": bool(self.LoopbackConfirmed),
             "ExternalAttenuationDb": float(self.ExternalAttenuationDb),
+            "RfTargetEmulatorEnabled": bool(
+                self.RfTargetEmulatorEnabled
+            ),
+            "RfTargetUseScenario": bool(self.RfTargetUseScenario),
+            "RfTargetEmulatorActive": bool(rf_target_active),
+            "RfTargetName": str(rf_target["Name"]),
+            "RfTargetRangeM": float(rf_target["RangeM"]),
+            "RfTargetBearingDeg": float(rf_target["BearingDeg"]),
+            "RfTargetRadialVelocityMps": float(
+                rf_target["RadialVelocityMps"]
+            ),
+            "RfTargetScenarioEquivalentAmplitude": float(
+                rf_target["EquivalentAmplitude"]
+            ),
+            "RfTargetScenarioConstituentReturnCount": int(
+                rf_target["ConstituentReturnCount"]
+            ),
+            "RfTargetAngleHalfWidthDeg": float(
+                self.RfTargetAngleHalfWidthDeg
+            ),
+            "RfTargetAngleErrorDeg": float(
+                rf_target_angle_error_deg
+            ),
+            "RfTargetTxOffsetSec": float(rf_target_tx_offset_sec),
+            "LoopbackHardwareDelaySamples": int(
+                self.LoopbackHardwareDelaySamples
+            ),
             "TransmitCommandCount": int(transmit_command_count),
             "TransmitBurstAcknowledgementCount": int(
                 transmit_acknowledgement_count
@@ -632,7 +766,7 @@ class EttusRadarSource:
             "ScheduledRxHardwareTimesSec": scheduled_rx_times_sec.copy(),
             "ScheduledTxHardwareTimesSec": np.where(
                 transmit_queued_by_pulse,
-                scheduled_pri_times_sec,
+                scheduled_pri_times_sec + pulse_tx_offset_sec,
                 np.nan,
             ),
             "RxFrequencyHz": float(self.Usrp.get_rx_freq(self.Channel)),
@@ -677,6 +811,8 @@ class EttusRadarSource:
         ThisDwell,
         pulse_index,
         scheduled_pri_time_sec,
+        tx_time_offset_sec=None,
+        rf_target=None,
     ):
         """Queue one finite waveform burst at the absolute PRI origin."""
 
@@ -720,6 +856,37 @@ class EttusRadarSource:
             frequency_offset_hz = float(
                 getattr(pulse_plan, "FrequencyOffsetHz", 0.0)
             )
+        if rf_target is None:
+            angle_error_deg = self._signed_angle_difference_deg(
+                float(getattr(ThisDwell, "AzimuthDeg", 0.0)),
+                self.RfTargetBearingDeg,
+            )
+            rf_target = {
+                "Active": bool(
+                    self.RfTargetEmulatorEnabled
+                    and abs(angle_error_deg)
+                    <= self.RfTargetAngleHalfWidthDeg
+                ),
+                "RangeM": self.RfTargetRangeM,
+                "RadialVelocityMps": self.RfTargetRadialVelocityMps,
+                "AmplitudeScale": self.RfTargetAmplitudeScale,
+            }
+        rf_target_active = bool(rf_target["Active"])
+        if rf_target_active:
+            amplitude_scale *= float(rf_target["AmplitudeScale"])
+            wavelength_m = 299792458.0 / float(
+                self.Config.get("RfFrequency", 9.4e9)
+            )
+            target_doppler_hz = (
+                2.0 * float(rf_target["RadialVelocityMps"]) / wavelength_m
+            )
+            phase_offset_rad += (
+                2.0
+                * np.pi
+                * target_doppler_hz
+                * pulse_index
+                * self._get_pulse_pri_sec(ThisDwell, pulse_index)
+            )
         if not 0.0 < amplitude_scale <= 1.0:
             raise ValueError(
                 "Combined TX amplitude scale must be in (0, 1]"
@@ -751,15 +918,54 @@ class EttusRadarSource:
         )
         if pulse_duration_sec > pri_sec:
             raise ValueError("TX waveform does not fit within the PRI")
-        if pulse_duration_sec > rx_start_delay_sec + 1.0e-12:
+        if tx_time_offset_sec is None:
+            tx_time_offset_sec = (
+                self._target_tx_offset_sec(
+                    self._configured_sample_rate,
+                    target_range_m=rf_target["RangeM"],
+                )
+                if rf_target_active
+                else 0.0
+            )
+        tx_time_offset_sec = float(tx_time_offset_sec)
+        if tx_time_offset_sec < 0.0:
+            raise ValueError("TX time offset must not be negative")
+
+        if rf_target_active:
+            desired_echo_delay_sec = (
+                2.0 * float(rf_target["RangeM"]) / 299792458.0
+            )
+            num_rx_samples = self._get_pulse_num_rx_samples(
+                ThisDwell,
+                pulse_index,
+                int(getattr(ThisDwell, "NumSamples", 0)),
+            )
+            rx_end_delay_sec = (
+                rx_start_delay_sec
+                + num_rx_samples / float(self._configured_sample_rate)
+            )
+            if desired_echo_delay_sec < rx_start_delay_sec - 1.0e-12:
+                raise ValueError(
+                    "RF target echo begins before the RX window"
+                )
+            if (
+                desired_echo_delay_sec + pulse_duration_sec
+                > rx_end_delay_sec + 1.0e-12
+            ):
+                raise ValueError(
+                    "RF target echo does not fit inside the RX window"
+                )
+        elif pulse_duration_sec > rx_start_delay_sec + 1.0e-12:
             raise ValueError(
                 "Operational RX starts before the TX waveform has ended"
             )
+        if tx_time_offset_sec + pulse_duration_sec > pri_sec:
+            raise ValueError("Delayed TX waveform does not fit within the PRI")
 
         metadata = uhd.types.TXMetadata()
         metadata.has_time_spec = True
         metadata.time_spec = uhd.types.TimeSpec(
-            float(scheduled_pri_time_sec)
+            float(scheduled_pri_time_sec) + tx_time_offset_sec
         )
         metadata.start_of_burst = True
         metadata.end_of_burst = True
@@ -1131,6 +1337,114 @@ class EttusRadarSource:
             if value is not None:
                 return int(value)
         return int(default_value)
+
+    @staticmethod
+    def _signed_angle_difference_deg(angle_deg, reference_deg):
+        return (
+            (float(angle_deg) - float(reference_deg) + 180.0) % 360.0
+        ) - 180.0
+
+    def _resolve_rf_target_for_dwell(
+        self,
+        ThisDwell,
+        sample_rate_hz,
+        num_samples,
+        waveform_id,
+        rx_start_delay_sec,
+    ):
+        boresight_deg = float(getattr(ThisDwell, "AzimuthDeg", 0.0))
+        if self.RfTargetUseScenario:
+            waveform = np.asarray(
+                self.TheWaveformLibrary.Get(waveform_id)
+            )
+            pulse_duration_sec = waveform.size / float(sample_rate_hz)
+            receive_end_sec = (
+                float(rx_start_delay_sec)
+                + int(num_samples) / float(sample_rate_hz)
+            )
+            minimum_range_m = (
+                float(rx_start_delay_sec) * 299792458.0 / 2.0
+            )
+            maximum_range_m = (
+                (receive_end_sec - pulse_duration_sec)
+                * 299792458.0
+                / 2.0
+            )
+            selected = SelectStrongestScenarioTarget(
+                SceneReturns=self.Config.get("SceneReturns", []),
+                BoresightDeg=boresight_deg,
+                AngleHalfWidthDeg=self.RfTargetAngleHalfWidthDeg,
+                MinimumRangeM=minimum_range_m,
+                MaximumRangeM=maximum_range_m,
+            )
+            if selected is None:
+                return {
+                    "Active": False,
+                    "Name": "",
+                    "RangeM": 0.0,
+                    "BearingDeg": boresight_deg,
+                    "RadialVelocityMps": 0.0,
+                    "AngleErrorDeg": 0.0,
+                    "AmplitudeScale": self.RfTargetAmplitudeScale,
+                    "EquivalentAmplitude": 0.0,
+                    "ConstituentReturnCount": 0,
+                }
+            return {
+                "Active": True,
+                "Name": str(selected["Name"]),
+                "RangeM": float(selected["RangeM"]),
+                "BearingDeg": float(selected["BearingDeg"]),
+                "RadialVelocityMps": float(
+                    selected["RadialVelocityMps"]
+                ),
+                "AngleErrorDeg": float(selected["AngleErrorDeg"]),
+                # Scenario amplitude selects the strongest parent. Absolute
+                # RF amplitude remains the separately guarded loopback scale.
+                "AmplitudeScale": self.RfTargetAmplitudeScale,
+                "EquivalentAmplitude": float(
+                    selected["EquivalentAmplitude"]
+                ),
+                "ConstituentReturnCount": int(
+                    selected["ConstituentReturnCount"]
+                ),
+            }
+
+        angle_error_deg = self._signed_angle_difference_deg(
+            boresight_deg,
+            self.RfTargetBearingDeg,
+        )
+        return {
+            "Active": bool(
+                self.RfTargetEmulatorEnabled
+                and abs(angle_error_deg)
+                <= self.RfTargetAngleHalfWidthDeg
+            ),
+            "Name": "FixedRfTarget",
+            "RangeM": self.RfTargetRangeM,
+            "BearingDeg": self.RfTargetBearingDeg,
+            "RadialVelocityMps": self.RfTargetRadialVelocityMps,
+            "AngleErrorDeg": angle_error_deg,
+            "AmplitudeScale": self.RfTargetAmplitudeScale,
+            "EquivalentAmplitude": 0.0,
+            "ConstituentReturnCount": 1,
+        }
+
+    def _target_tx_offset_sec(self, sample_rate_hz, target_range_m=None):
+        if target_range_m is None:
+            target_range_m = self.RfTargetRangeM
+        desired_echo_delay_sec = (
+            2.0 * float(target_range_m) / 299792458.0
+        )
+        hardware_delay_sec = (
+            self.LoopbackHardwareDelaySamples / float(sample_rate_hz)
+        )
+        offset_sec = desired_echo_delay_sec - hardware_delay_sec
+        if offset_sec < 0.0:
+            raise ValueError(
+                "Requested RF target range is shorter than the calibrated "
+                "loopback hardware delay"
+            )
+        return float(offset_sec)
 
     @staticmethod
     def _error_name(error_code):

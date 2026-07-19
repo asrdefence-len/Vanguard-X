@@ -34,7 +34,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--pulses", type=int, default=32)
     parser.add_argument("--maximum-range-km", type=float, default=15.0)
     parser.add_argument("--queue-depth", type=int, default=1)
-    parser.add_argument("--lead-ms", type=float, default=50.0)
+    parser.add_argument("--lead-ms", type=float, default=5.0)
     parser.add_argument("--timeout-sec", type=float, default=1.0)
     parser.add_argument("--dwells", type=int, default=1)
     parser.add_argument("--attenuation-db", type=float, required=True)
@@ -74,8 +74,8 @@ def validate_arguments(args):
         raise ValueError("Pulse and dwell counts must be positive")
     if not 1 <= args.queue_depth <= 20:
         raise ValueError("Queue depth must be between 1 and 20")
-    if args.lead_ms < 20.0:
-        raise ValueError("Command lead must be at least 20 ms")
+    if args.lead_ms < 5.0:
+        raise ValueError("Command lead must be at least 5 ms")
 
 
 def build_config(args):

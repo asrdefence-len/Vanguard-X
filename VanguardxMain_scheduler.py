@@ -160,6 +160,59 @@ def GetControlledBoresightDeg(Display, ScanBoresightDeg, ControlState=None):
     return float(ControlState.get("BeamAngleDeg", ScanBoresightDeg))
 
 
+def ApplyOperatorPointingCommand(
+    Pointing,
+    ControlState,
+    DisplayMode,
+    ScanEnabled,
+    LastDisplayMode,
+    LastScanEnabled,
+    LastManualNudgeCommandId,
+):
+    """Apply one-shot STARE/STOP/nudge intent independently of RF state.
+
+    This function must run before the radar-dwell enable/throttle gates. PTZ
+    pointing is an operator control path and must not depend on TX being armed.
+    Returns ``(last_nudge_id, action, commanded_relative_deg)``.
+    """
+    if Pointing is None:
+        return LastManualNudgeCommandId, "NONE", None
+
+    ManualNudgeCommandId = LastManualNudgeCommandId
+    ManualNudgeDeltaDeg = 0.0
+    if ControlState is not None:
+        ManualNudgeCommandId = int(
+            ControlState.get(
+                "ManualNudgeCommandId",
+                LastManualNudgeCommandId,
+            )
+        )
+        ManualNudgeDeltaDeg = float(
+            ControlState.get("ManualNudgeDeltaDeg", 0.0)
+        )
+
+    if (
+        ManualNudgeCommandId != LastManualNudgeCommandId
+        and abs(ManualNudgeDeltaDeg) > 0.0
+    ):
+        CommandedRelativeDeg = Pointing.Nudge(ManualNudgeDeltaDeg)
+        return ManualNudgeCommandId, "NUDGE", CommandedRelativeDeg
+
+    LeavingScan = bool(
+        LastDisplayMode == "SCAN"
+        and LastScanEnabled
+        and not (DisplayMode == "SCAN" and ScanEnabled)
+    )
+    StopTransition = bool(
+        DisplayMode == "STOP" and LastDisplayMode != "STOP"
+    )
+    if LeavingScan or StopTransition:
+        Pointing.Stop()
+        return LastManualNudgeCommandId, "HOLD", None
+
+    return LastManualNudgeCommandId, "NONE", None
+
+
 
 def InitialisePTZToStartupPose(Ptz, Config, Display=None):
     """Command the PTZ to the configured safe startup AZ/EL pose.
@@ -407,14 +460,13 @@ def Main(CommandLineArguments=None):
         "EttusSampleRateHz": 40.0e6,
         "EttusMaxSampleRateHz": 40.0e6,
         "EttusReceiveTimeoutSec": 1.0,
-        # Stage 3E0 is deliberately fail-closed. The first operational Ettus
-        # run remains receive-only with the same 50 ms lead used by the proven
-        # hardware harness. Timed TX and ATR are enabled only in later,
-        # separately verified stages.
+        # Startup remains fail-closed and receive-only. The operational
+        # timed-command lead is 5 ms; the independent radar dwell cadence
+        # remains 100 ms. Timed TX and ATR require separately verified modes.
         "EttusOperatingMode": "RECEIVE_ONLY",
         "EttusTimedTransmitEnabled": False,
         "EttusAtrGpioEnabled": False,
-        "EttusCommandLeadTimeSec": 0.050,
+        "EttusCommandLeadTimeSec": 0.005,
         "EttusCommandQueueDepth": 20,
         "EttusRxWarmupEnabled": True,
         "EttusDebug": True,
@@ -463,7 +515,11 @@ def Main(CommandLineArguments=None):
         "GuardCellsDoppler": 1,
         "CfarThresholdDb": 12.3,
         "MaxDetections": 200,
-        "MinRangeM": 100.0,
+        # Operational detection blanking. Direct-path leakage and receiver
+        # recovery currently contaminate the first 2 km of the cabled RF data.
+        # The range profile remains unblanked for diagnostics, but CFAR emits
+        # no detections here, so these cells cannot seed tracker plots/tracks.
+        "MinRangeM": 2000.0,
         "MaxRangeM": 15000.0,
 
         # Tracker / plot extraction parameters
@@ -593,8 +649,13 @@ def Main(CommandLineArguments=None):
         Config,
         OperatingArguments,
     )
-    if OperatingProfile == "STAGE3E1_LOOPBACK":
-        print("STAGE 3E1 GUARDED FULL-APPLICATION LOOPBACK SELECTED")
+    if OperatingProfile in (
+        "STAGE3E1_LOOPBACK",
+        "STAGE3F_RF_TARGET",
+    ):
+        print(
+            f"{OperatingProfile} GUARDED FULL-APPLICATION PROFILE SELECTED"
+        )
         print(
             "  RF path:        TX/RX -> "
             f"{Config['EttusExternalAttenuationDb']:.1f} dB -> RX2"
@@ -604,10 +665,19 @@ def Main(CommandLineArguments=None):
             f"  TX/RX gains:    {Config['EttusTxGainDb']:.1f} / "
             f"{Config['EttusRxGainDb']:.1f} dB"
         )
-        print(
-            "  automatic stop: "
-            f"{Config['Stage3E1MaximumTimedDwells']} timed dwells"
-        )
+        print("  shutdown:       operator Stop / Exit")
+        if OperatingProfile == "STAGE3F_RF_TARGET":
+            print(
+                "  RF targets:     TargetScenario strongest parent "
+                "inside true bearing +/-2.00 deg"
+            )
+            print(
+                "  RF representation: one equivalent delayed pulse per PRI"
+            )
+            print(
+                "  calibrated delay: "
+                f"{Config['EttusLoopbackHardwareDelaySamples']} samples"
+            )
 
     # -------------------------------------------------------------------------
     # Waveform library
@@ -712,8 +782,6 @@ def Main(CommandLineArguments=None):
 
     DwellId = 1
     ScanCycle = 1
-    CompletedTimedDwells = 0
-
     ExitRequested = False
 
     ScanStartDeg = float(Config.get("ScanStartDeg", -60.0))
@@ -723,7 +791,6 @@ def Main(CommandLineArguments=None):
     CurrentScanBoresightDeg = float(Config.get("InitialBeamAngleDeg", Config.get("BoresightDeg", 0.0)))
     CurrentScanBoresightDeg = max(min(CurrentScanBoresightDeg, ScanStopDeg), ScanStartDeg)
     LastManualNudgeCommandId = 0
-    LastStopCommandId = 0
     PtzStopped = False
     LastScanEnabled = False
     LastDisplayMode = "STOP"
@@ -919,6 +986,50 @@ def Main(CommandLineArguments=None):
                 )
 
                 # -------------------------------------------------------------
+                # Apply operator pointing intent before any RF/dwell gate.
+                # Nudge and STARE/STOP transitions must work while TX is off.
+                # This path issues commands only on a new nudge ID or mode
+                # transition, so it does not add continuous PTZ serial traffic.
+                # -------------------------------------------------------------
+                try:
+                    (
+                        LastManualNudgeCommandId,
+                        PointingAction,
+                        NudgeTargetRelativeDeg,
+                    ) = ApplyOperatorPointingCommand(
+                        Pointing=Pointing if Ptz is not None else None,
+                        ControlState=ControlState,
+                        DisplayMode=DisplayMode,
+                        ScanEnabled=ScanEnabled,
+                        LastDisplayMode=LastDisplayMode,
+                        LastScanEnabled=LastScanEnabled,
+                        LastManualNudgeCommandId=(
+                            LastManualNudgeCommandId
+                        ),
+                    )
+                    if PointingAction == "NUDGE":
+                        print(
+                            "Operator nudge: "
+                            f"{float(NudgeTargetRelativeDeg):.2f} deg relative"
+                        )
+                except Exception as exc:
+                    if ControlState is not None:
+                        LastManualNudgeCommandId = int(
+                            ControlState.get(
+                                "ManualNudgeCommandId",
+                                LastManualNudgeCommandId,
+                            )
+                        )
+                    print(f"Operator pointing command failed: {exc}")
+
+                # Consume the operator mode transition immediately.  Do not
+                # wait until the next radar dwell, otherwise the fast GUI loop
+                # can issue the same PTZ Stop command repeatedly while the
+                # dwell-rate throttle is active.
+                LastScanEnabled = bool(ScanEnabled)
+                LastDisplayMode = str(DisplayMode)
+
+                # -------------------------------------------------------------
                 # Timed radar dwell scheduler.
                 #
                 # IMPORTANT:
@@ -939,17 +1050,6 @@ def Main(CommandLineArguments=None):
                 )
 
                 if DisplayMode == "STOP" or not RadarDwellEnabled:
-                    # If the operator stops the radar, stop the PTZ immediately;
-                    # do not wait for the next dwell slot.
-                    if Ptz is not None and (LastDisplayMode != "STOP" or LastScanEnabled):
-                        try:
-                            Pointing.Stop()
-                        except Exception:
-                            pass
-
-                    LastScanEnabled = bool(ScanEnabled)
-                    LastDisplayMode = str(DisplayMode)
-
                     if hasattr(Display, "App"):
                         Display.App.processEvents()
                     time.sleep(0.005)
@@ -988,30 +1088,6 @@ def Main(CommandLineArguments=None):
                         PtzRateDegPerSec = float(PtzState.PanRateDegPerSec)
                         PtzValid = bool(PtzState.Valid)
                         PtzSource = str(PtzState.Source)
-
-                        # Manual positioning is owned by PointingManager.
-                        ManualNudgeCommandId = None
-                        ManualNudgeDeltaDeg = 0.0
-                        if ControlState is not None:
-                            ManualNudgeCommandId = ControlState.get("ManualNudgeCommandId", None)
-                            ManualNudgeDeltaDeg = float(ControlState.get("ManualNudgeDeltaDeg", 0.0))
-
-                        if not hasattr(Main, "_LastConsumedNudgeId"):
-                            Main._LastConsumedNudgeId = None
-
-                        if (
-                            ManualNudgeCommandId is not None
-                            and ManualNudgeCommandId != Main._LastConsumedNudgeId
-                            and abs(ManualNudgeDeltaDeg) > 0.0
-                        ):
-                            Main._LastConsumedNudgeId = ManualNudgeCommandId
-                            Pointing.Nudge(ManualNudgeDeltaDeg)
-
-                        elif not (DisplayMode == "SCAN" and ScanEnabled):
-                            # PointingManager owns the stop transition. This
-                            # clears its active task as well as stopping motion.
-                            if LastDisplayMode == "SCAN" and LastScanEnabled:
-                                Pointing.Stop()
 
                         if PtzValid:
                             CurrentScanBoresightDeg = float(PtzAzDeg)
@@ -1179,9 +1255,6 @@ def Main(CommandLineArguments=None):
                 T4 = DwellResult["T4"]
                 T5 = DwellResult["T5"]
 
-                if Config.get("Stage3E1LoopbackActive", False):
-                    CompletedTimedDwells += 1
-
                 # One scheduler task currently corresponds to one completed
                 # legacy dwell. SEARCH is persistent, so completing it simply
                 # returns it to the queued state for the next dwell.
@@ -1192,11 +1265,26 @@ def Main(CommandLineArguments=None):
                 if DwellId % 1 == 0:
                     TimedTransportSummary = ""
                     if Config.get("Stage3E1LoopbackActive", False):
+                        TargetSummary = ""
+                        if Processed.Diagnostics.get(
+                            "RfTargetEmulatorActive", False
+                        ):
+                            TargetName = str(
+                                Processed.Diagnostics.get(
+                                    "RfTargetName", "Target"
+                                )
+                            )
+                            TargetSummary = (
+                                " TARGET "
+                                f"{TargetName} "
+                                f"{float(Processed.Diagnostics.get('RfTargetRangeM', 0.0)) / 1000.0:.2f}km"
+                            )
                         TimedTransportSummary = (
                             " | TX "
                             f"{int(Processed.Diagnostics.get('TransmitCommandCount', 0))} "
                             "ACK "
                             f"{int(Processed.Diagnostics.get('TransmitBurstAcknowledgementCount', 0))}"
+                            f"{TargetSummary}"
                         )
                     if LastPrintedBoresightDeg is None:
                         PrintedAzStepDeg = 0.0
@@ -1238,17 +1326,6 @@ def Main(CommandLineArguments=None):
                 update_scene_objects(SceneObjects, DwellTimeS)
 
                 DwellId += 1
-
-                if (
-                    Config.get("Stage3E1LoopbackActive", False)
-                    and CompletedTimedDwells
-                    >= int(Config["Stage3E1MaximumTimedDwells"])
-                ):
-                    print(
-                        "Stage 3E1 automatic timed-dwell limit reached: "
-                        f"{CompletedTimedDwells}. Shutting down RF output."
-                    )
-                    break
 
                 # -------------------------------------------------------------
                 # Update scan limits from display/operator controls.

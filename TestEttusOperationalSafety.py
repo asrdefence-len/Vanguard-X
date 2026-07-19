@@ -14,7 +14,7 @@ class TestEttusOperationalSafety(unittest.TestCase):
         self.assertFalse(source.TimedTransmitEnabled)
         self.assertFalse(source.AtrGpioEnabled)
         self.assertEqual(source.CommandQueueDepth, 20)
-        self.assertAlmostEqual(source.CommandLeadTimeSec, 0.050)
+        self.assertAlmostEqual(source.CommandLeadTimeSec, 0.005)
 
     def test_unknown_operating_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "EttusOperatingMode"):
@@ -94,7 +94,22 @@ class TestEttusOperationalSafety(unittest.TestCase):
         self.assertIn('"EttusOperatingMode": "RECEIVE_ONLY"', main_text)
         self.assertIn('"EttusTimedTransmitEnabled": False', main_text)
         self.assertIn('"EttusAtrGpioEnabled": False', main_text)
-        self.assertIn('"EttusCommandLeadTimeSec": 0.050', main_text)
+        self.assertIn('"EttusCommandLeadTimeSec": 0.005', main_text)
+        self.assertIn('"RadarDwellIntervalSec": 0.10', main_text)
+
+    def test_hardware_harness_accepts_operational_five_ms_lead(self):
+        harness_text = (
+            Path(__file__).with_name(
+                "RunEttusOperationalTimedPairHardwareTest.py"
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertIn(
+            'parser.add_argument("--lead-ms", type=float, default=5.0)',
+            harness_text,
+        )
+        self.assertIn("if args.lead_ms < 5.0:", harness_text)
+        self.assertNotIn("at least 20 ms", harness_text)
 
 
 if __name__ == "__main__":
