@@ -1434,6 +1434,7 @@ class RadarDisplay:
         # StopCommandId to send a real PTZ stop and then remains in idle.
         self.DisplayMode = "STOP"
         self.ScanEnabled = False
+        self.TransmitEnabled = False
         self.StopCommandId += 1
         self.UpdateStatusPanel()
 

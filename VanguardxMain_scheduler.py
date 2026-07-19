@@ -58,6 +58,10 @@ from SimpleDisplay import SimpleDisplay
 from RadarDisplayQt5 import RadarDisplay
 from DataLogger import DataLogger
 from EttusRadarSource import EttusRadarSource
+from EttusOperatingProfiles import (
+    ApplyOperatingProfile,
+    ParseOperatingProfileArguments,
+)
 import time
 
 try:
@@ -351,7 +355,7 @@ def ExecuteRadarDwell(
         "T5": T5,
     }
 
-def Main():
+def Main(CommandLineArguments=None):
     """
     Main radar program.
 
@@ -363,6 +367,10 @@ def Main():
     # -------------------------------------------------------------------------
     # Configuration dictionary
     # -------------------------------------------------------------------------
+
+    OperatingArguments = ParseOperatingProfileArguments(
+        CommandLineArguments
+    )
 
     Config = {
         # Operator timing selections. PRI, CPI duration, RX start and receive
@@ -581,6 +589,26 @@ def Main():
         "IMUInvertElevation": False,
     }
 
+    OperatingProfile = ApplyOperatingProfile(
+        Config,
+        OperatingArguments,
+    )
+    if OperatingProfile == "STAGE3E1_LOOPBACK":
+        print("STAGE 3E1 GUARDED FULL-APPLICATION LOOPBACK SELECTED")
+        print(
+            "  RF path:        TX/RX -> "
+            f"{Config['EttusExternalAttenuationDb']:.1f} dB -> RX2"
+        )
+        print("  ATR / TRM / PA: DISABLED")
+        print(
+            f"  TX/RX gains:    {Config['EttusTxGainDb']:.1f} / "
+            f"{Config['EttusRxGainDb']:.1f} dB"
+        )
+        print(
+            "  automatic stop: "
+            f"{Config['Stage3E1MaximumTimedDwells']} timed dwells"
+        )
+
     # -------------------------------------------------------------------------
     # Waveform library
     # -------------------------------------------------------------------------
@@ -616,9 +644,9 @@ def Main():
     Config["RfTransmitAvailable"] = bool(
         getattr(Source, "TimedTransmitEnabled", True)
     )
-    Config["InitialTransmitEnabled"] = bool(
-        Config["RfTransmitAvailable"]
-    )
+    # Even when the guarded loopback profile makes TX available, startup is
+    # unarmed. The operator must press Start before the first timed dwell.
+    Config["InitialTransmitEnabled"] = False
     ReceiveOnlyOperation = bool(
         RadarSourceType == "ETTUS"
         and str(getattr(Source, "OperatingMode", "")).upper()
@@ -684,6 +712,7 @@ def Main():
 
     DwellId = 1
     ScanCycle = 1
+    CompletedTimedDwells = 0
 
     ExitRequested = False
 
@@ -1150,6 +1179,9 @@ def Main():
                 T4 = DwellResult["T4"]
                 T5 = DwellResult["T5"]
 
+                if Config.get("Stage3E1LoopbackActive", False):
+                    CompletedTimedDwells += 1
+
                 # One scheduler task currently corresponds to one completed
                 # legacy dwell. SEARCH is persistent, so completing it simply
                 # returns it to the queued state for the next dwell.
@@ -1158,6 +1190,14 @@ def Main():
                 )
 
                 if DwellId % 1 == 0:
+                    TimedTransportSummary = ""
+                    if Config.get("Stage3E1LoopbackActive", False):
+                        TimedTransportSummary = (
+                            " | TX "
+                            f"{int(Processed.Diagnostics.get('TransmitCommandCount', 0))} "
+                            "ACK "
+                            f"{int(Processed.Diagnostics.get('TransmitBurstAcknowledgementCount', 0))}"
+                        )
                     if LastPrintedBoresightDeg is None:
                         PrintedAzStepDeg = 0.0
                     else:
@@ -1186,6 +1226,7 @@ def Main():
                         f"Tent {int(TrackerDebug.get('TentativeTracks', 0)):3d} "
                         f"Conf {int(TrackerDebug.get('ConfirmedTracks', 0)):3d} "
                         f"ScanCycle {ScanCycle}"
+                        f"{TimedTransportSummary}"
                     )
 
 
@@ -1197,6 +1238,17 @@ def Main():
                 update_scene_objects(SceneObjects, DwellTimeS)
 
                 DwellId += 1
+
+                if (
+                    Config.get("Stage3E1LoopbackActive", False)
+                    and CompletedTimedDwells
+                    >= int(Config["Stage3E1MaximumTimedDwells"])
+                ):
+                    print(
+                        "Stage 3E1 automatic timed-dwell limit reached: "
+                        f"{CompletedTimedDwells}. Shutting down RF output."
+                    )
+                    break
 
                 # -------------------------------------------------------------
                 # Update scan limits from display/operator controls.

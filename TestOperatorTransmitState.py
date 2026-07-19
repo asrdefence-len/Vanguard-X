@@ -38,6 +38,12 @@ class TestOperatorTransmitState(unittest.TestCase):
             start_method,
         )
 
+    def test_stop_disarms_transmit(self):
+        stop_method = self.display_text.split(
+            "    def OnStop(self):", 1
+        )[1].split("    def OnStopTransmit(self):", 1)[0]
+        self.assertIn("self.TransmitEnabled = False", stop_method)
+
     def test_main_allows_rx_dwells_while_tx_is_inhibited(self):
         self.assertIn(
             "TransmitEnabled or ReceiveOnlyOperation",
