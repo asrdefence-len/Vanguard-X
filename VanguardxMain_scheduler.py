@@ -388,7 +388,7 @@ def Main():
         # Radar source
         # ---------------------------------------------------------------------
 
-        "RadarSource": "SIM",        # Validate SIM before "ETTUS"
+        "RadarSource": "ETTUS",        # Validate SIM before "ETTUS"
 
         # Ettus configuration
         "EttusSerial": "34A0320",
@@ -609,6 +609,21 @@ def Main():
     else:
         print("Using simulated radar source")
         Source = SimulatedSource(Config, TheWaveformLibrary)
+
+    # Publish actual RF capability to the operator display. In Stage 3E0 the
+    # Ettus source is receive-only, so Start may run RX dwells but must never
+    # present transmit as enabled or available.
+    Config["RfTransmitAvailable"] = bool(
+        getattr(Source, "TimedTransmitEnabled", True)
+    )
+    Config["InitialTransmitEnabled"] = bool(
+        Config["RfTransmitAvailable"]
+    )
+    ReceiveOnlyOperation = bool(
+        RadarSourceType == "ETTUS"
+        and str(getattr(Source, "OperatingMode", "")).upper()
+        == "RECEIVE_ONLY"
+    )
 
     Processor = RadarProcessor(Config, TheWaveformLibrary)
 
@@ -890,8 +905,11 @@ def Main():
                 DwellWallDtSec = NowDwellSec - LastRadarDwellTimeSec if LastRadarDwellTimeSec > 0.0 else 0.0
 
                 TransmitEnabled = True if ControlState is None else bool(ControlState.get("TransmitEnabled", True))
+                RadarDwellEnabled = bool(
+                    TransmitEnabled or ReceiveOnlyOperation
+                )
 
-                if DisplayMode == "STOP" or not TransmitEnabled:
+                if DisplayMode == "STOP" or not RadarDwellEnabled:
                     # If the operator stops the radar, stop the PTZ immediately;
                     # do not wait for the next dwell slot.
                     if Ptz is not None and (LastDisplayMode != "STOP" or LastScanEnabled):

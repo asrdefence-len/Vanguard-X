@@ -64,7 +64,15 @@ class RadarDisplay:
         # ------------------------------------------------------------------
         # Display / control state
         # ------------------------------------------------------------------
-        self.TransmitEnabled = True
+        self.TransmitAvailable = bool(
+            self.Config.get("RfTransmitAvailable", True)
+        )
+        self.TransmitEnabled = bool(
+            self.Config.get(
+                "InitialTransmitEnabled",
+                self.TransmitAvailable,
+            )
+        ) and self.TransmitAvailable
         self.ExitRequested = False
         self.UpdateCounter = 0
 
@@ -349,6 +357,7 @@ class RadarDisplay:
             "ScanStartDeg": self.ScanStartDeg,
             "ScanStopDeg": self.ScanStopDeg,
             "ScanStepDeg": self.ScanStepDeg,
+            "TransmitAvailable": self.TransmitAvailable,
             "TransmitEnabled": self.TransmitEnabled,
             "ExitRequested": self.ExitRequested,
             "DataLogFilename": self.DataLogFilename,
@@ -586,6 +595,9 @@ class RadarDisplay:
         StartButton = CompactButton("Start", 58)
         StopButton = CompactButton("Stop", 58)
         StopTxButton = CompactButton("Tx Off", 58)
+        if not self.TransmitAvailable:
+            StopTxButton.setText("TX N/A")
+            StopTxButton.setEnabled(False)
         ExitButton = CompactButton("Exit", 58)
         ScanButton = CompactButton("Scan", 58)
         StareButton = CompactButton("Stare", 58)
@@ -1337,12 +1349,19 @@ class RadarDisplay:
             if bool(getattr(Track, "IsConfirmed", False)) or str(getattr(Track, "Status", "")).upper() == "CONFIRMED"
         )
         NumTentative = max(0, len(self.LatestTracks) - NumConfirmed)
+        if not self.TransmitAvailable:
+            TransmitStatus = "INHIBITED (RX ONLY)"
+        elif self.TransmitEnabled:
+            TransmitStatus = "ENABLED"
+        else:
+            TransmitStatus = "OFF"
+
         Lines = [
             "Vanguard X Radar",
             "----------------",
             f"Mode:   {self.DisplayMode}",
             f"Scan:   {self.ScanEnabled}",
-            f"Tx:     {self.TransmitEnabled}",
+            f"Tx:     {TransmitStatus}",
             f"Beam:   {self.BeamAngleDeg:.1f} deg",
             f"Wave:   {self.AppliedWaveformId}",
             (
@@ -1405,7 +1424,8 @@ class RadarDisplay:
         # independent of the initial startup setting.
         self.DisplayMode = "SCAN"
         self.ScanEnabled = True
-        self.TransmitEnabled = True
+        if self.TransmitAvailable:
+            self.TransmitEnabled = True
         self.ManualNudgeDeltaDeg = 0.0
         self.UpdateStatusPanel()
 
