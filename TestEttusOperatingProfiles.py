@@ -61,6 +61,37 @@ class TestEttusOperatingProfiles(unittest.TestCase):
         self.assertEqual(profile, "STAGE3I_ATR_RF_TARGET_OVERLAP")
         self.assertEqual(config["EttusTxGainDb"], 50.0)
         self.assertEqual(config["EttusRxGainDb"], 30.0)
+        self.assertTrue(config["EttusRfTargetUseScenario"])
+
+    def test_stage3i_can_select_a_stationary_fixed_point_target(self):
+        arguments = ParseOperatingProfileArguments(
+            self._required_arguments(
+                "--stage3i-atr-rf-target-overlap",
+                "--fixed-rf-target",
+                "--target-range-km", "6.0",
+                "--target-bearing-deg", "80.0",
+                "--target-radial-velocity-mps", "0.0",
+            )
+        )
+        config = self._base_config()
+
+        profile = ApplyOperatingProfile(config, arguments)
+
+        self.assertEqual(profile, "STAGE3I_ATR_RF_TARGET_OVERLAP")
+        self.assertFalse(config["EttusRfTargetUseScenario"])
+        self.assertEqual(config["EttusRfTargetRangeM"], 6000.0)
+        self.assertEqual(config["EttusRfTargetBearingDeg"], 80.0)
+        self.assertEqual(config["EttusRfTargetRadialVelocityMps"], 0.0)
+        self.assertEqual(config["EttusTxGainDb"], 50.0)
+        self.assertEqual(config["EttusRxGainDb"], 30.0)
+
+    def test_fixed_target_requires_a_guarded_target_profile(self):
+        arguments = ParseOperatingProfileArguments([
+            "--fixed-rf-target",
+        ])
+
+        with self.assertRaisesRegex(ValueError, "explicit test profile"):
+            ApplyOperatingProfile(self._base_config(), arguments)
 
     def test_other_loopback_profiles_keep_conservative_defaults(self):
         for option, expected_profile in (
