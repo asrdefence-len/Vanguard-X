@@ -167,7 +167,10 @@ class TestGolayOperational(unittest.TestCase):
         Library = MakeLibrary()
         Plan = MakePlan()
         Raw = MakeStationaryEcho(Library, Plan)
-        Processor = RadarProcessor({"RfFrequency": 9.4e9}, Library)
+        Processor = RadarProcessor({
+            "RfFrequency": 9.4e9,
+            "GolayDiagnosticCaptureEnabled": True,
+        }, Library)
 
         Result = Processor.Process(Raw, Plan)
 
@@ -178,6 +181,16 @@ class TestGolayOperational(unittest.TestCase):
         self.assertAlmostEqual(Result.Diagnostics["PairPriSec"], 500.0e-6)
         self.assertEqual(Result.Diagnostics["PeakRangeBin"], 80)
         self.assertEqual(Result.Diagnostics["PeakDopplerHz"], 0.0)
+        self.assertEqual(Result.GolayDiagnostic["RawA"].shape, (4, 512))
+        self.assertEqual(Result.GolayDiagnostic["RawB"].shape, (4, 512))
+        self.assertEqual(
+            Result.GolayDiagnostic["CompressedA"].shape,
+            (4, 512),
+        )
+        self.assertEqual(
+            Result.GolayDiagnostic["CompressedB"].shape,
+            (4, 512),
+        )
 
         Profile = Result.RangeCompressed[0]
         Peak = abs(Profile[80])
