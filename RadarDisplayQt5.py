@@ -36,7 +36,10 @@ import math
 import os
 import numpy as np
 
-from RangeProfileScaling import CalculateNoiseReferencedRangeProfileLimits
+from RangeProfileScaling import (
+    CalculateNoiseReferencedRangeProfileLimits,
+    SelectRangeProfileDb,
+)
 
 DISPLAY_VERSION = "tracks-white-surface-symbol-v7-side-by-side-target"
 
@@ -178,6 +181,13 @@ class RadarDisplay:
         )
         self.DecimateRangeProfile = int(Config.get("QtRangeProfileDecimation", 2))
         self.MaxRangeProfilePoints = int(Config.get("QtMaxRangeProfilePoints", 1500))
+        self.RangeProfileDopplerMode = str(
+            Config.get("RangeProfileDopplerMode", "MAX")
+        ).upper()
+        if self.RangeProfileDopplerMode not in ("MAX", "ZERO_DOPPLER"):
+            raise ValueError(
+                "RangeProfileDopplerMode must be MAX or ZERO_DOPPLER"
+            )
 
         # Range-profile vertical scale. By default both limits follow a robust
         # estimate of the displayed noise floor and the current strongest
@@ -532,7 +542,11 @@ class RadarDisplay:
         self.RangePlot.setLabel("bottom", "Range", units="m")
         self.RangePlot.setLabel("left", "Magnitude", units="dB")
         self.RangePlot.setXRange(0, self.MaxDisplayRangeM, padding=0.0)
-        self.RangePlot.setTitle("Range Profile")
+        self.RangePlot.setTitle(
+            "Range Profile (0 Hz Doppler)"
+            if self.RangeProfileDopplerMode == "ZERO_DOPPLER"
+            else "Range Profile (Max Doppler Envelope)"
+        )
         self.ApplyRangeProfileScale()
         RightLayout.addWidget(self.RangePlot, stretch=1)
 
@@ -1169,7 +1183,11 @@ class RadarDisplay:
             return
 
         try:
-            RangeProfileDb = np.max(Processed.MagnitudeDb, axis=0)
+            RangeProfileDb = SelectRangeProfileDb(
+                Processed.MagnitudeDb,
+                getattr(Processed, "DopplerAxisHz", None),
+                Mode=self.RangeProfileDopplerMode,
+            )
             RangeAxisM = np.asarray(Processed.RangeAxisM)
         except Exception:
             return
