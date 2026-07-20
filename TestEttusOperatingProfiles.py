@@ -82,6 +82,7 @@ class TestEttusOperatingProfiles(unittest.TestCase):
         self.assertEqual(config["EttusRfTargetRangeM"], 6000.0)
         self.assertEqual(config["EttusRfTargetBearingDeg"], 80.0)
         self.assertEqual(config["EttusRfTargetRadialVelocityMps"], 0.0)
+        self.assertEqual(config["RangeProfileDopplerMode"], "ZERO_DOPPLER")
         self.assertEqual(config["EttusTxGainDb"], 50.0)
         self.assertEqual(config["EttusRxGainDb"], 30.0)
 
