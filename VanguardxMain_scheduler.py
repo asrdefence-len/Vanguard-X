@@ -689,13 +689,21 @@ def Main(CommandLineArguments=None):
             "STAGE3F_RF_TARGET",
             "STAGE3I_ATR_RF_TARGET_OVERLAP",
         ):
-            print(
-                "  RF targets:     TargetScenario strongest parent "
-                "inside true bearing +/-2.00 deg"
-            )
-            print(
-                "  RF representation: one equivalent delayed pulse per PRI"
-            )
+            if Config.get("EttusRfTargetUseScenario", False):
+                print(
+                    "  RF targets:     TargetScenario strongest parent "
+                    "inside true bearing +/-2.00 deg"
+                )
+                print(
+                    "  RF representation: one equivalent delayed pulse per PRI"
+                )
+            else:
+                print(
+                    "  RF target:      FIXED POINT "
+                    f"{Config['EttusRfTargetRangeM'] / 1000.0:.3f} km at "
+                    f"{Config['EttusRfTargetBearingDeg']:.2f} deg, "
+                    f"{Config['EttusRfTargetRadialVelocityMps']:.2f} m/s"
+                )
             print(
                 "  calibrated delay: "
                 f"{Config['EttusLoopbackHardwareDelaySamples']} samples"
