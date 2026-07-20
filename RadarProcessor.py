@@ -242,6 +242,30 @@ class RadarProcessor:
             float(RxStartDelayValues[0]),
         )
 
+    @staticmethod
+    def _ResolveRawRxStartDelay(Raw, PlannedDelaySec, ProcessingMode):
+        """Prefer the acquired RF-relative range origin when it is present."""
+
+        RawDelays = getattr(Raw, "PulseRxStartDelaySec", None)
+        if RawDelays is None:
+            return float(PlannedDelaySec)
+
+        RawDelays = np.asarray(RawDelays, dtype=np.float64).reshape(-1)
+        if RawDelays.size != Raw.IQ.shape[0]:
+            raise ValueError("Raw pulse RX timing count does not match the CPI")
+        if not np.all(np.isfinite(RawDelays)):
+            raise ValueError("Raw pulse RX timing contains non-finite values")
+        if not np.allclose(
+            RawDelays,
+            RawDelays[0],
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f"{ProcessingMode} requires a constant raw RX range origin"
+            )
+        return float(RawDelays[0])
+
     def _ProcessUniformPri(self, Raw, ThisDwell):
         """Existing fixed-waveform, fixed-PRI pulse compression and Doppler FFT."""
 
@@ -250,39 +274,11 @@ class RadarProcessor:
             PRI,
             RxStartDelaySec,
         ) = self._ValidateUniformPriPlan(ThisDwell)
-
-        # The plan carries the scheduled RX time from the transport origin.
-        # Acquired data carries the range reference from the first non-zero
-        # RF sample, excluding any leading-zero transport padding.
-        RawRxStartDelaySec = getattr(
+        RxStartDelaySec = self._ResolveRawRxStartDelay(
             Raw,
-            "PulseRxStartDelaySec",
-            None,
+            RxStartDelaySec,
+            "UNIFORM_PRI_FFT",
         )
-        if RawRxStartDelaySec is not None:
-            RawRxStartDelaySec = np.asarray(
-                RawRxStartDelaySec,
-                dtype=np.float64,
-            ).reshape(-1)
-            if RawRxStartDelaySec.size != Raw.IQ.shape[0]:
-                raise ValueError(
-                    "Raw pulse RX timing count does not match the CPI"
-                )
-            if not np.all(np.isfinite(RawRxStartDelaySec)):
-                raise ValueError(
-                    "Raw pulse RX timing contains non-finite values"
-                )
-            if not np.allclose(
-                RawRxStartDelaySec,
-                RawRxStartDelaySec[0],
-                rtol=0.0,
-                atol=1e-12,
-            ):
-                raise ValueError(
-                    "UNIFORM_PRI_FFT requires a constant raw RX range origin"
-                )
-            RxStartDelaySec = float(RawRxStartDelaySec[0])
-
         TxWaveform = self.TheWaveformLibrary.Get(WaveformName)
         WaveformMetadata = self.TheWaveformLibrary.GetMetadata(WaveformName)
         ChipCount = int(WaveformMetadata["ChipCount"])
@@ -382,10 +378,219 @@ class RadarProcessor:
         return Processed
 
     def _ProcessGolay(self, Raw, ThisDwell):
-        raise NotImplementedError(
-            "Golay complementary processing is defined architecturally but "
-            "has not yet been implemented"
+        """Compress strict A/B pairs, sum them, then process pair Doppler."""
+
+        (
+            WaveformAId,
+            WaveformBId,
+            PhysicalPriSec,
+            RxStartDelaySec,
+        ) = self._ValidateGolayPlan(Raw, ThisDwell)
+        RxStartDelaySec = self._ResolveRawRxStartDelay(
+            Raw,
+            RxStartDelaySec,
+            "GOLAY_COMPLEMENTARY",
         )
+
+        WaveformA = self.TheWaveformLibrary.Get(WaveformAId)
+        WaveformB = self.TheWaveformLibrary.Get(WaveformBId)
+        MetadataA = self.TheWaveformLibrary.GetMetadata(WaveformAId)
+        MetadataB = self.TheWaveformLibrary.GetMetadata(WaveformBId)
+
+        if len(WaveformA) != len(WaveformB):
+            raise ValueError("Golay A and B sampled waveforms must be equal length")
+        if not np.isclose(
+            MetadataA["SampleRateHz"],
+            MetadataB["SampleRateHz"],
+            rtol=0.0,
+            atol=1.0,
+        ):
+            raise ValueError("Golay A and B sample rates must match")
+        if not np.isclose(
+            MetadataA["ChipRateHz"],
+            MetadataB["ChipRateHz"],
+            rtol=0.0,
+            atol=1.0,
+        ):
+            raise ValueError("Golay A and B chip rates must match")
+
+        RawA = Raw.IQ[0::2]
+        RawB = Raw.IQ[1::2]
+        PreparedB, CompensationMode = (
+            self._ApplyGolayBPreCompressionCompensation(
+                RawB,
+                ThisDwell,
+                PhysicalPriSec,
+            )
+        )
+        if PreparedB.shape != RawB.shape:
+            raise ValueError(
+                "Golay B pre-compression compensation changed the IQ shape"
+            )
+
+        CompressedA = self._PulseCompressFft(
+            RawA,
+            WaveformAId,
+            WaveformA,
+        )
+        CompressedB = self._PulseCompressFft(
+            PreparedB,
+            WaveformBId,
+            WaveformB,
+        )
+        RangeCompressed = (CompressedA + CompressedB).astype(
+            np.complex64,
+            copy=False,
+        )
+
+        NumPairs, NumSamples = RangeCompressed.shape
+        PairPriSec = 2.0 * PhysicalPriSec
+        DopplerWindow = self._GetDopplerWindow(NumPairs)
+        Windowed = RangeCompressed * DopplerWindow[:, np.newaxis]
+        RangeDopplerMap = np.fft.fftshift(
+            np.fft.fft(Windowed, axis=0),
+            axes=0,
+        )
+        MagnitudeDb = 20.0 * np.log10(np.abs(RangeDopplerMap) + 1e-12)
+
+        RangeAxisM, DopplerAxisHz, VelocityAxisMps = self._GetAxes(
+            NumPairs,
+            NumSamples,
+            Raw.SampleRate,
+            PairPriSec,
+            RxStartDelaySec,
+        )
+        PeakDopplerBin, PeakRangeBin = np.unravel_index(
+            np.argmax(np.abs(RangeDopplerMap)),
+            RangeDopplerMap.shape,
+        )
+        ChipCount = int(MetadataA["ChipCount"])
+        IdealProcessingGainDb = 10.0 * np.log10(2.0 * ChipCount)
+
+        Diagnostics = {
+            "ProcessingMode": "GOLAY_COMPLEMENTARY",
+            "ProcessorId": "GOLAY_COMPLEMENTARY_RANGE_DOPPLER",
+            "WaveformId": str(MetadataA["PairId"]),
+            "WaveformAId": WaveformAId,
+            "WaveformBId": WaveformBId,
+            "DopplerCompensationMode": CompensationMode,
+            "DopplerCompensationEnabled": False,
+            "PhysicalPriSec": PhysicalPriSec,
+            "PairPriSec": PairPriSec,
+            "PhysicalPulseCount": int(Raw.IQ.shape[0]),
+            "ComplementaryPairCount": int(NumPairs),
+            "RxStartDelaySec": RxStartDelaySec,
+            "FirstRxSampleRangeOffsetM": float(RangeAxisM[0]),
+            "CodeLength": ChipCount,
+            "ChipCount": ChipCount,
+            "ChipRateHz": float(MetadataA["ChipRateHz"]),
+            "SamplesPerChip": int(MetadataA["SamplesPerChip"]),
+            "SampledWaveformLength": int(MetadataA["NumSamples"]),
+            "PulseDurationSec": float(MetadataA["PulseDurationSec"]),
+            "IdealProcessingGainDb": float(IdealProcessingGainDb),
+            "PeakRangeBin": int(PeakRangeBin),
+            "PeakDopplerBin": int(PeakDopplerBin),
+            "PeakRangeM": float(RangeAxisM[PeakRangeBin]),
+            "PeakDopplerHz": float(DopplerAxisHz[PeakDopplerBin]),
+            "PeakVelocityMps": float(VelocityAxisMps[PeakDopplerBin]),
+            "TaskId": getattr(ThisDwell, "TaskId", None),
+            "TaskType": getattr(ThisDwell, "TaskType", None),
+        }
+        RawDiagnostics = getattr(Raw, "Diagnostics", None)
+        if RawDiagnostics:
+            Diagnostics.update(RawDiagnostics)
+
+        Processed = ProcessedDwellData(
+            DwellId=Raw.DwellId,
+            RangeCompressed=RangeCompressed,
+            RangeDopplerMap=RangeDopplerMap,
+            MagnitudeDb=MagnitudeDb,
+            RangeAxisM=RangeAxisM,
+            DopplerAxisHz=DopplerAxisHz,
+            VelocityAxisMps=VelocityAxisMps,
+            TimeStamp=Raw.TimeStamp,
+        )
+        Processed.Diagnostics = Diagnostics
+        return Processed
+
+    def _ValidateGolayPlan(self, Raw, ThisDwell):
+        """Reject incomplete, reordered or physically inconsistent pairs."""
+
+        Pulses = list(getattr(ThisDwell, "PulsePlans", []))
+        if not Pulses or len(Pulses) % 2 != 0:
+            raise ValueError("Golay processing requires a positive even pulse count")
+        if Raw.IQ.ndim != 2 or Raw.IQ.shape[0] != len(Pulses):
+            raise ValueError("Raw Golay IQ dimensions do not match the dwell plan")
+        if bool(getattr(ThisDwell.Processing, "DopplerCompensationEnabled", False)):
+            raise ValueError(
+                "Golay Doppler compensation is reserved but not yet enabled"
+            )
+
+        PriValues = np.asarray([pulse.PriSec for pulse in Pulses], dtype=np.float64)
+        RxDelays = np.asarray(
+            [pulse.RxStartDelaySec for pulse in Pulses],
+            dtype=np.float64,
+        )
+        if not np.allclose(PriValues, PriValues[0], rtol=0.0, atol=1e-12):
+            raise ValueError("Golay processing requires a constant physical PRI")
+        if not np.allclose(RxDelays, RxDelays[0], rtol=0.0, atol=1e-12):
+            raise ValueError("Golay processing requires one RX start delay per dwell")
+        if PriValues[0] <= 0.0 or RxDelays[0] < 0.0:
+            raise ValueError("Golay PRI must be positive and RX delay non-negative")
+        if not all(bool(pulse.TxEnabled) for pulse in Pulses):
+            raise ValueError("Golay processing requires every A/B pulse to transmit")
+
+        WaveformAId = str(Pulses[0].WaveformId)
+        WaveformBId = str(Pulses[1].WaveformId)
+        MetadataA = self.TheWaveformLibrary.GetMetadata(WaveformAId)
+        MetadataB = self.TheWaveformLibrary.GetMetadata(WaveformBId)
+        if MetadataA["PairRole"] != "A" or MetadataB["PairRole"] != "B":
+            raise ValueError("Golay dwell must begin with the A waveform then B")
+        if (
+            MetadataA["PairId"] is None
+            or MetadataA["PairId"] != MetadataB["PairId"]
+            or MetadataA["ComplementaryWaveformId"] != WaveformBId
+            or MetadataB["ComplementaryWaveformId"] != WaveformAId
+        ):
+            raise ValueError("Golay A and B waveforms are not a declared pair")
+
+        for pair_index in range(len(Pulses) // 2):
+            PulseA = Pulses[2 * pair_index]
+            PulseB = Pulses[2 * pair_index + 1]
+            if (
+                str(PulseA.WaveformId) != WaveformAId
+                or str(PulseB.WaveformId) != WaveformBId
+                or PulseA.GroupId != pair_index
+                or PulseB.GroupId != pair_index
+                or str(PulseA.GroupRole).upper() != "A"
+                or str(PulseB.GroupRole).upper() != "B"
+            ):
+                raise ValueError(
+                    f"Golay pair {pair_index} is missing, reordered or mislabelled"
+                )
+            if (
+                PulseA.NumRxSamples != ThisDwell.NumSamples
+                or PulseB.NumRxSamples != ThisDwell.NumSamples
+            ):
+                raise ValueError("Golay pulses must use the dwell receive length")
+
+        return (
+            WaveformAId,
+            WaveformBId,
+            float(PriValues[0]),
+            float(RxDelays[0]),
+        )
+
+    def _ApplyGolayBPreCompressionCompensation(
+        self,
+        RawB,
+        ThisDwell,
+        PhysicalPriSec,
+    ):
+        """Reserved pre-compression B-code compensation hook; identity today."""
+
+        del ThisDwell, PhysicalPriSec
+        return RawB, "NONE"
 
     def _ProcessNonuniformDoppler(self, Raw, ThisDwell):
         raise NotImplementedError(
