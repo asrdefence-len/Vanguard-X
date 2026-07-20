@@ -29,6 +29,7 @@ from the expanded sampled-waveform length.
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -47,6 +48,9 @@ class WaveformDefinition:
     Samples: np.ndarray
     NumSamples: int
     PulseDurationSec: float
+    PairId: Optional[str] = None
+    PairRole: Optional[str] = None
+    ComplementaryWaveformId: Optional[str] = None
 
 
 class WaveformLibrary:
@@ -78,13 +82,14 @@ class WaveformLibrary:
         self.Definitions = {}
 
     def LoadDefaultWaveforms(self):
-        """Load the initial 10 and 20 Mchip/s Barker and Frank catalogue."""
+        """Load the operational Barker, Frank and Golay catalogue."""
 
         self.Waveforms.clear()
         self.Definitions.clear()
 
         Barker13 = self.MakeBarker13()
         Frank10 = self.MakeFrankCode(10)
+        Golay64A, Golay64B = self.MakeGolayPair(64)
 
         self.RegisterPhaseCode(
             WaveformId="Barker13_10MHz",
@@ -110,6 +115,24 @@ class WaveformLibrary:
             Chips=Frank10,
             ChipRateHz=20.0e6,
         )
+        self.RegisterPhaseCode(
+            WaveformId="Golay64A_20MHz",
+            CodeFamily="GOLAY",
+            Chips=Golay64A,
+            ChipRateHz=20.0e6,
+            PairId="Golay64_20MHz",
+            PairRole="A",
+            ComplementaryWaveformId="Golay64B_20MHz",
+        )
+        self.RegisterPhaseCode(
+            WaveformId="Golay64B_20MHz",
+            CodeFamily="GOLAY",
+            Chips=Golay64B,
+            ChipRateHz=20.0e6,
+            PairId="Golay64_20MHz",
+            PairRole="B",
+            ComplementaryWaveformId="Golay64A_20MHz",
+        )
 
     def RegisterPhaseCode(
         self,
@@ -117,12 +140,22 @@ class WaveformLibrary:
         CodeFamily,
         Chips,
         ChipRateHz,
+        PairId=None,
+        PairRole=None,
+        ComplementaryWaveformId=None,
     ):
         """Validate, sample and register one constant-amplitude phase code."""
 
         WaveformId = str(WaveformId)
         CodeFamily = str(CodeFamily).upper()
         ChipRateHz = float(ChipRateHz)
+        PairId = None if PairId is None else str(PairId)
+        PairRole = None if PairRole is None else str(PairRole).upper()
+        ComplementaryWaveformId = (
+            None
+            if ComplementaryWaveformId is None
+            else str(ComplementaryWaveformId)
+        )
 
         if not WaveformId:
             raise ValueError("WaveformId must not be empty")
@@ -130,6 +163,17 @@ class WaveformLibrary:
             raise ValueError(f"Waveform already registered: {WaveformId}")
         if not CodeFamily:
             raise ValueError("CodeFamily must not be empty")
+        PairFields = (PairId, PairRole, ComplementaryWaveformId)
+        if any(value is not None for value in PairFields):
+            if not all(value for value in PairFields):
+                raise ValueError(
+                    "Complementary waveform metadata must specify pair id, "
+                    "pair role and complementary waveform id together"
+                )
+            if PairRole not in ("A", "B"):
+                raise ValueError("Complementary waveform pair role must be A or B")
+            if ComplementaryWaveformId == WaveformId:
+                raise ValueError("A waveform cannot be complementary with itself")
         if ChipRateHz <= 0.0:
             raise ValueError("ChipRateHz must be greater than zero")
 
@@ -189,6 +233,9 @@ class WaveformLibrary:
             Samples=Samples,
             NumSamples=NumSamples,
             PulseDurationSec=PulseDurationSec,
+            PairId=PairId,
+            PairRole=PairRole,
+            ComplementaryWaveformId=ComplementaryWaveformId,
         )
 
         self.Definitions[WaveformId] = Definition
@@ -229,6 +276,24 @@ class WaveformLibrary:
 
         return np.asarray(Chips, dtype=np.complex64)
 
+    @staticmethod
+    def MakeGolayPair(Length):
+        """Return a binary Golay complementary pair of power-of-two length."""
+
+        Length = int(Length)
+        if Length <= 0 or (Length & (Length - 1)) != 0:
+            raise ValueError("Golay length must be a positive power of two")
+
+        A = np.array([1.0], dtype=np.complex64)
+        B = np.array([1.0], dtype=np.complex64)
+        while len(A) < Length:
+            PreviousA = A
+            PreviousB = B
+            A = np.concatenate((PreviousA, PreviousB))
+            B = np.concatenate((PreviousA, -PreviousB))
+
+        return A.astype(np.complex64), B.astype(np.complex64)
+
     def Get(self, WaveformName):
         """Return the authoritative sampled complex waveform."""
 
@@ -255,6 +320,9 @@ class WaveformLibrary:
             "SamplesPerChip": Definition.SamplesPerChip,
             "NumSamples": Definition.NumSamples,
             "PulseDurationSec": Definition.PulseDurationSec,
+            "PairId": Definition.PairId,
+            "PairRole": Definition.PairRole,
+            "ComplementaryWaveformId": Definition.ComplementaryWaveformId,
         }
 
     def GetChips(self, WaveformName):
