@@ -431,8 +431,11 @@ def Main(CommandLineArguments=None):
         # configuration inputs.
         "MinPrfHz": 1000.0,
         "MaxPrfHz": 4000.0,
-        "SelectedPrfHz": 2000.0,
-        "SelectedPulsesPerCpi": 32,
+        # Operational Golay uses 64 physical A/B pulses at 4 kHz.  The
+        # complementary processor produces 32 pair samples at a 2 kHz pair
+        # rate, preserving the established 16 ms CPI and Doppler span.
+        "SelectedPrfHz": 4000.0,
+        "SelectedPulsesPerCpi": 64,
         "MinPulsesPerCpi": 8,
         "MaxPulsesPerCpi": 128,
         "InstrumentedMaxRangeM": 15000.0,
@@ -475,8 +478,8 @@ def Main(CommandLineArguments=None):
 
         # Initial pulse-plan architecture. Search and track waveform selectors
         # are separate even though only SEARCH is scheduled in this version.
-        "SearchWaveformId": "Frank10_20MHz",
-        "TrackWaveformId": "Barker13_20MHz",
+        "SearchWaveformId": "Golay64_20MHz",
+        "TrackWaveformId": "Golay64_20MHz",
 
         # RF parameters
         "RfFrequency": 9.4e9,
