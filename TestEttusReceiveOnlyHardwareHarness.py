@@ -57,6 +57,7 @@ class TestEttusReceiveOnlyHardwareHarness(unittest.TestCase):
             PulseValid=np.ones(self.Timing.PulsesPerCpi, dtype=bool),
             Diagnostics={
                 "ReceiveOnly": True,
+                "OperatingMode": "RECEIVE_ONLY",
                 "TimedTransmitEnabled": False,
                 "SoftwareIqInjectionEnabled": False,
                 "SBandStylePerPriLoop": True,
