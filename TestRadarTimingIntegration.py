@@ -216,7 +216,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
 
         self.assertEqual(Track.WaveformId, "Barker13_20MHz")
         self.assertEqual(Track.NumSamples, 4043)
-        self.assertAlmostEqual(Track.RxStartDelaySec, 1.65e-6, places=15)
+        self.assertAlmostEqual(Track.RxStartDelaySec, 1.85e-6, places=15)
         self.assertEqual(Track.Timing.AntennaMovementDuringCpiDeg, 0.0)
 
     def test_pulse_plan_carries_derived_receive_window(self):
@@ -268,7 +268,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
         self.assertEqual(Raw.IQ.shape, (8, 4043))
         np.testing.assert_allclose(
             Raw.PulseRxStartDelaySec,
-            6.2e-6,
+            6.0e-6,
             rtol=0.0,
             atol=1e-15,
         )
@@ -283,7 +283,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
         )
         self.assertAlmostEqual(
             Processed.Diagnostics["RxStartDelaySec"],
-            6.2e-6,
+            6.0e-6,
             places=15,
         )
 
@@ -291,6 +291,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
         Config = MakeBaseConfig()
         Config["EttusCommandLeadTimeSec"] = 0.005
         Config["EttusAtrGpioEnabled"] = False
+        Config["EttusTxLeadingZeroSamples"] = 8
         Library = MakeLibrary(Config)
         Timing = CalculateRadarTiming(
             Library.GetMetadata("Frank10_20MHz"),
@@ -320,7 +321,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
             )
         np.testing.assert_allclose(
             Raw.PulseRxStartDelaySec,
-            6.2e-6,
+            6.0e-6,
             rtol=0.0,
             atol=1e-15,
         )

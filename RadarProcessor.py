@@ -250,6 +250,39 @@ class RadarProcessor:
             PRI,
             RxStartDelaySec,
         ) = self._ValidateUniformPriPlan(ThisDwell)
+
+        # The plan carries the scheduled RX time from the transport origin.
+        # Acquired data carries the range reference from the first non-zero
+        # RF sample, excluding any leading-zero transport padding.
+        RawRxStartDelaySec = getattr(
+            Raw,
+            "PulseRxStartDelaySec",
+            None,
+        )
+        if RawRxStartDelaySec is not None:
+            RawRxStartDelaySec = np.asarray(
+                RawRxStartDelaySec,
+                dtype=np.float64,
+            ).reshape(-1)
+            if RawRxStartDelaySec.size != Raw.IQ.shape[0]:
+                raise ValueError(
+                    "Raw pulse RX timing count does not match the CPI"
+                )
+            if not np.all(np.isfinite(RawRxStartDelaySec)):
+                raise ValueError(
+                    "Raw pulse RX timing contains non-finite values"
+                )
+            if not np.allclose(
+                RawRxStartDelaySec,
+                RawRxStartDelaySec[0],
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "UNIFORM_PRI_FFT requires a constant raw RX range origin"
+                )
+            RxStartDelaySec = float(RawRxStartDelaySec[0])
+
         TxWaveform = self.TheWaveformLibrary.Get(WaveformName)
         WaveformMetadata = self.TheWaveformLibrary.GetMetadata(WaveformName)
         ChipCount = int(WaveformMetadata["ChipCount"])

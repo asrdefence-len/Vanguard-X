@@ -221,15 +221,28 @@ class SimulatedSource:
         if NumPulses > 1:
             PulseTimesSec[1:] = np.cumsum(PulsePriSec[:-1])
 
-        PulseRxStartDelaySec = np.asarray(
+        ScheduledPulseRxStartDelaySec = np.asarray(
             [
                 self._GetPulseRxStartDelaySec(ThisDwell, i)
                 for i in range(NumPulses)
             ],
             dtype=np.float64,
         )
-        if np.any(PulseRxStartDelaySec < 0.0):
+        RadarTimingMetadata = dict(
+            getattr(ThisDwell, "Metadata", {}).get("RadarTiming", {})
+        )
+        RfPulseStartDelaySec = float(
+            RadarTimingMetadata.get("RfPulseStartDelaySec", 0.0)
+        )
+        PulseRxStartDelaySec = (
+            ScheduledPulseRxStartDelaySec - RfPulseStartDelaySec
+        )
+        if np.any(ScheduledPulseRxStartDelaySec < 0.0):
             raise ValueError("RX start delay must not be negative")
+        if np.any(PulseRxStartDelaySec < 0.0):
+            raise ValueError(
+                "RX start precedes the RF waveform range-time origin"
+            )
 
         PulseWaveformIds = [
             self._GetPulseWaveformId(ThisDwell, i)
@@ -414,6 +427,10 @@ class SimulatedSource:
         Diagnostics["PulseRxStartDelaySec"] = (
             PulseRxStartDelaySec.copy()
         )
+        Diagnostics["PulseScheduledRxStartDelaySec"] = (
+            ScheduledPulseRxStartDelaySec.copy()
+        )
+        Diagnostics["RfPulseStartDelaySec"] = RfPulseStartDelaySec
         Diagnostics["FirstRxSampleRangeOffsetM"] = float(
             SpeedOfLight * PulseRxStartDelaySec[0] / 2.0
         )
