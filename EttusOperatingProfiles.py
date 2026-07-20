@@ -273,6 +273,11 @@ def ApplyOperatingProfile(config, arguments):
                 "EttusRfTargetUseScenario": not bool(
                     getattr(arguments, "fixed_rf_target", False)
                 ),
+                "RangeProfileDopplerMode": (
+                    "ZERO_DOPPLER"
+                    if bool(getattr(arguments, "fixed_rf_target", False))
+                    else "MAX"
+                ),
                 "EttusRfTargetRangeM": (
                     float(arguments.target_range_km) * 1000.0
                 ),
@@ -303,6 +308,11 @@ def ApplyOperatingProfile(config, arguments):
             "EttusRfTargetEmulatorEnabled": True,
             "EttusRfTargetUseScenario": not bool(
                 getattr(arguments, "fixed_rf_target", False)
+            ),
+            "RangeProfileDopplerMode": (
+                "ZERO_DOPPLER"
+                if bool(getattr(arguments, "fixed_rf_target", False))
+                else "MAX"
             ),
             "EttusAtrAllowOverlapForSimulation": False,
             "EttusRfTargetRangeM": (
