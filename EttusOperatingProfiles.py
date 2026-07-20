@@ -281,6 +281,12 @@ def ApplyOperatingProfile(config, arguments):
                 "ShowRangeDetectionMarkers": not bool(
                     getattr(arguments, "fixed_rf_target", False)
                 ),
+                "GolayDiagnosticCaptureEnabled": bool(
+                    getattr(arguments, "fixed_rf_target", False)
+                ),
+                "LogGolayDiagnosticOnce": bool(
+                    getattr(arguments, "fixed_rf_target", False)
+                ),
                 "EttusRfTargetRangeM": (
                     float(arguments.target_range_km) * 1000.0
                 ),
@@ -318,6 +324,12 @@ def ApplyOperatingProfile(config, arguments):
                 else "MAX"
             ),
             "ShowRangeDetectionMarkers": not bool(
+                getattr(arguments, "fixed_rf_target", False)
+            ),
+            "GolayDiagnosticCaptureEnabled": bool(
+                getattr(arguments, "fixed_rf_target", False)
+            ),
+            "LogGolayDiagnosticOnce": bool(
                 getattr(arguments, "fixed_rf_target", False)
             ),
             "EttusAtrAllowOverlapForSimulation": False,
