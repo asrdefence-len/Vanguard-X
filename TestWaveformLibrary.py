@@ -22,6 +22,8 @@ class TestWaveformLibrary(unittest.TestCase):
                 "Barker13_20MHz",
                 "Frank10_10MHz",
                 "Frank10_20MHz",
+                "Golay64A_20MHz",
+                "Golay64B_20MHz",
             ],
         )
 
@@ -35,6 +37,8 @@ class TestWaveformLibrary(unittest.TestCase):
             "Barker13_20MHz": (13, 20.0e6, 2, 26, 0.65e-6),
             "Frank10_10MHz": (100, 10.0e6, 4, 400, 10.0e-6),
             "Frank10_20MHz": (100, 20.0e6, 2, 200, 5.0e-6),
+            "Golay64A_20MHz": (64, 20.0e6, 2, 128, 3.2e-6),
+            "Golay64B_20MHz": (64, 20.0e6, 2, 128, 3.2e-6),
         }
 
         for WaveformId, Values in Expected.items():
