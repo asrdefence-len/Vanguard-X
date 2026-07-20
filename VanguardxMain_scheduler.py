@@ -171,7 +171,7 @@ def ApplyOperatorPointingCommand(
 ):
     """Apply one-shot STARE/STOP/nudge intent independently of RF state.
 
-    This function must run before the radar-dwell enable/throttle gates. PTZ
+    This function must run before the radar-dwell enable/throttle gates. X6-60
     pointing is an operator control path and must not depend on TX being armed.
     Returns ``(last_nudge_id, action, commanded_relative_deg)``.
     """
@@ -215,7 +215,7 @@ def ApplyOperatorPointingCommand(
 
 
 def InitialisePTZToStartupPose(Ptz, Config, Display=None):
-    """Command the PTZ to the configured safe startup AZ/EL pose.
+    """Command the X6-60 motor/positioning unit to its startup AZ/EL pose.
 
     Default startup pose is reported EL=55 deg and AZ=200 deg.  This runs before the
     radar dwell loop so the antenna starts from a known mechanical attitude.
@@ -232,7 +232,7 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
     TimeoutSec = float(Config.get("PTZStartupTimeoutSec", 20.0))
     ToleranceDeg = float(Config.get("PTZStartupPositionToleranceDeg", Config.get("PTZPositionToleranceDeg", 1.0)))
 
-    print(f"PTZ startup initialise: AZ={TargetAzDeg:.2f} deg, EL={TargetElDeg:.2f} deg")
+    print(f"X6-60 startup initialise: AZ={TargetAzDeg:.2f} deg, EL={TargetElDeg:.2f} deg")
 
     if hasattr(Ptz, "CommandPosition"):
         Ptz.CommandPosition(TargetAzDeg, TargetElDeg)
@@ -251,7 +251,7 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
             AzDeg = float(getattr(State, "AzimuthDeg", TargetAzDeg))
             ElDeg = float(getattr(State, "ElevationDeg", TargetElDeg))
         except Exception as exc:
-            print(f"PTZ startup initialise warning: {exc}")
+            print(f"X6-60 startup initialise warning: {exc}")
             break
 
         if hasattr(Display, "App"):
@@ -262,7 +262,7 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
 
         NowSec = time.time()
         if NowSec - LastPrintSec > 1.0:
-            print(f"PTZ startup position: AZ={AzDeg:.2f} deg, EL={ElDeg:.2f} deg")
+            print(f"X6-60 startup position: AZ={AzDeg:.2f} deg, EL={ElDeg:.2f} deg")
             LastPrintSec = NowSec
 
         if AzOk and ElOk:
@@ -460,12 +460,14 @@ def Main(CommandLineArguments=None):
         "EttusSampleRateHz": 40.0e6,
         "EttusMaxSampleRateHz": 40.0e6,
         "EttusReceiveTimeoutSec": 1.0,
-        # Startup remains fail-closed and receive-only. The operational
-        # timed-command lead is 5 ms; the independent radar dwell cadence
-        # remains 100 ms. Timed TX and ATR require separately verified modes.
+        # No-profile startup remains fail-closed.  The Stage 3H profile enables
+        # the CRO-verified ATR mapping on the safe attenuated SDR loopback.
+        # The command lead is 5 ms and dwell cadence remains 100 ms.
         "EttusOperatingMode": "RECEIVE_ONLY",
         "EttusTimedTransmitEnabled": False,
         "EttusAtrGpioEnabled": False,
+        "EttusAtrAllowOverlapForSimulation": False,
+        "EttusTxLeadingZeroSamples": 8,
         "EttusCommandLeadTimeSec": 0.005,
         "EttusCommandQueueDepth": 20,
         "EttusRxWarmupEnabled": True,
@@ -606,7 +608,7 @@ def Main(CommandLineArguments=None):
         "InitialBeamAngleDeg": 200.0,
         "ManualBeamStepDeg": 1.0,
 
-        # PTZ controls "pelco" or "sim"
+        # X6-60 motor/positioning unit controls (legacy PTZ keys/classes).
         "EnablePTZ": True,
         "PTZMode": "sim", #"pelco"
         "PTZPort": "/dev/ttyACM0",
@@ -652,6 +654,8 @@ def Main(CommandLineArguments=None):
     if OperatingProfile in (
         "STAGE3E1_LOOPBACK",
         "STAGE3F_RF_TARGET",
+        "STAGE3H_ATR_LOOPBACK",
+        "STAGE3I_ATR_RF_TARGET_OVERLAP",
     ):
         print(
             f"{OperatingProfile} GUARDED FULL-APPLICATION PROFILE SELECTED"
@@ -660,13 +664,28 @@ def Main(CommandLineArguments=None):
             "  RF path:        TX/RX -> "
             f"{Config['EttusExternalAttenuationDb']:.1f} dB -> RX2"
         )
-        print("  ATR / TRM / PA: DISABLED")
+        if OperatingProfile in (
+            "STAGE3H_ATR_LOOPBACK",
+            "STAGE3I_ATR_RF_TARGET_OVERLAP",
+        ):
+            print("  ATR:            ENABLED (CRO-verified FP0 mapping)")
+            print("  GPIO:           J6-3 TX, J6-4 RX, J6-5 ATR_XX witness")
+            print("  TRM / PA:       DISCONNECTED")
+            print("  TX pre-roll:    8 zero samples / 0.200 us")
+            if OperatingProfile == "STAGE3I_ATR_RF_TARGET_OVERLAP":
+                print("  ATR_XX:         TX + RX + witness HIGH (SIMULATION ONLY)")
+                print("  WARNING:        NEVER CONNECT TRM OR PA IN THIS PROFILE")
+        else:
+            print("  ATR / TRM / PA: DISABLED")
         print(
             f"  TX/RX gains:    {Config['EttusTxGainDb']:.1f} / "
             f"{Config['EttusRxGainDb']:.1f} dB"
         )
         print("  shutdown:       operator Stop / Exit")
-        if OperatingProfile == "STAGE3F_RF_TARGET":
+        if OperatingProfile in (
+            "STAGE3F_RF_TARGET",
+            "STAGE3I_ATR_RF_TARGET_OVERLAP",
+        ):
             print(
                 "  RF targets:     TargetScenario strongest parent "
                 "inside true bearing +/-2.00 deg"
@@ -745,21 +764,21 @@ def Main(CommandLineArguments=None):
         if Config.get("EnableIMU", False):
             print("IMU requested, but ReadIMU.py / IMUReader could not be imported.")
 
-    # PTZ controller. In hardware mode this opens /dev/ttyACM0 and uses
-    # native Pelco-D pan position commands.
+    # X6-60 motor/positioning unit.  The legacy PTZController class opens
+    # /dev/ttyACM0 and uses native Pelco-D pan position commands.
     if Config.get("EnablePTZ", False) and CreatePTZController is not None:
         try:
             Ptz = CreatePTZController(Config)
             Ptz.Open()
-            print(f"PTZ controller enabled. Mode={Config.get('PTZMode', 'pelco')}")
+            print(f"X6-60 motor/positioning unit enabled. Mode={Config.get('PTZMode', 'pelco')}")
             InitialisePTZToStartupPose(Ptz, Config, Display)
         except Exception as exc:
             Ptz = None
-            print(f"PTZ requested but failed to open: {exc}")
+            print(f"X6-60 motor/positioning unit failed to open: {exc}")
     else:
         Ptz = None
         if Config.get("EnablePTZ", False):
-            print("PTZ requested, but PTZController.py could not be imported.")
+            print("X6-60 requested, but legacy PTZController.py could not be imported.")
 
     Source.Initialise()
 
@@ -886,6 +905,8 @@ def Main(CommandLineArguments=None):
         f"PRI={SearchTiming.PriSec * 1e6:.3f} us, "
         f"pulses={SearchTiming.PulsesPerCpi}, "
         f"CPI={SearchTiming.CpiDurationSec * 1e3:.3f} ms, "
+        f"TX_ATR={SearchTiming.TxAtrEnvelopeDurationSec * 1e6:.3f} us, "
+        f"RF_start={SearchTiming.RfPulseStartDelaySec * 1e6:.3f} us, "
         f"RX_start={SearchTiming.RxStartDelaySec * 1e6:.3f} us, "
         f"RX_samples={SearchTiming.NumRxSamples}, "
         f"max_range={SearchTiming.MaximumRangeM / 1e3:.3f} km"
@@ -1306,7 +1327,7 @@ def Main(CommandLineArguments=None):
                         f"Log {1000*(T4-T3):7.2f} ms | "
                         f"Display {1000*(T5-T4):7.2f} ms | "
                         f"Total {1000*(T5-T0):7.2f} ms | "
-                        f"PTZ {PtzAzDeg:7.2f} deg {PtzSource} | "
+                        f"X6-60 {PtzAzDeg:7.2f} deg {PtzSource} | "
                         f"Mode {DisplayMode} Scan {ScanEnabled} | "
                         f"Dets {len(Detections):3d} Plots {len(Plots):3d} Tracks {len(Tracks):3d} | "
                         f"Pts {int(TrackerDebug.get('CurrentScanPoints', 0)):3d} "

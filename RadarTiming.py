@@ -14,7 +14,9 @@ The initial timing architecture uses:
     default PRF:                 2 kHz
     default pulses per CPI:      32
 
-Receive capture starts after the sampled transmit waveform and provisional
+The transport burst begins with eight zero samples (200 ns at 40 MS/s), then
+the unchanged waveform-library samples establish the RF/range time origin.
+Receive capture starts after the complete ATR transmit envelope and provisional
 receiver-recovery interval. Capture continues until the complete coded return
 from maximum instrumented range, plus the configured end margin, is available.
 
@@ -44,6 +46,12 @@ class RadarTimingSolution:
     SamplesPerChip: int
     TxWaveformSamples: int
     TxPulseDurationSec: float
+    TxLeadingZeroSamples: int
+    TxLeadingZeroDurationSec: float
+    TxAtrEnvelopeSamples: int
+    TxAtrEnvelopeDurationSec: float
+    RfPulseStartDelaySec: float
+    RfPulseEndDelaySec: float
 
     SelectedPrfHz: float
     PriSec: float
@@ -123,6 +131,15 @@ def _RequirePositiveInteger(Name, Value):
     return IntegerValue
 
 
+def _RequireNonNegativeInteger(Name, Value):
+    if isinstance(Value, bool):
+        raise ValueError(f"{Name} must be a non-negative integer")
+    IntegerValue = int(Value)
+    if IntegerValue < 0 or float(Value) != float(IntegerValue):
+        raise ValueError(f"{Name} must be a non-negative integer")
+    return IntegerValue
+
+
 def _MetadataValue(WaveformMetadata, Name):
     try:
         return WaveformMetadata[Name]
@@ -145,6 +162,7 @@ def CalculateRadarTiming(
     OperatorMaxPrfHz: float = 4000.0,
     RfFrequencyHz: float = 9.4e9,
     AntennaScanRateDegPerSec: float = 90.0,
+    TxLeadingZeroSamples: int = 8,
 ) -> RadarTimingSolution:
     """Calculate and validate one uniform-PRI Vanguard X timing solution."""
 
@@ -186,6 +204,10 @@ def CalculateRadarTiming(
     TxPulseDurationSec = _RequirePositive(
         "PulseDurationSec",
         _MetadataValue(WaveformMetadata, "PulseDurationSec"),
+    )
+    TxLeadingZeroSamples = _RequireNonNegativeInteger(
+        "TxLeadingZeroSamples",
+        TxLeadingZeroSamples,
     )
 
     ExpectedTxSamples = ChipCount * SamplesPerChip
@@ -246,12 +268,23 @@ def CalculateRadarTiming(
     )
 
     PriSec = 1.0 / SelectedPrfHz
+    TxLeadingZeroDurationSec = TxLeadingZeroSamples / SampleRateHz
+    TxAtrEnvelopeSamples = TxLeadingZeroSamples + TxWaveformSamples
+    TxAtrEnvelopeDurationSec = TxAtrEnvelopeSamples / SampleRateHz
+    RfPulseStartDelaySec = TxLeadingZeroDurationSec
+    RfPulseEndDelaySec = (
+        RfPulseStartDelaySec + TxPulseDurationSec
+    )
     MaximumEchoLeadingEdgeDelaySec = (
         2.0 * MaximumRangeM / SPEED_OF_LIGHT_MPS
     )
-    RxStartDelaySec = TxPulseDurationSec + ReceiverRecoveryTimeSec
+    RxStartDelaySec = (
+        TxAtrEnvelopeDurationSec + ReceiverRecoveryTimeSec
+    )
     MinimumFullEchoRangeM = (
-        SPEED_OF_LIGHT_MPS * RxStartDelaySec / 2.0
+        SPEED_OF_LIGHT_MPS
+        * (RxStartDelaySec - RfPulseStartDelaySec)
+        / 2.0
     )
     if MaximumRangeM <= MinimumFullEchoRangeM:
         raise ValueError(
@@ -260,7 +293,8 @@ def CalculateRadarTiming(
             f"{WaveformId}"
         )
     RequiredRxEndDelaySec = (
-        MaximumEchoLeadingEdgeDelaySec
+        RfPulseStartDelaySec
+        + MaximumEchoLeadingEdgeDelaySec
         + TxPulseDurationSec
         + RxEndMarginSec
     )
@@ -324,6 +358,12 @@ def CalculateRadarTiming(
         SamplesPerChip=SamplesPerChip,
         TxWaveformSamples=TxWaveformSamples,
         TxPulseDurationSec=TxPulseDurationSec,
+        TxLeadingZeroSamples=TxLeadingZeroSamples,
+        TxLeadingZeroDurationSec=TxLeadingZeroDurationSec,
+        TxAtrEnvelopeSamples=TxAtrEnvelopeSamples,
+        TxAtrEnvelopeDurationSec=TxAtrEnvelopeDurationSec,
+        RfPulseStartDelaySec=RfPulseStartDelaySec,
+        RfPulseEndDelaySec=RfPulseEndDelaySec,
         SelectedPrfHz=SelectedPrfHz,
         PriSec=PriSec,
         OperatorMinPrfHz=OperatorMinPrfHz,
@@ -353,7 +393,7 @@ def CalculateRadarTiming(
         UnambiguousRadialVelocityMps=UnambiguousRadialVelocityMps,
         VelocityBinSpacingMps=VelocityBinSpacingMps,
         AntennaMovementDuringCpiDeg=AntennaMovementDuringCpiDeg,
-        TransmitDutyCycle=TxPulseDurationSec / PriSec,
+        TransmitDutyCycle=TxAtrEnvelopeDurationSec / PriSec,
         ReceiveCaptureDutyCycle=ActualRxCaptureDurationSec / PriSec,
         BytesPerPulseSc16=BytesPerPulseSc16,
         BytesPerPulseFc32=BytesPerPulseFc32,

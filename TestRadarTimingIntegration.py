@@ -19,6 +19,7 @@ from WaveformLibrary import WaveformLibrary
 def MakeBaseConfig():
     return {
         "EttusSampleRateHz": 40.0e6,
+        "EttusRxWarmupEnabled": False,
         "RfFrequency": 9.4e9,
         "SearchWaveformId": "Frank10_20MHz",
         "TrackWaveformId": "Barker13_20MHz",
@@ -68,7 +69,11 @@ class FakeHardwareTime:
 
 
 class FakeUsrp:
+    def __init__(self):
+        self.TimeQueryCount = 0
+
     def get_time_now(self):
+        self.TimeQueryCount += 1
         return FakeHardwareTime(100.0)
 
     def get_rx_freq(self, Channel):
@@ -88,17 +93,37 @@ class RecordingEttusSource(EttusRadarSource):
         super().__init__(Config, Library)
         self.Usrp = FakeUsrp()
         self.IssuedCommands = []
+        self.Events = []
         self._initialised = True
 
     def _configure_sample_rate(self, requested_rate):
         return float(requested_rate)
 
     def _issue_receive_command(self, num_samples, scheduled_time_sec):
+        self.Events.append("ARM_RX")
         self.IssuedCommands.append(
             (int(num_samples), float(scheduled_time_sec))
         )
 
+    def _queue_transmit_for_pri(
+        self,
+        ThisDwell,
+        pulse_index,
+        scheduled_pri_time_sec,
+        tx_time_offset_sec=None,
+        rf_target=None,
+    ):
+        self.Events.append("TX_HOOK_DISABLED")
+        return super()._queue_transmit_for_pri(
+            ThisDwell,
+            pulse_index,
+            scheduled_pri_time_sec,
+            tx_time_offset_sec=tx_time_offset_sec,
+            rf_target=rf_target,
+        )
+
     def _receive_scheduled_pri(self, num_samples):
+        self.Events.append("COLLECT_RX")
         return (
             np.zeros(int(num_samples), dtype=np.complex64),
             {
@@ -182,7 +207,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
         self.assertEqual(Search.NumSamples, 4043)
         self.assertEqual(Search.NumPulses, 32)
         self.assertAlmostEqual(Search.PriSec, 500.0e-6, places=15)
-        self.assertAlmostEqual(Search.RxStartDelaySec, 6.0e-6, places=15)
+        self.assertAlmostEqual(Search.RxStartDelaySec, 6.2e-6, places=15)
         self.assertAlmostEqual(
             Search.Timing.AntennaMovementDuringCpiDeg,
             0.224,
@@ -205,13 +230,13 @@ class TestRadarTimingIntegration(unittest.TestCase):
         self.assertEqual(Plan.NumSamples, 4043)
         self.assertEqual(Plan.NumPulses, 32)
         self.assertAlmostEqual(Plan.PRI, 500.0e-6, places=15)
-        self.assertAlmostEqual(Plan.RxStartDelaySec, 6.0e-6, places=15)
+        self.assertAlmostEqual(Plan.RxStartDelaySec, 6.2e-6, places=15)
         self.assertTrue(all(
             pulse.NumRxSamples == 4043
             for pulse in Plan.PulsePlans
         ))
         self.assertTrue(all(
-            abs(pulse.RxStartDelaySec - 6.0e-6) < 1e-15
+            abs(pulse.RxStartDelaySec - 6.2e-6) < 1e-15
             for pulse in Plan.PulsePlans
         ))
 
@@ -243,7 +268,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
         self.assertEqual(Raw.IQ.shape, (8, 4043))
         np.testing.assert_allclose(
             Raw.PulseRxStartDelaySec,
-            6.0e-6,
+            6.2e-6,
             rtol=0.0,
             atol=1e-15,
         )
@@ -258,7 +283,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
         )
         self.assertAlmostEqual(
             Processed.Diagnostics["RxStartDelaySec"],
-            6.0e-6,
+            6.2e-6,
             places=15,
         )
 
@@ -278,7 +303,7 @@ class TestRadarTimingIntegration(unittest.TestCase):
 
         self.assertEqual(Raw.IQ.shape, (4, 4043))
         self.assertEqual(len(Source.IssuedCommands), 4)
-        ExpectedFirstRxTimeSec = 100.0 + 0.005 + 6.0e-6
+        ExpectedFirstRxTimeSec = 100.0 + 0.005 + 6.2e-6
         self.assertAlmostEqual(
             Source.IssuedCommands[0][1],
             ExpectedFirstRxTimeSec,
@@ -295,12 +320,36 @@ class TestRadarTimingIntegration(unittest.TestCase):
             )
         np.testing.assert_allclose(
             Raw.PulseRxStartDelaySec,
-            6.0e-6,
+            6.2e-6,
             rtol=0.0,
             atol=1e-15,
         )
         self.assertTrue(
             Raw.Diagnostics["AllReceiveCommandsQueuedBeforeCollection"]
+        )
+        self.assertTrue(Raw.Diagnostics["SBandStylePerPriLoop"])
+        self.assertTrue(Raw.Diagnostics["BoundedIndividualPriPipeline"])
+        self.assertEqual(Raw.Diagnostics["ReceiveCommandCount"], 4)
+        self.assertEqual(Raw.Diagnostics["ConfiguredCommandQueueDepth"], 20)
+        self.assertEqual(Raw.Diagnostics["ActiveCommandQueueDepth"], 4)
+        self.assertEqual(
+            Raw.Diagnostics["MaximumOutstandingReceiveCommands"],
+            4,
+        )
+        self.assertEqual(Raw.Diagnostics["HardwareTimeQueriesPerDwell"], 1)
+        self.assertEqual(Source.Usrp.TimeQueryCount, 1)
+        self.assertEqual(
+            Source.Events,
+            [
+                "TX_HOOK_DISABLED", "ARM_RX",
+                "TX_HOOK_DISABLED", "ARM_RX",
+                "TX_HOOK_DISABLED", "ARM_RX",
+                "TX_HOOK_DISABLED", "ARM_RX",
+                "COLLECT_RX",
+                "COLLECT_RX",
+                "COLLECT_RX",
+                "COLLECT_RX",
+            ],
         )
         self.assertFalse(Raw.Diagnostics["TimedTransmitEnabled"])
 

@@ -10,7 +10,8 @@ J6 pin 4, GPIO_2, as RX ATR
 ATR_0X: both low
 ATR_RX: RX high, TX low
 ATR_TX: TX high, RX low
-ATR_XX: both low
+J6 pin 5, GPIO_3, as the ATR_XX overlap witness
+ATR_XX: TX and RX low; overlap witness high
 
 Key behaviour:
 - The hardware clock is read once to establish the absolute dwell start.
@@ -32,8 +33,12 @@ Key behaviour:
 - TX asynchronous events are drained only after replenishing the bounded
   scheduling horizon; remaining burst acknowledgements are collected after
   the complete CPI capture.
-- ATR GPIO is disabled by default and must be enabled explicitly only after
-  its separate oscilloscope-verification stage.
+- ATR GPIO is disabled by default.  The Stage 3H guarded loopback profile may
+  enable the CRO-verified mapping after explicit physical acknowledgements.
+- The current timed-TX profiles prepend eight zero samples (200 ns at
+  40 MS/s) to the transport burst without changing the waveform-library or
+  matched-filter reference.  Delayed Stage 3F targets retain the RF-relative
+  range origin after this padding.
 - Optional software IQ injection can add synthetic targets to each received PRI.
 """
 
@@ -244,20 +249,87 @@ class EttusRadarSource:
         self.AtrGpioEnabled = bool(
             Config.get("EttusAtrGpioEnabled", False)
         )
-        if self.TimedTransmitEnabled and self.AtrGpioEnabled:
-            raise RuntimeError(
-                "Stage 3E1 keeps ATR disabled; verify ATR separately later"
+        self.AtrCroVerifiedAcknowledged = bool(
+            Config.get("EttusAtrCroVerifiedAcknowledged", False)
+        )
+        self.TrmPaDisconnectedConfirmed = bool(
+            Config.get("EttusTrmPaDisconnectedConfirmed", False)
+        )
+        self.AtrAllowOverlapForSimulation = bool(
+            Config.get("EttusAtrAllowOverlapForSimulation", False)
+        )
+        self.TxLeadingZeroSamples = int(
+            Config.get("EttusTxLeadingZeroSamples", 0)
+        )
+        if self.TxLeadingZeroSamples < 0:
+            raise ValueError(
+                "EttusTxLeadingZeroSamples must not be negative"
             )
         self.GpioBank = str(Config.get("EttusGPIOBank", "FP0"))
         self.TxAtrGpioBit = int(Config.get("EttusTxAtrGPIO", 1))
         self.RxAtrGpioBit = int(Config.get("EttusRxAtrGPIO", 2))
+        self.OverlapAtrGpioBit = int(
+            Config.get("EttusAtrOverlapGPIO", 3)
+        )
+        if min(
+            self.TxAtrGpioBit,
+            self.RxAtrGpioBit,
+            self.OverlapAtrGpioBit,
+        ) < 0:
+            raise ValueError("ATR GPIO bit numbers must be non-negative")
         self.TxAtrMask = 1 << self.TxAtrGpioBit
         self.RxAtrMask = 1 << self.RxAtrGpioBit
-        self.AtrGpioMask = self.TxAtrMask | self.RxAtrMask
-
+        self.OverlapAtrMask = 1 << self.OverlapAtrGpioBit
+        self.AtrGpioMask = (
+            self.TxAtrMask | self.RxAtrMask | self.OverlapAtrMask
+        )
+        if self.AtrGpioEnabled:
+            if not self.TimedTransmitEnabled:
+                raise RuntimeError("ATR GPIO requires timed TX/RX mode")
+            if not self.AtrCroVerifiedAcknowledged:
+                raise RuntimeError(
+                    "ATR GPIO requires explicit CRO-verification acknowledgement"
+                )
+            if not self.TrmPaDisconnectedConfirmed:
+                raise RuntimeError(
+                    "Stage 3H ATR loopback requires TRM and PA disconnected"
+                )
+            if (
+                self.GpioBank != "FP0"
+                or self.TxAtrGpioBit != 1
+                or self.RxAtrGpioBit != 2
+                or self.OverlapAtrGpioBit != 3
+            ):
+                raise RuntimeError(
+                    "Stage 3H requires verified FP0 GPIO bits 1=TX, "
+                    "2=RX and 3=ATR_XX witness"
+                )
+            if self.TxLeadingZeroSamples != 8:
+                raise RuntimeError(
+                    "Stage 3H requires exactly eight leading zero samples"
+                )
+        if self.AtrAllowOverlapForSimulation:
+            if not self.AtrGpioEnabled:
+                raise RuntimeError(
+                    "Simulation ATR overlap requires ATR GPIO enabled"
+                )
+            if not self.RfTargetEmulatorEnabled:
+                raise RuntimeError(
+                    "Simulation ATR overlap is restricted to RF target emulation"
+                )
+        if (
+            self.AtrGpioEnabled
+            and self.RfTargetEmulatorEnabled
+            and not self.AtrAllowOverlapForSimulation
+        ):
+            raise RuntimeError(
+                "ATR plus delayed RF target emulation requires the explicit "
+                "simulation-overlap profile"
+            )
         self._configured_sample_rate = None
         self._receive_path_warmed = False
         self._initialised = False
+        self._atr_configured = False
 
     def Initialise(self):
         if uhd is None:
@@ -383,6 +455,15 @@ class EttusRadarSource:
                 )
 
     def Shutdown(self):
+        if self.AtrGpioEnabled and self.Usrp is not None:
+            try:
+                self._force_atr_safe_low()
+            except Exception as exc:
+                print(
+                    "WARNING: ATR safe-low shutdown/readback failed: "
+                    f"{exc}"
+                )
+
         if self.RxStreamer is not None and uhd is not None:
             try:
                 command = uhd.types.StreamCMD(
@@ -398,6 +479,7 @@ class EttusRadarSource:
         self._configured_sample_rate = None
         self._receive_path_warmed = False
         self._initialised = False
+        self._atr_configured = False
         print("Ettus source shutdown")
 
     def SetIqInjector(self, iq_injector: Optional[IqInjector]):
@@ -457,6 +539,16 @@ class EttusRadarSource:
         )
         if np.any(pulse_rx_start_delay_sec < 0.0):
             raise ValueError("RX start delay must not be negative")
+        tx_leading_zero_duration_sec = (
+            self.TxLeadingZeroSamples / float(actual_sample_rate)
+        )
+        pulse_range_reference_rx_start_delay_sec = (
+            pulse_rx_start_delay_sec - tx_leading_zero_duration_sec
+        )
+        if np.any(pulse_range_reference_rx_start_delay_sec < 0.0):
+            raise ValueError(
+                "RX start precedes the RF waveform range-time origin"
+            )
 
         pulse_num_rx_samples = np.asarray(
             [
@@ -476,7 +568,9 @@ class EttusRadarSource:
             sample_rate_hz=actual_sample_rate,
             num_samples=num_samples,
             waveform_id=pulse_waveform_ids[0],
-            rx_start_delay_sec=float(pulse_rx_start_delay_sec[0]),
+            rx_start_delay_sec=float(
+                pulse_range_reference_rx_start_delay_sec[0]
+            ),
         )
         rf_target_active = bool(rf_target["Active"])
         rf_target_angle_error_deg = float(rf_target["AngleErrorDeg"])
@@ -622,7 +716,13 @@ class EttusRadarSource:
                 "PulseTimeSec": float(pulse_times_sec[pulse_index]),
                 "PriSec": float(pulse_pri_sec[pulse_index]),
                 "RxStartDelaySec": float(
+                    pulse_range_reference_rx_start_delay_sec[pulse_index]
+                ),
+                "ScheduledRxStartDelaySec": float(
                     pulse_rx_start_delay_sec[pulse_index]
+                ),
+                "RfPulseStartDelaySec": float(
+                    tx_leading_zero_duration_sec
                 ),
                 "WaveformId": str(pulse_waveform_ids[pulse_index]),
                 "ValidBeforeInjection": bool(pulse_valid[pulse_index]),
@@ -759,7 +859,12 @@ class EttusRadarSource:
             "ActualSampleRate": actual_sample_rate,
             "NumSamplesPerPulse": num_samples,
             "NumPulses": num_pulses,
-            "PulseRxStartDelaySec": pulse_rx_start_delay_sec.copy(),
+            "PulseRxStartDelaySec": (
+                pulse_range_reference_rx_start_delay_sec.copy()
+            ),
+            "PulseScheduledRxStartDelaySec": (
+                pulse_rx_start_delay_sec.copy()
+            ),
             "ScheduledPriHardwareTimesSec": (
                 scheduled_pri_times_sec.copy()
             ),
@@ -776,6 +881,20 @@ class EttusRadarSource:
             "AtrGpioBank": str(self.GpioBank),
             "TxAtrGpioBit": int(self.TxAtrGpioBit),
             "RxAtrGpioBit": int(self.RxAtrGpioBit),
+            "OverlapAtrGpioBit": int(self.OverlapAtrGpioBit),
+            "AtrCroVerifiedAcknowledged": bool(
+                self.AtrCroVerifiedAcknowledged
+            ),
+            "TrmPaDisconnectedConfirmed": bool(
+                self.TrmPaDisconnectedConfirmed
+            ),
+            "AtrAllowOverlapForSimulation": bool(
+                self.AtrAllowOverlapForSimulation
+            ),
+            "TxLeadingZeroSamples": int(self.TxLeadingZeroSamples),
+            "TxLeadingZeroDurationSec": (
+                self.TxLeadingZeroSamples / float(actual_sample_rate)
+            ),
             "PulseDiagnostics": pulse_diagnostics,
             "CaptureElapsedSec": wall_end - wall_start,
         }
@@ -800,7 +919,9 @@ class EttusRadarSource:
             TimeStamp=float(wall_end),
             PulseTimesSec=pulse_times_sec,
             PulsePriSec=pulse_pri_sec,
-            PulseRxStartDelaySec=pulse_rx_start_delay_sec,
+            PulseRxStartDelaySec=(
+                pulse_range_reference_rx_start_delay_sec
+            ),
             PulseWaveformIds=pulse_waveform_ids,
             PulseValid=pulse_valid,
             Diagnostics=diagnostics,
@@ -892,6 +1013,7 @@ class EttusRadarSource:
                 "Combined TX amplitude scale must be in (0, 1]"
             )
 
+        rf_waveform_samples = int(waveform.size)
         if phase_offset_rad != 0.0 or frequency_offset_hz != 0.0:
             sample_number = np.arange(waveform.size, dtype=np.float64)
             phase = (
@@ -907,8 +1029,19 @@ class EttusRadarSource:
             waveform * amplitude_scale,
             dtype=np.complex64,
         )
+        if self.TxLeadingZeroSamples:
+            waveform = np.concatenate((
+                np.zeros(
+                    self.TxLeadingZeroSamples,
+                    dtype=np.complex64,
+                ),
+                waveform,
+            ))
 
-        pulse_duration_sec = (
+        rf_pulse_duration_sec = (
+            rf_waveform_samples / float(self._configured_sample_rate)
+        )
+        tx_envelope_duration_sec = (
             waveform.size / float(self._configured_sample_rate)
         )
         pri_sec = self._get_pulse_pri_sec(ThisDwell, pulse_index)
@@ -916,7 +1049,7 @@ class EttusRadarSource:
             ThisDwell,
             pulse_index,
         )
-        if pulse_duration_sec > pri_sec:
+        if tx_envelope_duration_sec > pri_sec:
             raise ValueError("TX waveform does not fit within the PRI")
         if tx_time_offset_sec is None:
             tx_time_offset_sec = (
@@ -935,31 +1068,44 @@ class EttusRadarSource:
             desired_echo_delay_sec = (
                 2.0 * float(rf_target["RangeM"]) / 299792458.0
             )
+            # Dwell-plan RX timing is absolute from the transport/PRI origin,
+            # while target range is measured from the first non-zero RF
+            # sample.  Remove the leading-zero duration for range-window tests.
+            rf_origin_delay_sec = (
+                self.TxLeadingZeroSamples
+                / float(self._configured_sample_rate)
+            )
+            range_rx_start_delay_sec = (
+                rx_start_delay_sec - rf_origin_delay_sec
+            )
             num_rx_samples = self._get_pulse_num_rx_samples(
                 ThisDwell,
                 pulse_index,
                 int(getattr(ThisDwell, "NumSamples", 0)),
             )
             rx_end_delay_sec = (
-                rx_start_delay_sec
+                range_rx_start_delay_sec
                 + num_rx_samples / float(self._configured_sample_rate)
             )
-            if desired_echo_delay_sec < rx_start_delay_sec - 1.0e-12:
+            if (
+                desired_echo_delay_sec
+                < range_rx_start_delay_sec - 1.0e-12
+            ):
                 raise ValueError(
                     "RF target echo begins before the RX window"
                 )
             if (
-                desired_echo_delay_sec + pulse_duration_sec
+                desired_echo_delay_sec + rf_pulse_duration_sec
                 > rx_end_delay_sec + 1.0e-12
             ):
                 raise ValueError(
                     "RF target echo does not fit inside the RX window"
                 )
-        elif pulse_duration_sec > rx_start_delay_sec + 1.0e-12:
+        elif tx_envelope_duration_sec > rx_start_delay_sec + 1.0e-12:
             raise ValueError(
                 "Operational RX starts before the TX waveform has ended"
             )
-        if tx_time_offset_sec + pulse_duration_sec > pri_sec:
+        if tx_time_offset_sec + tx_envelope_duration_sec > pri_sec:
             raise ValueError("Delayed TX waveform does not fit within the PRI")
 
         metadata = uhd.types.TXMetadata()
@@ -1028,7 +1174,7 @@ class EttusRadarSource:
         return acknowledgements, errors
 
     def _configure_atr_gpio(self):
-        """Configure J6 pins 3 and 4 as FPGA-controlled ATR outputs."""
+        """Configure the CRO-verified fail-low Stage 3H ATR mapping."""
         available_banks = list(self.Usrp.get_gpio_banks(0))
         if self.GpioBank not in available_banks:
             raise RuntimeError(
@@ -1036,60 +1182,102 @@ class EttusRadarSource:
                 f"available banks are {available_banks}"
             )
 
-        if self.TxAtrGpioBit == self.RxAtrGpioBit:
+        if len({
+            self.TxAtrGpioBit,
+            self.RxAtrGpioBit,
+            self.OverlapAtrGpioBit,
+        }) != 3:
             raise ValueError(
-                "EttusTxAtrGPIO and EttusRxAtrGPIO must use different bits"
+                "TX, RX and ATR_XX witness GPIOs must use different bits"
             )
-        if self.TxAtrGpioBit < 0 or self.RxAtrGpioBit < 0:
+        if min(
+            self.TxAtrGpioBit,
+            self.RxAtrGpioBit,
+            self.OverlapAtrGpioBit,
+        ) < 0:
             raise ValueError(
                 "ATR GPIO bit numbers must be non-negative"
             )
 
-        # CTRL=1 selects FPGA ATR control; DDR=1 selects output direction.
-        self.Usrp.set_gpio_attr(
-            self.GpioBank,
-            "CTRL",
-            self.AtrGpioMask,
-            self.AtrGpioMask,
-            0,
-        )
-        self.Usrp.set_gpio_attr(
-            self.GpioBank,
-            "DDR",
-            self.AtrGpioMask,
-            self.AtrGpioMask,
-            0,
-        )
+        try:
+            # Begin in manual safe-low.  OUT is preloaded while the pins are
+            # inputs, manual control is selected, and only then are the output
+            # drivers enabled.  This is the ordering proven by the CRO harness.
+            self._force_atr_safe_low()
 
-        # ATR states for the Vanguard X half-duplex radar:
-        # idle: both low; RX: pin 4 high; TX: pin 3 high; TX/RX: both low.
-        self.Usrp.set_gpio_attr(
-            self.GpioBank, "ATR_0X", 0, self.AtrGpioMask, 0
-        )
-        self.Usrp.set_gpio_attr(
-            self.GpioBank,
-            "ATR_RX",
-            self.RxAtrMask,
-            self.AtrGpioMask,
-            0,
-        )
-        self.Usrp.set_gpio_attr(
-            self.GpioBank,
-            "ATR_TX",
-            self.TxAtrMask,
-            self.AtrGpioMask,
-            0,
-        )
-        self.Usrp.set_gpio_attr(
-            self.GpioBank, "ATR_XX", 0, self.AtrGpioMask, 0
-        )
+            # Normal operation fails both operational outputs low during full
+            # duplex.  The explicit simulation-only target profile instead
+            # drives TX and RX high together; GPIO_3 remains the witness.
+            atr_xx_value = self.OverlapAtrMask
+            if self.AtrAllowOverlapForSimulation:
+                atr_xx_value |= self.TxAtrMask | self.RxAtrMask
+            self._set_atr_gpio_attr("ATR_0X", 0)
+            self._set_atr_gpio_attr("ATR_RX", self.RxAtrMask)
+            self._set_atr_gpio_attr("ATR_TX", self.TxAtrMask)
+            self._set_atr_gpio_attr("ATR_XX", atr_xx_value)
+            self._require_atr_gpio_attr("ATR_0X", 0)
+            self._require_atr_gpio_attr("ATR_RX", self.RxAtrMask)
+            self._require_atr_gpio_attr("ATR_TX", self.TxAtrMask)
+            self._require_atr_gpio_attr("ATR_XX", atr_xx_value)
+
+            # Hand ownership to the FPGA only after all state words and the
+            # safe output direction have been established and read back.
+            self._set_atr_gpio_attr("CTRL", self.AtrGpioMask)
+            self._require_atr_gpio_attr("CTRL", self.AtrGpioMask)
+            self._atr_configured = True
+        except Exception:
+            try:
+                self._force_atr_safe_low()
+            except Exception:
+                pass
+            raise
 
         print(
             "Ettus ATR GPIO configured: "
             f"bank={self.GpioBank}, "
             f"J6 pin 3=TX (GPIO_{self.TxAtrGpioBit}), "
-            f"J6 pin 4=RX (GPIO_{self.RxAtrGpioBit})"
+            f"J6 pin 4=RX (GPIO_{self.RxAtrGpioBit}), "
+            f"J6 pin 5=ATR_XX witness (GPIO_{self.OverlapAtrGpioBit}), "
+            "ATR_XX="
+            f"{'TX+RX+WITNESS' if self.AtrAllowOverlapForSimulation else 'WITNESS_ONLY'}"
         )
+
+    def _set_atr_gpio_attr(self, attribute, value):
+        self.Usrp.set_gpio_attr(
+            self.GpioBank,
+            str(attribute),
+            int(value),
+            self.AtrGpioMask,
+            0,
+        )
+
+    def _read_atr_gpio_attr(self, attribute):
+        return int(
+            self.Usrp.get_gpio_attr(
+                self.GpioBank,
+                str(attribute),
+                0,
+            )
+        ) & self.AtrGpioMask
+
+    def _require_atr_gpio_attr(self, attribute, expected):
+        actual = self._read_atr_gpio_attr(attribute)
+        expected = int(expected) & self.AtrGpioMask
+        if actual != expected:
+            raise RuntimeError(
+                f"GPIO {attribute} readback 0x{actual:X}; "
+                f"expected 0x{expected:X}"
+            )
+
+    def _force_atr_safe_low(self):
+        """Take manual GPIO ownership and drive all ATR pins low."""
+        self._set_atr_gpio_attr("OUT", 0)
+        self._set_atr_gpio_attr("CTRL", 0)
+        self._set_atr_gpio_attr("DDR", self.AtrGpioMask)
+        self._require_atr_gpio_attr("CTRL", 0)
+        self._require_atr_gpio_attr("DDR", self.AtrGpioMask)
+        self._require_atr_gpio_attr("OUT", 0)
+        self._atr_configured = False
 
     def _issue_receive_command(self, num_samples, scheduled_time_sec):
         """Queue one finite timed receive window without blocking."""
@@ -1249,6 +1437,15 @@ class EttusRadarSource:
         return output[:received_total].copy(), diagnostics
 
     def _configure_sample_rate(self, requested_rate):
+        if self.TxLeadingZeroSamples and not np.isclose(
+            float(requested_rate),
+            40.0e6,
+            rtol=0.0,
+            atol=1.0,
+        ):
+            raise RuntimeError(
+                "The eight-sample Stage 3H pre-roll requires 40 MS/s"
+            )
         if self._configured_sample_rate != requested_rate:
             self._receive_path_warmed = False
             self.Usrp.set_rx_rate(float(requested_rate), self.Channel)

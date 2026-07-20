@@ -4,9 +4,30 @@ from pathlib import Path
 import unittest
 
 from EttusRadarSource import EttusRadarSource
+from RadarTiming import CalculateRadarTiming
 
 
 class TestEttusOperationalSafety(unittest.TestCase):
+    @staticmethod
+    def _stage3h_config(**overrides):
+        config = {
+            "EttusOperatingMode": "TIMED_TX_RX",
+            "EttusTimedTransmitEnabled": True,
+            "EttusRfOutputAcknowledged": True,
+            "EttusLoopbackConfirmed": True,
+            "EttusExternalAttenuationDb": 30.0,
+            "EttusAtrGpioEnabled": True,
+            "EttusAtrCroVerifiedAcknowledged": True,
+            "EttusTrmPaDisconnectedConfirmed": True,
+            "EttusGPIOBank": "FP0",
+            "EttusTxAtrGPIO": 1,
+            "EttusRxAtrGPIO": 2,
+            "EttusAtrOverlapGPIO": 3,
+            "EttusTxLeadingZeroSamples": 8,
+        }
+        config.update(overrides)
+        return config
+
     def test_defaults_are_receive_only_and_atr_disabled(self):
         source = EttusRadarSource({})
 
@@ -53,16 +74,39 @@ class TestEttusOperationalSafety(unittest.TestCase):
                 "EttusExternalAttenuationDb": 29.9,
             })
 
-    def test_stage3e1_timed_mode_rejects_atr(self):
-        with self.assertRaisesRegex(RuntimeError, "keeps ATR disabled"):
-            EttusRadarSource({
-                "EttusOperatingMode": "TIMED_TX_RX",
-                "EttusTimedTransmitEnabled": True,
-                "EttusRfOutputAcknowledged": True,
-                "EttusLoopbackConfirmed": True,
-                "EttusExternalAttenuationDb": 30.0,
-                "EttusAtrGpioEnabled": True,
-            })
+    def test_atr_requires_cro_verification_acknowledgement(self):
+        with self.assertRaisesRegex(RuntimeError, "CRO-verification"):
+            EttusRadarSource(self._stage3h_config(
+                EttusAtrCroVerifiedAcknowledged=False,
+            ))
+
+    def test_atr_requires_trm_and_pa_disconnected(self):
+        with self.assertRaisesRegex(RuntimeError, "TRM and PA"):
+            EttusRadarSource(self._stage3h_config(
+                EttusTrmPaDisconnectedConfirmed=False,
+            ))
+
+    def test_stage3h_accepts_verified_mapping_and_pre_roll(self):
+        source = EttusRadarSource(self._stage3h_config())
+        self.assertTrue(source.TimedTransmitEnabled)
+        self.assertTrue(source.AtrGpioEnabled)
+        self.assertEqual(source.GpioBank, "FP0")
+        self.assertEqual(source.TxAtrGpioBit, 1)
+        self.assertEqual(source.RxAtrGpioBit, 2)
+        self.assertEqual(source.OverlapAtrGpioBit, 3)
+        self.assertEqual(source.TxLeadingZeroSamples, 8)
+
+    def test_stage3h_rejects_unverified_mapping(self):
+        with self.assertRaisesRegex(RuntimeError, "verified FP0"):
+            EttusRadarSource(self._stage3h_config(
+                EttusTxAtrGPIO=0,
+            ))
+
+    def test_stage3h_rejects_wrong_pre_roll(self):
+        with self.assertRaisesRegex(RuntimeError, "exactly eight"):
+            EttusRadarSource(self._stage3h_config(
+                EttusTxLeadingZeroSamples=7,
+            ))
 
     def test_stage3e1_timed_mode_rejects_queue_above_proven_depth(self):
         with self.assertRaisesRegex(ValueError, "must not exceed 20"):
@@ -94,6 +138,8 @@ class TestEttusOperationalSafety(unittest.TestCase):
         self.assertIn('"EttusOperatingMode": "RECEIVE_ONLY"', main_text)
         self.assertIn('"EttusTimedTransmitEnabled": False', main_text)
         self.assertIn('"EttusAtrGpioEnabled": False', main_text)
+        self.assertIn('"EttusTxLeadingZeroSamples": 8', main_text)
+        self.assertIn('"STAGE3H_ATR_LOOPBACK"', main_text)
         self.assertIn('"EttusCommandLeadTimeSec": 0.005', main_text)
         self.assertIn('"RadarDwellIntervalSec": 0.10', main_text)
 
@@ -110,6 +156,32 @@ class TestEttusOperationalSafety(unittest.TestCase):
         )
         self.assertIn("if args.lead_ms < 5.0:", harness_text)
         self.assertNotIn("at least 20 ms", harness_text)
+
+    def test_atr_timing_has_eight_sample_pre_roll_and_one_us_guard(self):
+        timing = CalculateRadarTiming({
+            "WaveformId": "Frank10_20MHz",
+            "SampleRateHz": 40.0e6,
+            "ChipRateHz": 20.0e6,
+            "ChipCount": 100,
+            "SamplesPerChip": 2,
+            "NumSamples": 200,
+            "PulseDurationSec": 5.0e-6,
+        })
+
+        self.assertEqual(timing.TxLeadingZeroSamples, 8)
+        self.assertEqual(timing.TxAtrEnvelopeSamples, 208)
+        self.assertAlmostEqual(timing.TxLeadingZeroDurationSec, 0.2e-6)
+        self.assertAlmostEqual(timing.TxAtrEnvelopeDurationSec, 5.2e-6)
+        self.assertAlmostEqual(timing.RxStartDelaySec, 6.2e-6)
+        self.assertAlmostEqual(
+            timing.RxStartDelaySec - timing.TxAtrEnvelopeDurationSec,
+            1.0e-6,
+        )
+        self.assertEqual(timing.NumRxSamples, 4043)
+        self.assertAlmostEqual(
+            timing.FirstRxSampleRangeOffsetM,
+            299792458.0 * 6.0e-6 / 2.0,
+        )
 
 
 if __name__ == "__main__":

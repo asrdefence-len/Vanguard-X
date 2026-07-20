@@ -166,9 +166,9 @@ class TestEttusTimedPairs(unittest.TestCase):
     def tearDown(self):
         source_module.uhd = self.original_uhd
 
-    def make_source(self):
+    def make_source(self, config=None):
         source = EttusRadarSource(
-            timed_config(),
+            timed_config() if config is None else config,
             TheWaveformLibrary=FakeWaveformLibrary(),
         )
         source.Usrp = FakeUsrp()
@@ -180,14 +180,14 @@ class TestEttusTimedPairs(unittest.TestCase):
         return source
 
     @staticmethod
-    def make_plan():
+    def make_plan(num_samples=512):
         return make_uniform_dwell_plan(
             dwell_id=7,
             task_id=1,
             task_type="SEARCH",
             waveform_id="Frank10_20MHz",
             sample_rate=40.0e6,
-            num_samples=512,
+            num_samples=num_samples,
             num_pulses=4,
             pri_sec=1.0e-3,
             rx_start_delay_sec=6.0e-6,
@@ -256,6 +256,131 @@ class TestEttusTimedPairs(unittest.TestCase):
             source.ExecuteDwell(self.make_plan())
 
         self.assertEqual(source.RxStreamer.receive_index, 4)
+
+    def test_rf_target_delays_main_pulse_only_inside_theta_plus_minus_two(self):
+        config = timed_config()
+        config.update({
+            "EttusRfTargetEmulatorEnabled": True,
+            "EttusRfTargetRangeM": 6000.0,
+            "EttusRfTargetBearingDeg": 80.0,
+            "EttusRfTargetAngleHalfWidthDeg": 2.0,
+            "EttusLoopbackHardwareDelaySamples": 166,
+            "RfFrequency": 9.4e9,
+        })
+
+        active_source = self.make_source(config)
+        active_plan = self.make_plan(num_samples=4043)
+        active_plan.AzimuthDeg = 82.0
+        active_raw = active_source.ExecuteDwell(active_plan)
+
+        expected_offset = (
+            2.0 * 6000.0 / 299792458.0 - 166.0 / 40.0e6
+        )
+        self.assertTrue(active_raw.Diagnostics["RfTargetEmulatorActive"])
+        self.assertAlmostEqual(
+            active_raw.Diagnostics["RfTargetTxOffsetSec"],
+            expected_offset,
+        )
+        self.assertAlmostEqual(
+            active_source.TxStreamer.sends[0]["TimeSec"],
+            100.050 + expected_offset,
+        )
+
+        lower_edge_source = self.make_source(config)
+        lower_edge_plan = self.make_plan(num_samples=4043)
+        lower_edge_plan.AzimuthDeg = 78.0
+        lower_edge_raw = lower_edge_source.ExecuteDwell(lower_edge_plan)
+        self.assertTrue(lower_edge_raw.Diagnostics["RfTargetEmulatorActive"])
+
+        inactive_source = self.make_source(config)
+        inactive_plan = self.make_plan(num_samples=4043)
+        inactive_plan.AzimuthDeg = 82.01
+        inactive_raw = inactive_source.ExecuteDwell(inactive_plan)
+
+        self.assertFalse(inactive_raw.Diagnostics["RfTargetEmulatorActive"])
+        self.assertAlmostEqual(
+            inactive_source.TxStreamer.sends[0]["TimeSec"],
+            100.050,
+        )
+
+    def test_rf_target_velocity_applies_slow_time_phase(self):
+        config = timed_config()
+        config.update({
+            "EttusRfTargetEmulatorEnabled": True,
+            "EttusRfTargetRangeM": 6000.0,
+            "EttusRfTargetBearingDeg": 80.0,
+            "EttusRfTargetAngleHalfWidthDeg": 2.0,
+            "EttusRfTargetRadialVelocityMps": 5.0,
+            "EttusLoopbackHardwareDelaySamples": 166,
+            "RfFrequency": 9.4e9,
+        })
+        source = self.make_source(config)
+        plan = self.make_plan(num_samples=4043)
+        plan.AzimuthDeg = 80.0
+
+        source.ExecuteDwell(plan)
+
+        wavelength_m = 299792458.0 / 9.4e9
+        doppler_hz = 2.0 * 5.0 / wavelength_m
+        expected_phase = 2.0 * np.pi * doppler_hz * 1.0e-3
+        measured_phase = np.angle(
+            source.TxStreamer.sends[1]["Waveform"][0]
+            / source.TxStreamer.sends[0]["Waveform"][0]
+        )
+        self.assertAlmostEqual(
+            np.angle(np.exp(1j * measured_phase)),
+            np.angle(np.exp(1j * expected_phase)),
+            places=5,
+        )
+
+    def test_target_scenario_drives_actual_transmit_time_and_doppler(self):
+        config = timed_config()
+        config.update({
+            "EttusRfTargetEmulatorEnabled": True,
+            "EttusRfTargetUseScenario": True,
+            "EttusRfTargetAngleHalfWidthDeg": 2.0,
+            "EttusRfTargetAmplitudeScale": 1.0,
+            "EttusLoopbackHardwareDelaySamples": 166,
+            "RfFrequency": 9.4e9,
+            "SceneReturns": [{
+                "name": "ScenarioShip_S01",
+                "parent_name": "ScenarioShip",
+                "range_m": 5000.0,
+                "bearing_deg": 80.0,
+                "radial_velocity_mps": 4.0,
+                "amplitude": 10.0,
+            }],
+        })
+        source = self.make_source(config)
+        plan = self.make_plan(num_samples=4043)
+        plan.AzimuthDeg = 80.0
+
+        raw = source.ExecuteDwell(plan)
+
+        expected_offset = (
+            2.0 * 5000.0 / 299792458.0 - 166.0 / 40.0e6
+        )
+        self.assertTrue(raw.Diagnostics["RfTargetEmulatorActive"])
+        self.assertTrue(raw.Diagnostics["RfTargetUseScenario"])
+        self.assertEqual(raw.Diagnostics["RfTargetName"], "ScenarioShip")
+        self.assertAlmostEqual(raw.Diagnostics["RfTargetRangeM"], 5000.0)
+        self.assertAlmostEqual(
+            source.TxStreamer.sends[0]["TimeSec"],
+            100.050 + expected_offset,
+        )
+
+        wavelength_m = 299792458.0 / 9.4e9
+        doppler_hz = 2.0 * 4.0 / wavelength_m
+        expected_phase = 2.0 * np.pi * doppler_hz * 1.0e-3
+        measured_phase = np.angle(
+            source.TxStreamer.sends[1]["Waveform"][0]
+            / source.TxStreamer.sends[0]["Waveform"][0]
+        )
+        self.assertAlmostEqual(
+            np.angle(np.exp(1j * measured_phase)),
+            np.angle(np.exp(1j * expected_phase)),
+            places=5,
+        )
 
 
 if __name__ == "__main__":
