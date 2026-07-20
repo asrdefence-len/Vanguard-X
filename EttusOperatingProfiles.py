@@ -62,6 +62,14 @@ def ParseOperatingProfileArguments(argv=None):
     parser.add_argument("--target-range-km", type=float, default=6.0)
     parser.add_argument("--target-bearing-deg", type=float, default=80.0)
     parser.add_argument(
+        "--fixed-rf-target",
+        action="store_true",
+        help=(
+            "use one fixed point target instead of the moving TargetScenario; "
+            "range, bearing and radial velocity come from the target options"
+        ),
+    )
+    parser.add_argument(
         "--target-radial-velocity-mps",
         type=float,
         default=0.0,
@@ -180,6 +188,7 @@ def ApplyOperatingProfile(config, arguments):
         arguments.attenuation_db is not None
         or arguments.tx_gain_db is not None
         or arguments.rx_gain_db is not None
+        or bool(getattr(arguments, "fixed_rf_target", False))
         or arguments.i_understand_rf_output_is_enabled
         or arguments.i_confirm_txrx_to_rx2_loopback
         or arguments.i_confirm_atr_trm_pa_disabled
@@ -208,6 +217,18 @@ def ApplyOperatingProfile(config, arguments):
         return "RECEIVE_ONLY"
 
     _ApplyProfileGainDefaults(arguments)
+
+    target_profile_selected = bool(
+        arguments.stage3f_rf_target
+        or getattr(arguments, "stage3i_atr_rf_target_overlap", False)
+    )
+    if (
+        bool(getattr(arguments, "fixed_rf_target", False))
+        and not target_profile_selected
+    ):
+        raise ValueError(
+            "--fixed-rf-target requires Stage 3F or Stage 3I"
+        )
 
     atr_enabled = bool(
         getattr(arguments, "stage3h_atr_loopback", False)
@@ -249,7 +270,9 @@ def ApplyOperatingProfile(config, arguments):
             config.update({
                 "EttusAtrAllowOverlapForSimulation": True,
                 "EttusRfTargetEmulatorEnabled": True,
-                "EttusRfTargetUseScenario": True,
+                "EttusRfTargetUseScenario": not bool(
+                    getattr(arguments, "fixed_rf_target", False)
+                ),
                 "EttusRfTargetRangeM": (
                     float(arguments.target_range_km) * 1000.0
                 ),
@@ -278,7 +301,9 @@ def ApplyOperatingProfile(config, arguments):
             raise ValueError("Loopback hardware delay must not be negative")
         config.update({
             "EttusRfTargetEmulatorEnabled": True,
-            "EttusRfTargetUseScenario": True,
+            "EttusRfTargetUseScenario": not bool(
+                getattr(arguments, "fixed_rf_target", False)
+            ),
             "EttusAtrAllowOverlapForSimulation": False,
             "EttusRfTargetRangeM": (
                 float(arguments.target_range_km) * 1000.0
