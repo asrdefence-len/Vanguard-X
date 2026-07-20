@@ -94,6 +94,9 @@ class DataLogger:
 
         self.LogDetections = bool(Config.get("LogDetections", True))
         self.LogRangeDoppler = bool(Config.get("LogRangeDoppler", True))
+        self.LogGolayDiagnosticOnce = bool(
+            Config.get("LogGolayDiagnosticOnce", False)
+        )
 
         self.RangeDopplerEveryNDwells = int(Config.get("LogRangeDopplerEveryNDwells", 10))
         self.RangeDopplerMaxRangeM = float(Config.get("LogRangeDopplerMaxRangeM", Config.get("MaxDisplayRangeM", 15000.0)))
@@ -118,6 +121,7 @@ class DataLogger:
         self.VelocityAxisWritten = False
         self.RdShape = None
         self.DwellWriteCount = 0
+        self.GolayDiagnosticWritten = False
 
         if self.Enabled:
             self._open_file()
@@ -195,6 +199,8 @@ class DataLogger:
             if self.RangeDopplerEveryNDwells > 0 and DwellId % self.RangeDopplerEveryNDwells == 0:
                 self._append_range_doppler(Processed, DwellId, NowS, BoresightDeg)
 
+        self._write_golay_diagnostic_once(Processed, DwellId, NowS)
+
         self.DwellWriteCount += 1
         if self.FlushEveryNDwells > 0 and self.DwellWriteCount % self.FlushEveryNDwells == 0:
             self.flush()
@@ -229,6 +235,7 @@ class DataLogger:
         self.VelocityAxisWritten = False
         self.RdShape = None
         self.DwellWriteCount = 0
+        self.GolayDiagnosticWritten = False
 
         RequestedFilename = str(getattr(self, "LogFilename", "") or "datafile1.h5").strip()
         if RequestedFilename:
@@ -427,6 +434,136 @@ class DataLogger:
             compression="gzip",
             compression_opts=4,
             shuffle=True,
+        )
+
+    def _write_golay_diagnostic_once(
+        self,
+        Processed: Any,
+        DwellId: int,
+        NowS: float,
+    ) -> None:
+        """Write the first complete fixed-point Golay dwell in this file."""
+
+        if not self.LogGolayDiagnosticOnce or self.GolayDiagnosticWritten:
+            return
+        Payload = getattr(Processed, "GolayDiagnostic", None)
+        if not isinstance(Payload, dict):
+            return
+
+        Diagnostics = getattr(Processed, "Diagnostics", {}) or {}
+        if str(Diagnostics.get("ProcessingMode", "")).upper() != "GOLAY_COMPLEMENTARY":
+            return
+        if not bool(Diagnostics.get("RfTargetEmulatorActive", False)):
+            return
+        if bool(Diagnostics.get("RfTargetUseScenario", True)):
+            return
+        if abs(float(Diagnostics.get("RfTargetRadialVelocityMps", np.inf))) > 1.0e-9:
+            return
+
+        RequiredArrays = (
+            "RawA",
+            "RawB",
+            "CompressedA",
+            "CompressedB",
+            "PulseValid",
+        )
+        if any(Name not in Payload for Name in RequiredArrays):
+            return
+
+        RawA = np.asarray(Payload["RawA"], dtype=np.complex64)
+        RawB = np.asarray(Payload["RawB"], dtype=np.complex64)
+        CompressedA = np.asarray(
+            Payload["CompressedA"],
+            dtype=np.complex64,
+        )
+        CompressedB = np.asarray(
+            Payload["CompressedB"],
+            dtype=np.complex64,
+        )
+        PulseValid = np.asarray(Payload["PulseValid"], dtype=bool).reshape(-1)
+        if (
+            RawA.ndim != 2
+            or RawA.shape != RawB.shape
+            or CompressedA.shape != CompressedB.shape
+            or CompressedA.shape != RawA.shape
+        ):
+            return
+
+        PhysicalPulseCount = 2 * RawA.shape[0]
+        if PulseValid.size != PhysicalPulseCount or not np.all(PulseValid):
+            return
+        if int(Diagnostics.get("TransmitCommandCount", -1)) != PhysicalPulseCount:
+            return
+        if (
+            int(Diagnostics.get("TransmitBurstAcknowledgementCount", -1))
+            != PhysicalPulseCount
+        ):
+            return
+
+        Group = self.File.create_group("golay_diagnostic")
+        Group.attrs["description"] = (
+            "One complete stationary fixed-point Golay dwell; arrays are "
+            "[complementary_pair, range_sample]."
+        )
+        Group.attrs["dwell_id"] = int(DwellId)
+        Group.attrs["unix_time_s"] = float(NowS)
+        Group.attrs["waveform_a_id"] = str(Payload["WaveformAId"])
+        Group.attrs["waveform_b_id"] = str(Payload["WaveformBId"])
+        Group.attrs["sample_rate_hz"] = float(Payload["SampleRateHz"])
+        Group.attrs["physical_pri_sec"] = float(Payload["PhysicalPriSec"])
+        Group.attrs["pair_pri_sec"] = float(Payload["PairPriSec"])
+        Group.attrs["samples_per_chip"] = int(Payload["SamplesPerChip"])
+        Group.attrs["target_range_m"] = float(
+            Diagnostics.get("RfTargetRangeM", np.nan)
+        )
+        Group.attrs["target_bearing_deg"] = float(
+            Diagnostics.get("RfTargetBearingDeg", np.nan)
+        )
+        Group.attrs["target_radial_velocity_mps"] = float(
+            Diagnostics.get("RfTargetRadialVelocityMps", np.nan)
+        )
+        Group.attrs["tx_gain_db"] = float(Diagnostics.get("TxGainDb", np.nan))
+        Group.attrs["rx_gain_db"] = float(Diagnostics.get("RxGainDb", np.nan))
+        Group.attrs["external_attenuation_db"] = float(
+            Diagnostics.get("ExternalAttenuationDb", np.nan)
+        )
+        Group.attrs["transmit_command_count"] = int(
+            Diagnostics["TransmitCommandCount"]
+        )
+        Group.attrs["transmit_acknowledgement_count"] = int(
+            Diagnostics["TransmitBurstAcknowledgementCount"]
+        )
+
+        DatasetOptions = {
+            "compression": "gzip",
+            "compression_opts": 4,
+            "shuffle": True,
+        }
+        Group.create_dataset("raw_a", data=RawA, **DatasetOptions)
+        Group.create_dataset("raw_b", data=RawB, **DatasetOptions)
+        Group.create_dataset(
+            "compressed_a",
+            data=CompressedA,
+            **DatasetOptions,
+        )
+        Group.create_dataset(
+            "compressed_b",
+            data=CompressedB,
+            **DatasetOptions,
+        )
+        Group.create_dataset("pulse_valid", data=PulseValid.astype(np.uint8))
+        Group.create_dataset(
+            "range_m",
+            data=np.asarray(Processed.RangeAxisM, dtype=np.float64),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+        self.GolayDiagnosticWritten = True
+        self.File.flush()
+        print(
+            "Golay diagnostic captured once: "
+            f"{self.Filename} dwell={DwellId}"
         )
 
     # ---------------------------------------------------------------------
