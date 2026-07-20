@@ -35,7 +35,11 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 import time
 
-from RadarPlans import DwellPlan, make_uniform_dwell_plan
+from RadarPlans import (
+    DwellPlan,
+    make_golay_dwell_plan,
+    make_uniform_dwell_plan,
+)
 from RadarTasks import RadarTask, RadarTaskType, SearchTask, TrackTask
 from PointingManager import PointingManager, PointingState
 from NavigationState import PlatformAttitude
@@ -281,6 +285,25 @@ class RadarExecutor:
                 "RevisitIntervalSec": float(task.RevisitIntervalSec),
             })
 
+        if str(profile.WaveformId) == "Golay64_20MHz":
+            return make_golay_dwell_plan(
+                dwell_id=dwell_id,
+                task_id=int(task.TaskId),
+                task_type=task.TaskType.value,
+                waveform_a_id="Golay64A_20MHz",
+                waveform_b_id="Golay64B_20MHz",
+                sample_rate=float(profile.SampleRate),
+                num_samples=int(profile.NumSamples),
+                num_pulses=int(profile.NumPulses),
+                pri_sec=float(profile.PriSec),
+                rx_start_delay_sec=float(profile.RxStartDelaySec),
+                azimuth_deg=float(pointing.BeamBearingTrueDeg),
+                elevation_deg=float(pointing.BeamElevationTrueDeg),
+                rx_attenuation_db=float(profile.RxAttenuationDb),
+                tx_attenuation_db=float(profile.TxAttenuationDb),
+                metadata=metadata,
+            )
+
         return make_uniform_dwell_plan(
             dwell_id=dwell_id,
             task_id=int(task.TaskId),
@@ -384,7 +407,12 @@ class RadarExecutor:
 
         Prefix = str(Name)
         IsSearch = Prefix.upper() == "SEARCH"
-        WaveformMetadata = self.WaveformLibrary.GetMetadata(WaveformId)
+        TimingWaveformId = (
+            "Golay64A_20MHz"
+            if str(WaveformId) == "Golay64_20MHz"
+            else str(WaveformId)
+        )
+        WaveformMetadata = self.WaveformLibrary.GetMetadata(TimingWaveformId)
 
         Timing = CalculateRadarTiming(
             WaveformMetadata,
