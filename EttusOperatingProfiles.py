@@ -278,6 +278,9 @@ def ApplyOperatingProfile(config, arguments):
                     if bool(getattr(arguments, "fixed_rf_target", False))
                     else "MAX"
                 ),
+                "ShowRangeDetectionMarkers": not bool(
+                    getattr(arguments, "fixed_rf_target", False)
+                ),
                 "EttusRfTargetRangeM": (
                     float(arguments.target_range_km) * 1000.0
                 ),
@@ -313,6 +316,9 @@ def ApplyOperatingProfile(config, arguments):
                 "ZERO_DOPPLER"
                 if bool(getattr(arguments, "fixed_rf_target", False))
                 else "MAX"
+            ),
+            "ShowRangeDetectionMarkers": not bool(
+                getattr(arguments, "fixed_rf_target", False)
             ),
             "EttusAtrAllowOverlapForSimulation": False,
             "EttusRfTargetRangeM": (
