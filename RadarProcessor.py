@@ -511,6 +511,25 @@ class RadarProcessor:
             TimeStamp=Raw.TimeStamp,
         )
         Processed.Diagnostics = Diagnostics
+        if bool(self.Config.get("GolayDiagnosticCaptureEnabled", False)):
+            PulseValid = getattr(Raw, "PulseValid", None)
+            if PulseValid is None:
+                PulseValid = np.ones(Raw.IQ.shape[0], dtype=bool)
+            else:
+                PulseValid = np.asarray(PulseValid, dtype=bool).reshape(-1)
+            Processed.GolayDiagnostic = {
+                "RawA": RawA,
+                "RawB": RawB,
+                "CompressedA": CompressedA,
+                "CompressedB": CompressedB,
+                "PulseValid": PulseValid,
+                "WaveformAId": WaveformAId,
+                "WaveformBId": WaveformBId,
+                "PhysicalPriSec": PhysicalPriSec,
+                "PairPriSec": PairPriSec,
+                "SampleRateHz": float(Raw.SampleRate),
+                "SamplesPerChip": int(MetadataA["SamplesPerChip"]),
+            }
         return Processed
 
     def _ValidateGolayPlan(self, Raw, ThisDwell):
