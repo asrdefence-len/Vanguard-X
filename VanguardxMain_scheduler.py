@@ -599,6 +599,7 @@ def Main(CommandLineArguments=None):
         "PolarUpdateEveryNDwells": 1,
         "PolarDetectionsUpdateEveryNDwells": 1,
         "RangeProfileUpdateEveryNDwells": 1,
+        "RangeProfileDopplerMode": "MAX",
         "StatusUpdateEveryNDwells": 1,
         "QtProcessEventsEveryNDwells": 1,
         "QtRangeProfileDecimation": 1,
