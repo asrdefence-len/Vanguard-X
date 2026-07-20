@@ -24,8 +24,8 @@ config = {
     "NumPulses": 8,
     "PRI": 1.0e-3,
 
-    "SearchWaveformId": "Barker13",
-    "TrackWaveformId": "Frank10",
+    "SearchWaveformId": "Barker13_20MHz",
+    "TrackWaveformId": "Frank10_20MHz",
 
     "RfFrequency": 9.4e9,
     "TransmitPowerW": 1.0,
@@ -137,7 +137,7 @@ while time.time() < deadline:
 assert track_result is not None
 assert track_result.Executed
 assert track_result.Dwell.TaskType == "TRACK"
-assert track_result.Dwell.WaveformName == "Frank10"
+assert track_result.Dwell.WaveformName == "Frank10_20MHz"
 assert track_result.Raw.Diagnostics["TrackId"] == 12
 assert abs(
     track_result.Raw.Diagnostics["BeamBearingTrueDeg"] - 70.0

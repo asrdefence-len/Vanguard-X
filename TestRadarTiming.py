@@ -36,7 +36,7 @@ class TestRadarTiming(unittest.TestCase):
         self.assertAlmostEqual(Timing.CpiDurationSec, 16.0e-3, places=15)
         self.assertAlmostEqual(Timing.PulseTrainSpanSec, 15.5e-3, places=15)
 
-        self.assertAlmostEqual(Timing.RxStartDelaySec, 6.0e-6, places=15)
+        self.assertAlmostEqual(Timing.RxStartDelaySec, 6.2e-6, places=15)
         self.assertEqual(Timing.NumRxSamples, 4043)
         self.assertAlmostEqual(
             Timing.ActualRxCaptureDurationSec,
@@ -45,17 +45,17 @@ class TestRadarTiming(unittest.TestCase):
         )
         self.assertAlmostEqual(
             Timing.ActualRxEndDelaySec,
-            107.075e-6,
+            107.275e-6,
             places=15,
         )
         self.assertAlmostEqual(
             Timing.MinimumPriSec,
-            109.075e-6,
+            109.275e-6,
             places=15,
         )
         self.assertAlmostEqual(
             Timing.TimingLimitedMaxPrfHz,
-            9168.003667201467,
+            9151.223976206818,
             places=9,
         )
         self.assertEqual(Timing.EffectiveMaxPrfHz, 4000.0)

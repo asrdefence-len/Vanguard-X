@@ -86,7 +86,7 @@ class TestRadarTimingControls(unittest.TestCase):
         )
         self.assertAlmostEqual(
             Result.Profile.RxStartDelaySec,
-            11.0e-6,
+            11.2e-6,
             places=15,
         )
         self.assertEqual(self.Config["SelectedPrfHz"], 2500.0)
