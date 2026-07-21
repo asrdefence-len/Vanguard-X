@@ -4,8 +4,8 @@ End-to-end simulator regression for the Vanguard scheduler architecture.
 This test proves:
   SEARCH -> synthetic RevisitRequest -> TRACK -> resume SEARCH
 
-It uses the existing simulated PTZ, SimulatedSource, RadarProcessor, CFAR and
-tracker. No Ettus, TRM or real PTZ hardware is accessed.
+It uses the existing simulated X660, SimulatedSource, RadarProcessor, CFAR and
+tracker. No Ettus, TRM or real X660 hardware is accessed.
 """
 
 import time
@@ -13,7 +13,7 @@ import time
 from CfarDetector import CfarDetector
 from NavigationState import SimulatedNavigationSource
 from PointingManager import PointingManager
-from PTZController import SimulatedPTZController
+from X660Controller import SimulatedX660Controller
 from RadarExecutor import RadarExecutor
 from RadarProcessor import RadarProcessor
 from RadarScheduler import RadarScheduler
@@ -66,20 +66,16 @@ def main():
     detector = CfarDetector(config)
     tracker = RadarTracker(config)
 
-    ptz = SimulatedPTZController(
-        LeftLimitDeg=10.0,
-        RightLimitDeg=120.0,
+    x660 = SimulatedX660Controller(
         InitialAzimuthDeg=10.0,
         MaxPanRateDegPerSec=90.0,
         PositionToleranceDeg=0.25,
     )
-    ptz.Open()
+    x660.Open()
 
     navigation = SimulatedNavigationSource(initial_heading_deg=0.0)
     pointing = PointingManager(
-        ptz=ptz,
-        left_limit_deg=10.0,
-        right_limit_deg=120.0,
+        x660=x660,
         endpoint_margin_deg=0.5,
         position_tolerance_deg=0.5,
     )
@@ -185,7 +181,7 @@ def main():
 
     finally:
         pointing.Stop()
-        ptz.Close()
+        x660.Close()
         source.Shutdown()
 
 

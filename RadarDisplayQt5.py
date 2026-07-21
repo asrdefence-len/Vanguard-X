@@ -87,10 +87,10 @@ class RadarDisplay:
         self.BeamAngleDeg = float(Config.get("InitialBeamAngleDeg", 0.0))
         self.ManualBeamStepDeg = float(Config.get("ManualBeamStepDeg", 2.0))
 
-        # One-shot PTZ/manual command events. These are consumed by the
+        # One-shot X6-60/manual command events. These are consumed by the
         # main loop exactly once. Do not use BeamAngleDeg itself as a
         # command event, because BeamAngleDeg is also overwritten by the
-        # measured PTZ boresight for display.
+        # measured X6-60 boresight for display.
         self.ManualNudgeCommandId = 0
         self.ManualNudgeDeltaDeg = 0.0
         self.StopCommandId = 0
@@ -394,6 +394,19 @@ class RadarDisplay:
             "SelectedMaximumRangeM": self.SelectedMaximumRangeM,
             "TimingSelectionRevision": self.TimingSelectionRevision,
         }
+
+    def SetMeasuredBeamAngle(self, AzimuthDeg):
+        """Refresh the PPI beam from measured X6-60 encoder telemetry.
+
+        This lightweight path is independent of radar dwell processing, so
+        the beam remains live while the operator display is in STOP.
+        """
+
+        self.BeamAngleDeg = float(AzimuthDeg) % 360.0
+        if self.BeamLine is not None:
+            self.UpdateBeamLine()
+        if self.StatusLabel is not None:
+            self.UpdateStatusPanel()
 
     def SetTimingApplicationResult(
         self,
@@ -1530,7 +1543,7 @@ class RadarDisplay:
 
     def OnStop(self):
         # STOP is a hard one-shot operator event. The main loop uses
-        # StopCommandId to send a real PTZ stop and then remains in idle.
+        # StopCommandId to send a real X6-60 stop and then remains in idle.
         self.DisplayMode = "STOP"
         self.ScanEnabled = False
         self.TransmitEnabled = False
@@ -1556,7 +1569,7 @@ class RadarDisplay:
 
     def OnBeamLeft(self):
         # One-shot manual nudge event. BeamAngleDeg is display state and may be
-        # overwritten by measured PTZ angle, so the main loop must consume this
+        # overwritten by measured X6-60 angle, so the main loop must consume this
         # explicit delta instead of inferring from BeamAngleDeg.  The visible
         # Step control is the operator's nudge increment as well as the sector
         # scan step setting.

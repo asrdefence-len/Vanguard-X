@@ -453,7 +453,7 @@ class RadarExecutor:
             )),
             RfFrequencyHz=float(self.Config["RfFrequency"]),
             AntennaScanRateDegPerSec=float(
-                self.Config.get("PTZScanSlewRateDegPerSec", 0.0)
+                self.Config.get("X660ScanSlewRateDegPerSec", 0.0)
                 if IsSearch
                 else self.Config.get("TrackAntennaRateDegPerSec", 0.0)
             ),

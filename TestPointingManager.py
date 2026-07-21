@@ -1,12 +1,12 @@
 """
-Regression tests for PointingManager.py using the existing simulated PTZ.
+Regression tests for PointingManager.py using the X6-60 simulator.
 """
 
 import time
 
 from NavigationState import SimulatedNavigationSource
 from PointingManager import PointingManager
-from PTZController import SimulatedPTZController
+from X660Controller import SimulatedX660Controller
 from RadarTasks import (
     AngleFrame,
     MakeSearchTask,
@@ -15,15 +15,13 @@ from RadarTasks import (
 )
 
 
-ptz = SimulatedPTZController(
-    LeftLimitDeg=10.0,
-    RightLimitDeg=300.0,
+x660 = SimulatedX660Controller(
     InitialAzimuthDeg=20.0,
     MaxPanRateDegPerSec=60.0,
     PositionToleranceDeg=0.2,
 )
 
-ptz.Open()
+x660.Open()
 
 nav = SimulatedNavigationSource(
     initial_heading_deg=30.0,
@@ -31,9 +29,7 @@ nav = SimulatedNavigationSource(
 )
 
 manager = PointingManager(
-    ptz=ptz,
-    left_limit_deg=10.0,
-    right_limit_deg=300.0,
+    x660=x660,
     endpoint_margin_deg=0.5,
     position_tolerance_deg=0.5,
 )
@@ -116,6 +112,6 @@ assert state.Mode.value == "CONTINUOUS_SCAN"
 assert state.ActiveTrackId is None
 
 manager.Stop()
-ptz.Close()
+x660.Close()
 
 print("PointingManager regression test passed")

@@ -6,7 +6,7 @@ import time
 
 from NavigationState import SimulatedNavigationSource
 from PointingManager import PointingManager
-from PTZController import SimulatedPTZController
+from X660Controller import SimulatedX660Controller
 from RadarExecutor import RadarExecutor
 from RadarTasks import (
     AngleFrame,
@@ -39,6 +39,7 @@ config = {
 
     "TRMRxAttenuationDb": 0.0,
     "TRMTxAttenuationDb": 31.5,
+    "X660ScanSlewRateDegPerSec": 30.0,
 }
 
 waveforms = WaveformLibrary(config)
@@ -47,15 +48,13 @@ waveforms.LoadDefaultWaveforms()
 source = SimulatedSource(config, waveforms)
 source.Initialise()
 
-ptz = SimulatedPTZController(
-    LeftLimitDeg=10.0,
-    RightLimitDeg=300.0,
+x660 = SimulatedX660Controller(
     InitialAzimuthDeg=20.0,
     MaxPanRateDegPerSec=120.0,
     PositionToleranceDeg=0.2,
 )
 
-ptz.Open()
+x660.Open()
 
 nav = SimulatedNavigationSource(
     initial_heading_deg=30.0,
@@ -63,9 +62,7 @@ nav = SimulatedNavigationSource(
 )
 
 pointing = PointingManager(
-    ptz=ptz,
-    left_limit_deg=10.0,
-    right_limit_deg=300.0,
+    x660=x660,
     endpoint_margin_deg=0.5,
     position_tolerance_deg=0.5,
 )
@@ -146,6 +143,6 @@ assert abs(
 executor.ReleaseTask(track)
 
 pointing.Stop()
-ptz.Close()
+x660.Close()
 
 print("RadarExecutor regression test passed")

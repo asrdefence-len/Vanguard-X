@@ -21,8 +21,6 @@ class X660ReadOnlyState:
     ElevationDeg: float = 0.0
     Valid: bool = False
     PanRateDegPerSec: float = 0.0
-    AtLeftLimit: bool = False
-    AtRightLimit: bool = False
     Direction: str = "stopped"
     AtTarget: bool = False
     Source: str = "X660_CAN_READ_ONLY_NOT_OPEN"
@@ -54,7 +52,9 @@ class X660ReadOnlyController:
     """Telemetry-only X6-60 controller compatible with PointingManager."""
 
     MotionCommandsEnabled = False
-    WrapMode = False
+    UnlimitedAzimuth = True
+    SupportsContinuousRotation = True
+    TelemetryWhileStopped = True
 
     def __init__(
         self,
@@ -64,9 +64,6 @@ class X660ReadOnlyController:
         QueryIntervalSec: float = 0.10,
         NorthRawAngleDeg: float = -361.53,
         DirectionSign: int = 0,
-        LeftLimitDeg: float = 10.0,
-        RightLimitDeg: float = 300.0,
-        LimitMarginDeg: float = 1.0,
         Debug: bool = False,
     ):
         self.Interface = str(Interface)
@@ -75,9 +72,6 @@ class X660ReadOnlyController:
         self.QueryIntervalSec = max(0.0, float(QueryIntervalSec))
         self.NorthRawAngleDeg = float(NorthRawAngleDeg)
         self.DirectionSign = int(DirectionSign)
-        self.LeftLimitDeg = float(LeftLimitDeg)
-        self.RightLimitDeg = float(RightLimitDeg)
-        self.LimitMarginDeg = abs(float(LimitMarginDeg))
         self.Debug = bool(Debug)
 
         if not self.Interface or any(Char.isspace() for Char in self.Interface):
@@ -88,8 +82,6 @@ class X660ReadOnlyController:
             raise ValueError("TimeoutSec must be between 0.01 and 5.0")
         if self.DirectionSign not in (-1, 0, 1):
             raise ValueError("DirectionSign must be -1, 0 (uncalibrated), or +1")
-        if self.RightLimitDeg <= self.LeftLimitDeg:
-            raise ValueError("RightLimitDeg must be greater than LeftLimitDeg")
 
         self.Bus = None
         self.CanModule = None
@@ -272,12 +264,6 @@ class X660ReadOnlyController:
         self.State.TorqueCurrentA = float(Status2.TorqueCurrentA)
         self.State.TimestampSec = time.time()
         self.State.Direction = Direction
-        self.State.AtLeftLimit = Azimuth <= (
-            self.LeftLimitDeg + self.LimitMarginDeg
-        )
-        self.State.AtRightLimit = Azimuth >= (
-            self.RightLimitDeg - self.LimitMarginDeg
-        )
         self.State.AtTarget = False
         self.State.Valid = bool(
             self.Calibrated and self.State.ErrorFlags == 0

@@ -46,7 +46,12 @@ from NavigationState import SimulatedNavigationSource
 from PointingManager import PointingManager
 from RadarExecutor import RadarExecutor
 from RadarScheduler import RadarScheduler
-from RadarTasks import AngleFrame, MakeSearchTask, RadarTaskType
+from RadarTasks import (
+    AngleFrame,
+    MakeSearchTask,
+    RadarTaskType,
+    SearchPattern,
+)
 from RadarTimingControls import ApplyTimingControlState
 
 from SimulatedSource import SimulatedSource
@@ -70,9 +75,9 @@ except Exception:
     IMUReader = None
 
 try:
-    from PTZController import CreatePTZController
+    from X660Controller import CreateX660Controller
 except Exception:
-    CreatePTZController = None
+    CreateX660Controller = None
 
 from TargetScenario import (
     create_default_scene,
@@ -213,47 +218,59 @@ def ApplyOperatorPointingCommand(
     return LastManualNudgeCommandId, "NONE", None
 
 
+def RefreshX660MeasuredBeam(X660, Display):
+    """Refresh the displayed beam directly from X6-60 encoder telemetry."""
 
-def InitialisePTZToStartupPose(Ptz, Config, Display=None):
+    if X660 is None:
+        return None
+
+    State = X660.Update()
+    if bool(getattr(State, "Valid", False)):
+        AzimuthDeg = float(State.AzimuthDeg) % 360.0
+        if hasattr(Display, "SetMeasuredBeamAngle"):
+            Display.SetMeasuredBeamAngle(AzimuthDeg)
+        elif hasattr(Display, "BeamAngleDeg"):
+            Display.BeamAngleDeg = AzimuthDeg
+    return State
+
+
+
+def InitialiseX660ToStartupPose(X660, Config, Display=None):
     """Command the X6-60 motor/positioning unit to its startup AZ/EL pose.
 
     Default startup pose is reported EL=55 deg and AZ=200 deg.  This runs before the
     radar dwell loop so the antenna starts from a known mechanical attitude.
     """
-    if Ptz is None or not bool(Config.get("PTZStartupEnabled", True)):
+    if X660 is None or not bool(Config.get("X660StartupEnabled", True)):
         return
 
-    if not bool(getattr(Ptz, "MotionCommandsEnabled", True)):
+    if not bool(getattr(X660, "MotionCommandsEnabled", True)):
         print(
             "X6-60 startup pose skipped: active controller is telemetry-only"
         )
         return
 
-    TargetAzDeg = ClampDeg(
-        float(Config.get("PTZStartupAzimuthDeg", 200.0)),
-        float(Config.get("PTZLeftLimitDeg", 10.0)),
-        float(Config.get("PTZRightLimitDeg", 300.0)),
-    )
-    TargetElDeg = ClampDeg(float(Config.get("PTZStartupElevationDeg", 45.0)), -90.0, 90.0)
-    TimeoutSec = float(Config.get("PTZStartupTimeoutSec", 20.0))
-    ToleranceDeg = float(Config.get("PTZStartupPositionToleranceDeg", Config.get("PTZPositionToleranceDeg", 1.0)))
+    TargetAzDeg = float(Config.get("X660StartupAzimuthDeg", 200.0)) % 360.0
+    TargetElDeg = ClampDeg(float(Config.get("X660StartupElevationDeg", 45.0)), -90.0, 90.0)
+    TimeoutSec = float(Config.get("X660StartupTimeoutSec", 20.0))
+    ToleranceDeg = float(Config.get("X660StartupPositionToleranceDeg", Config.get("X660PositionToleranceDeg", 1.0)))
 
     print(f"X6-60 startup initialise: AZ={TargetAzDeg:.2f} deg, EL={TargetElDeg:.2f} deg")
 
-    if hasattr(Ptz, "CommandPosition"):
-        Ptz.CommandPosition(TargetAzDeg, TargetElDeg)
+    if hasattr(X660, "CommandPosition"):
+        X660.CommandPosition(TargetAzDeg, TargetElDeg)
     else:
-        if hasattr(Ptz, "SetPanPositionNative"):
-            Ptz.SetPanPositionNative(TargetAzDeg)
-        if hasattr(Ptz, "SetTiltPositionNative"):
-            Ptz.SetTiltPositionNative(TargetElDeg)
+        if hasattr(X660, "SetPanPositionNative"):
+            X660.SetPanPositionNative(TargetAzDeg)
+        if hasattr(X660, "SetTiltPositionNative"):
+            X660.SetTiltPositionNative(TargetElDeg)
 
     StartSec = time.time()
     LastPrintSec = 0.0
 
     while (time.time() - StartSec) < TimeoutSec:
         try:
-            State = Ptz.Update() if hasattr(Ptz, "Update") else Ptz.GetState()
+            State = X660.Update() if hasattr(X660, "Update") else X660.GetState()
             AzDeg = float(getattr(State, "AzimuthDeg", TargetAzDeg))
             ElDeg = float(getattr(State, "ElevationDeg", TargetElDeg))
         except Exception as exc:
@@ -277,7 +294,7 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
         time.sleep(0.05)
 
     try:
-        Ptz.Stop()
+        X660.Stop()
     except Exception:
         pass
 
@@ -309,11 +326,12 @@ def ExecuteRadarDwell(
     MeasuredAntennaElDeg,
     ImuValid,
     ImuSource,
-    PtzAzDeg,
-    PtzRateDegPerSec,
-    PtzValid,
-    PtzSource,
-    PtzAtTarget,
+    X660AzDeg,
+    X660RateDegPerSec,
+    X660Valid,
+    X660Source,
+    X660AtTarget,
+    X660RawAngleDeg,
 ):
     """Execute one scheduled dwell and preserve the processing chain.
 
@@ -362,11 +380,14 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["AntennaElDeg"] = float(MeasuredAntennaElDeg)
     Processed.Diagnostics["IMUValid"] = bool(ImuValid)
     Processed.Diagnostics["IMUSource"] = str(ImuSource)
-    Processed.Diagnostics["PTZAzDeg"] = float(PtzAzDeg)
-    Processed.Diagnostics["PTZRateDegPerSec"] = float(PtzRateDegPerSec)
-    Processed.Diagnostics["PTZValid"] = bool(PtzValid)
-    Processed.Diagnostics["PTZSource"] = str(PtzSource)
-    Processed.Diagnostics["PTZAtTarget"] = bool(PtzAtTarget)
+    Processed.Diagnostics["X660AzDeg"] = float(X660AzDeg)
+    Processed.Diagnostics["X660RateDegPerSec"] = float(X660RateDegPerSec)
+    Processed.Diagnostics["X660Valid"] = bool(X660Valid)
+    Processed.Diagnostics["X660Source"] = str(X660Source)
+    Processed.Diagnostics["X660AtTarget"] = bool(X660AtTarget)
+    Processed.Diagnostics["X660RawAngleDeg"] = (
+        None if X660RawAngleDeg is None else float(X660RawAngleDeg)
+    )
     Processed.Diagnostics["ScanCycle"] = EffectiveScanCycle
     Processed.Diagnostics["ScheduledTaskId"] = int(ScheduledTask.TaskId)
     Processed.Diagnostics["ScheduledTaskType"] = str(ScheduledTask.TaskType)
@@ -618,44 +639,31 @@ def Main(CommandLineArguments=None):
         "InitialBeamAngleDeg": 200.0,
         "ManualBeamStepDeg": 1.0,
 
-        # X6-60 motor/positioning unit controls (legacy PTZ keys/classes).
-        "EnablePTZ": True,
-        "PTZMode": "x660-read-only", #"pelco"
-        "PTZPort": "/dev/ttyACM0",
-        "PTZBaudRate": 9600,
-        "PTZAddress": 1,
-        "PTZPanSpeed": 0x5F,
-        "PTZTiltSpeed": 0x3F,
-        "PTZLeftLimitDeg": 10.0,
-        "PTZRightLimitDeg": 300.0,
-        "PTZLimitMarginDeg": 1.0,
-        "PTZTimeoutSec": 0.3,
-        "PTZQueryIntervalSec": 0.10,
-        "PTZQueryTiltInUpdate": False,
-        "PTZDebug": False,
-        "PTZPositionToleranceDeg": 0.75,
-        "PTZScanReverseLockoutSec": 0.8,
-        "PTZScanEndpointMarginDeg": 1.0,
-        "PTZScanSlewRateDegPerSec": 14.0,
-        "PTZSimPanRateDegPerSec": 14.0,
-        "PTZSimWrapMode": False,
+        # X6-60 motor/positioning unit: unlimited multi-turn azimuth.
+        "EnableX660": True,
+        "X660Mode": "x660-read-only",
+        "X660Debug": False,
+        "X660PositionToleranceDeg": 0.75,
+        "X660ScanEndpointMarginDeg": 1.0,
+        "X660ScanSlewRateDegPerSec": 14.0,
+        "X660ScanPattern": "SECTOR",
+        "X660SimMaxRateDegPerSec": 14.0,
+        "X660TelemetryIntervalSec": 0.10,
         "RadarDwellIntervalSec": 0.10,
-        "PTZScanContinuousToEndpoint": True,
-        "PTZStartupEnabled": True,
-        "PTZStartupAzimuthDeg": 200.0,
-        "PTZStartupElevationDeg": 60.0,
-        "PTZStartupTimeoutSec": 20.0,
-        "PTZStartupPositionToleranceDeg": 1.0,
+        "X660StartupEnabled": True,
+        "X660StartupAzimuthDeg": 200.0,
+        "X660StartupElevationDeg": 60.0,
+        "X660StartupTimeoutSec": 20.0,
+        "X660StartupPositionToleranceDeg": 1.0,
 
-        # Stage 4B SocketCAN telemetry-only integration.  Select
-        # PTZMode="x660-read-only" to use these values.  DirectionSign remains
-        # zero until a controlled direction-calibration movement establishes
-        # whether increasing raw angle is clockwise (+1) or anticlockwise (-1).
+        # Stage 4B/4D SocketCAN telemetry-only integration.  The calibrated
+        # mapping is North=000 deg, positive clockwise, naturally wrapping at
+        # 360 deg while the raw multi-turn angle remains unchanged.
         "X660CanInterface": "can0",
         "X660NodeId": 1,
         "X660CanTimeoutSec": 0.25,
         "X660NorthRawAngleDeg": -361.53,
-        "X660DirectionSign": 0,
+        "X660DirectionSign": +1,
 
         # Antenna attitude / IMU controls
         "EnableIMU": False,
@@ -792,21 +800,24 @@ def Main(CommandLineArguments=None):
         if Config.get("EnableIMU", False):
             print("IMU requested, but ReadIMU.py / IMUReader could not be imported.")
 
-    # X6-60 motor/positioning unit.  The legacy PTZController class opens
-    # /dev/ttyACM0 and uses native Pelco-D pan position commands.
-    if Config.get("EnablePTZ", False) and CreatePTZController is not None:
+    # X6-60 motor/positioning unit.  Only X6-60 CAN telemetry and the X6-60
+    # software simulator are supported.
+    if Config.get("EnableX660", False) and CreateX660Controller is not None:
         try:
-            Ptz = CreatePTZController(Config)
-            Ptz.Open()
-            print(f"X6-60 motor/positioning unit enabled. Mode={Config.get('PTZMode', 'pelco')}")
-            InitialisePTZToStartupPose(Ptz, Config, Display)
+            X660 = CreateX660Controller(Config)
+            X660.Open()
+            print(
+                "X6-60 motor/positioning unit enabled. "
+                f"Mode={Config.get('X660Mode', 'x660-read-only')}"
+            )
+            InitialiseX660ToStartupPose(X660, Config, Display)
         except Exception as exc:
-            Ptz = None
+            X660 = None
             print(f"X6-60 motor/positioning unit failed to open: {exc}")
     else:
-        Ptz = None
-        if Config.get("EnablePTZ", False):
-            print("X6-60 requested, but legacy PTZController.py could not be imported.")
+        X660 = None
+        if Config.get("EnableX660", False):
+            print("X6-60 requested, but X660Controller.py could not be imported.")
 
     Source.Initialise()
 
@@ -838,7 +849,6 @@ def Main(CommandLineArguments=None):
     CurrentScanBoresightDeg = float(Config.get("InitialBeamAngleDeg", Config.get("BoresightDeg", 0.0)))
     CurrentScanBoresightDeg = max(min(CurrentScanBoresightDeg, ScanStopDeg), ScanStartDeg)
     LastManualNudgeCommandId = 0
-    PtzStopped = False
     LastScanEnabled = False
     LastDisplayMode = "STOP"
     LastRadarDwellTimeSec = 0.0
@@ -859,14 +869,12 @@ def Main(CommandLineArguments=None):
     )
 
     Pointing = PointingManager(
-        ptz=Ptz,
-        left_limit_deg=float(Config.get("PTZLeftLimitDeg", 10.0)),
-        right_limit_deg=float(Config.get("PTZRightLimitDeg", 300.0)),
+        x660=X660,
         endpoint_margin_deg=float(
-            Config.get("PTZScanEndpointMarginDeg", 1.0)
+            Config.get("X660ScanEndpointMarginDeg", 1.0)
         ),
         position_tolerance_deg=float(
-            Config.get("PTZPositionToleranceDeg", 0.75)
+            Config.get("X660PositionToleranceDeg", 0.75)
         ),
     )
 
@@ -875,9 +883,12 @@ def Main(CommandLineArguments=None):
         SectorStartDeg=float(ScanStartDeg),
         SectorStopDeg=float(ScanStopDeg),
         ScanRateDegPerSec=float(
-            Config.get("PTZScanSlewRateDegPerSec", 14.0)
+            Config.get("X660ScanSlewRateDegPerSec", 14.0)
         ),
         SectorFrame=AngleFrame.PLATFORM,
+        Pattern=SearchPattern(
+            str(Config.get("X660ScanPattern", "SECTOR")).upper()
+        ),
     )
 
     Scheduler = RadarScheduler(
@@ -1038,7 +1049,7 @@ def Main(CommandLineArguments=None):
                 # Apply operator pointing intent before any RF/dwell gate.
                 # Nudge and STARE/STOP transitions must work while TX is off.
                 # This path issues commands only on a new nudge ID or mode
-                # transition, so it does not add continuous PTZ serial traffic.
+                # transition, so it does not add continuous X660 serial traffic.
                 # -------------------------------------------------------------
                 try:
                     (
@@ -1046,7 +1057,7 @@ def Main(CommandLineArguments=None):
                         PointingAction,
                         NudgeTargetRelativeDeg,
                     ) = ApplyOperatorPointingCommand(
-                        Pointing=Pointing if Ptz is not None else None,
+                        Pointing=Pointing if X660 is not None else None,
                         ControlState=ControlState,
                         DisplayMode=DisplayMode,
                         ScanEnabled=ScanEnabled,
@@ -1073,20 +1084,47 @@ def Main(CommandLineArguments=None):
 
                 # Consume the operator mode transition immediately.  Do not
                 # wait until the next radar dwell, otherwise the fast GUI loop
-                # can issue the same PTZ Stop command repeatedly while the
+                # can issue the same X660 Stop command repeatedly while the
                 # dwell-rate throttle is active.
                 LastScanEnabled = bool(ScanEnabled)
                 LastDisplayMode = str(DisplayMode)
 
+                # X6-60 encoder telemetry is independent of radar dwells.  In
+                # STOP, keep the PPI beam tied to the measured antenna bearing
+                # even though no dwell is executed.  The read-only CAN adapter
+                # throttles these queries internally.
+                if (
+                    X660 is not None
+                    and DisplayMode == "STOP"
+                    and bool(getattr(X660, "TelemetryWhileStopped", False))
+                ):
+                    try:
+                        IdleX660State = RefreshX660MeasuredBeam(X660, Display)
+                        if (
+                            IdleX660State is not None
+                            and bool(getattr(IdleX660State, "Valid", False))
+                        ):
+                            CurrentScanBoresightDeg = float(
+                                IdleX660State.AzimuthDeg
+                            ) % 360.0
+                            Config["BoresightDeg"] = CurrentScanBoresightDeg
+                            Config["X660AzDeg"] = CurrentScanBoresightDeg
+                            Config["X660RawAngleDeg"] = getattr(
+                                IdleX660State,
+                                "RawAngleDeg",
+                                None,
+                            )
+                    except Exception:
+                        # Keep the GUI responsive.  The normal dwell/status
+                        # path will report the telemetry error when active.
+                        pass
+
                 # -------------------------------------------------------------
                 # Timed radar dwell scheduler.
                 #
-                # IMPORTANT:
-                # This gate is deliberately BEFORE the PTZ serial query/update.
-                # The Pelco-D query can block on serial timeout, so putting the
-                # gate after Ptz.Update() makes the radar dwell rate depend on
-                # PTZ serial latency.  Gate first, then do one PTZ update and
-                # one radar dwell when a dwell is actually due.
+                # The active-dwell X6-60 update remains after this gate.  The
+                # small STOP-mode refresh above is only for controllers that
+                # explicitly advertise telemetry-while-stopped support.
                 # -------------------------------------------------------------
 
                 NowDwellSec = time.time()
@@ -1106,7 +1144,7 @@ def Main(CommandLineArguments=None):
 
                 if LastRadarDwellTimeSec > 0.0 and DwellWallDtSec < RadarDwellIntervalSec:
                     # Between dwell instants, keep the GUI responsive but do not
-                    # spend time on PTZ serial queries.  The PTZ continues slewing
+                    # spend time on additional X6-60 queries.  The X6-60 continues slewing
                     # from the last command.
                     if hasattr(Display, "App"):
                         Display.App.processEvents()
@@ -1116,36 +1154,45 @@ def Main(CommandLineArguments=None):
                 LastRadarDwellTimeSec = NowDwellSec
 
                 # -------------------------------------------------------------
-                # PTZ / X6-60 state and operator controls.
+                # X660 / X6-60 state and operator controls.
                 #
                 # Continuous SCAN, endpoint reversal, STOP, and manual nudge are
                 # now owned exclusively by PointingManager. Main only forwards
                 # operator intent and consumes measured pointing state.
                 # -------------------------------------------------------------
 
-                PtzValid = False
-                PtzSource = "DISABLED"
-                PtzAzDeg = float(CommandedBoresightDeg)
-                PtzRateDegPerSec = 0.0
-                PtzAtTarget = False
+                X660Valid = False
+                X660Source = "DISABLED"
+                X660AzDeg = float(CommandedBoresightDeg)
+                X660RateDegPerSec = 0.0
+                X660AtTarget = False
+                X660RawAngleDeg = None
 
-                if Ptz is not None:
+                if X660 is not None:
                     try:
-                        # Query/update position. This is throttled inside PTZController.
-                        PtzState = Ptz.Update()
-                        PtzAzDeg = float(PtzState.AzimuthDeg)
-                        PtzRateDegPerSec = float(PtzState.PanRateDegPerSec)
-                        PtzValid = bool(PtzState.Valid)
-                        PtzSource = str(PtzState.Source)
+                        # Query/update position. This is throttled inside X660Controller.
+                        X660State = X660.Update()
+                        X660AzDeg = float(X660State.AzimuthDeg)
+                        X660RateDegPerSec = float(X660State.PanRateDegPerSec)
+                        X660Valid = bool(X660State.Valid)
+                        X660Source = str(X660State.Source)
+                        X660AtTarget = bool(
+                            getattr(X660State, "AtTarget", False)
+                        )
+                        X660RawAngleDeg = getattr(
+                            X660State,
+                            "RawAngleDeg",
+                            None,
+                        )
 
-                        if PtzValid:
-                            CurrentScanBoresightDeg = float(PtzAzDeg)
+                        if X660Valid:
+                            CurrentScanBoresightDeg = float(X660AzDeg)
                             if hasattr(Display, "BeamAngleDeg"):
-                                Display.BeamAngleDeg = float(PtzAzDeg)
+                                Display.BeamAngleDeg = float(X660AzDeg)
 
                     except Exception as exc:
-                        PtzValid = False
-                        PtzSource = f"ERROR: {exc}"
+                        X660Valid = False
+                        X660Source = f"ERROR: {exc}"
 
                 LastScanEnabled = bool(ScanEnabled)
                 LastDisplayMode = str(DisplayMode)
@@ -1163,8 +1210,8 @@ def Main(CommandLineArguments=None):
                     try:
                         if hasattr(Imu, "SetSimulatedAntennaPosition"):
                             Imu.SetSimulatedAntennaPosition(
-                                AzimuthDeg=float(PtzAzDeg if PtzValid else CommandedBoresightDeg),
-                                ElevationDeg=float(Config.get("AntennaElDeg", Config.get("PTZStartupElevationDeg", 55.0))),
+                                AzimuthDeg=float(X660AzDeg if X660Valid else CommandedBoresightDeg),
+                                ElevationDeg=float(Config.get("AntennaElDeg", Config.get("X660StartupElevationDeg", 55.0))),
                             )
 
                         ImuData = Imu.Read()
@@ -1178,12 +1225,12 @@ def Main(CommandLineArguments=None):
 
                 # Boresight source priority:
                 #   IMU if explicitly enabled and valid,
-                #   else PTZ measured position,
+                #   else X660 measured position,
                 #   else commanded fallback.
                 if Config.get("UseIMUForBeamAngle", False) and ImuValid:
                     BoresightDeg = float(MeasuredAntennaAzDeg)
-                elif PtzValid:
-                    BoresightDeg = float(PtzAzDeg)
+                elif X660Valid:
+                    BoresightDeg = float(X660AzDeg)
                 else:
                     BoresightDeg = float(CommandedBoresightDeg)
 
@@ -1193,11 +1240,12 @@ def Main(CommandLineArguments=None):
                 Config["AntennaElDeg"] = float(MeasuredAntennaElDeg)
                 Config["IMUValid"] = bool(ImuValid)
                 Config["IMUSource"] = str(ImuSource)
-                Config["PTZAzDeg"] = float(PtzAzDeg)
-                Config["PTZRateDegPerSec"] = float(PtzRateDegPerSec)
-                Config["PTZValid"] = bool(PtzValid)
-                Config["PTZSource"] = str(PtzSource)
-                Config["PTZAtTarget"] = bool(PtzAtTarget)
+                Config["X660AzDeg"] = float(X660AzDeg)
+                Config["X660RateDegPerSec"] = float(X660RateDegPerSec)
+                Config["X660Valid"] = bool(X660Valid)
+                Config["X660Source"] = str(X660Source)
+                Config["X660AtTarget"] = bool(X660AtTarget)
+                Config["X660RawAngleDeg"] = X660RawAngleDeg
                 Config["ScanCycle"] = int(ScanCycle)
 
                 # -------------------------------------------------------------
@@ -1232,7 +1280,7 @@ def Main(CommandLineArguments=None):
                 SearchTask.Sector.StartDeg = float(ScanStartDeg)
                 SearchTask.Sector.StopDeg = float(ScanStopDeg)
                 SearchTask.Sector.ScanRateDegPerSec = abs(
-                    float(Config.get("PTZScanSlewRateDegPerSec", 14.0))
+                    float(Config.get("X660ScanSlewRateDegPerSec", 14.0))
                 )
 
                 # Pointing.Stop() clears the active task. Reissue the search
@@ -1277,11 +1325,12 @@ def Main(CommandLineArguments=None):
                     MeasuredAntennaElDeg=MeasuredAntennaElDeg,
                     ImuValid=ImuValid,
                     ImuSource=ImuSource,
-                    PtzAzDeg=PtzAzDeg,
-                    PtzRateDegPerSec=PtzRateDegPerSec,
-                    PtzValid=PtzValid,
-                    PtzSource=PtzSource,
-                    PtzAtTarget=PtzAtTarget,
+                    X660AzDeg=X660AzDeg,
+                    X660RateDegPerSec=X660RateDegPerSec,
+                    X660Valid=X660Valid,
+                    X660Source=X660Source,
+                    X660AtTarget=X660AtTarget,
+                    X660RawAngleDeg=X660RawAngleDeg,
                 )
 
                 if not DwellResult["Executed"]:
@@ -1355,7 +1404,7 @@ def Main(CommandLineArguments=None):
                         f"Log {1000*(T4-T3):7.2f} ms | "
                         f"Display {1000*(T5-T4):7.2f} ms | "
                         f"Total {1000*(T5-T0):7.2f} ms | "
-                        f"X6-60 {PtzAzDeg:7.2f} deg {PtzSource} | "
+                        f"X6-60 {X660AzDeg:7.2f} deg {X660Source} | "
                         f"Mode {DisplayMode} Scan {ScanEnabled} | "
                         f"Dets {len(Detections):3d} Plots {len(Plots):3d} Tracks {len(Tracks):3d} | "
                         f"Pts {int(TrackerDebug.get('CurrentScanPoints', 0)):3d} "
@@ -1406,9 +1455,9 @@ def Main(CommandLineArguments=None):
             pass
 
         try:
-            if Ptz is not None:
+            if X660 is not None:
                 Pointing.Stop()
-                Ptz.Close()
+                X660.Close()
         except Exception:
             pass
 

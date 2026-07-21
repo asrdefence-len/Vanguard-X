@@ -18,7 +18,7 @@ The scheduler:
     - prevents duplicate queued track tasks for the same TrackId
 
 The scheduler does not:
-    - move the PTZ
+    - move the X6-60
     - build DwellPlan objects
     - process IQ
     - update tracks

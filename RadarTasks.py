@@ -9,7 +9,7 @@ Purpose
 Defines the high-level task objects used by RadarScheduler.
 
 A RadarTask describes WHAT the radar should do next. It does not control the
-PTZ, Ettus, TRM, detector, tracker, or display directly.
+X6-60, Ettus, TRM, detector, tracker, or display directly.
 
 Initial task types
 ------------------
@@ -69,6 +69,13 @@ class AngleFrame(str, Enum):
     PLATFORM = "PLATFORM"
 
 
+class SearchPattern(str, Enum):
+    """Azimuth movement used by a persistent search task."""
+
+    SECTOR = "SECTOR"
+    CONTINUOUS_CW = "CONTINUOUS_CW"
+
+
 @dataclass
 class PointingRequest:
     """
@@ -116,14 +123,24 @@ class SearchSector:
 
     LastMeasuredAzimuthDeg: Optional[float] = None
     InterruptedAzimuthDeg: Optional[float] = None
+    Pattern: SearchPattern = SearchPattern.SECTOR
 
     def __post_init__(self) -> None:
         self.StartDeg = float(self.StartDeg)
         self.StopDeg = float(self.StopDeg)
         self.ScanRateDegPerSec = abs(float(self.ScanRateDegPerSec))
+        self.Pattern = SearchPattern(self.Pattern)
 
         if self.ScanRateDegPerSec <= 0.0:
             raise ValueError("ScanRateDegPerSec must be greater than zero")
+
+        if (
+            self.Pattern == SearchPattern.CONTINUOUS_CW
+            and self.Frame != AngleFrame.PLATFORM
+        ):
+            raise ValueError(
+                "CONTINUOUS_CW search must use the PLATFORM angle frame"
+            )
 
         if int(self.Direction) not in (-1, 1):
             raise ValueError("Direction must be +1 or -1")
@@ -139,6 +156,9 @@ class SearchSector:
         return self.StopDeg if self.ActiveEndpoint == "STOP" else self.StartDeg
 
     def Reverse(self) -> None:
+        if self.Pattern == SearchPattern.CONTINUOUS_CW:
+            raise RuntimeError("continuous-CW search does not reverse")
+
         if self.ActiveEndpoint == "STOP":
             self.ActiveEndpoint = "START"
             self.Direction = -1
@@ -299,6 +319,7 @@ def MakeSearchTask(
     SectorStopDeg: float,
     ScanRateDegPerSec: float,
     SectorFrame: AngleFrame = AngleFrame.PLATFORM,
+    Pattern: SearchPattern = SearchPattern.SECTOR,
     WaveformProfileId: str = "SEARCH_DEFAULT",
     Priority: int = 10,
 ) -> SearchTask:
@@ -309,6 +330,7 @@ def MakeSearchTask(
         StartDeg=SectorStartDeg,
         StopDeg=SectorStopDeg,
         ScanRateDegPerSec=ScanRateDegPerSec,
+        Pattern=Pattern,
     )
 
     pointing = PointingRequest(

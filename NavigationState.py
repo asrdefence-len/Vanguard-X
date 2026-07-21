@@ -3,7 +3,8 @@ NavigationState.py
 
 Simulation-side navigation state for Vanguard X.
 
-This module represents the platform attitude independently of the PTZ.
+This module represents the platform attitude independently of the X6-60
+antenna positioning unit.
 Initially it provides heading only, but the interface already includes
 pitch and roll for future moving-platform support.
 """

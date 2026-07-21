@@ -6,7 +6,7 @@ PointingManager.py
 
 Purpose
 -------
-Provides the software-only pointing layer between radar tasks and the PTZ.
+Provides the software-only pointing layer between radar tasks and the X6-60.
 
 The Pointing Manager:
     - converts TRUE bearings to PLATFORM-relative antenna angles
@@ -22,7 +22,7 @@ It does not:
     - control the Ettus or TRM
     - perform track filtering
 
-The PTZ object must provide the public interface already used by Vanguard:
+The X6-60 object must provide the public interface already used by Vanguard:
     CommandSlew(rate_deg_per_sec, tilt_rate_deg_per_sec=0.0)
     SetPanPositionNative(target_deg)
     Stop()
@@ -41,6 +41,7 @@ from RadarTasks import (
     PointingMode,
     RadarTask,
     RadarTaskType,
+    SearchPattern,
     SearchTask,
     TrackTask,
 )
@@ -55,11 +56,9 @@ def signed_angle_delta_deg(target_deg: float, current_deg: float) -> float:
     delta = wrap360(target_deg) - wrap360(current_deg)
     if delta > 180.0:
         delta -= 360.0
+    elif delta < -180.0:
+        delta += 360.0
     return delta
-
-
-def clamp(value: float, minimum: float, maximum: float) -> float:
-    return max(float(minimum), min(float(maximum), float(value)))
 
 
 @dataclass
@@ -96,19 +95,15 @@ class PointingManager:
 
     def __init__(
         self,
-        ptz,
-        left_limit_deg: float = 10.0,
-        right_limit_deg: float = 300.0,
+        x660,
         endpoint_margin_deg: float = 1.0,
         position_tolerance_deg: float = 1.0,
         settle_rate_threshold_deg_per_sec: float = 0.25,
         default_scan_rate_deg_per_sec: float = 14.0,
         debug: bool = False,
     ):
-        self.Ptz = ptz
+        self.Positioner = x660
 
-        self.LeftLimitDeg = float(left_limit_deg)
-        self.RightLimitDeg = float(right_limit_deg)
         self.EndpointMarginDeg = abs(float(endpoint_margin_deg))
         self.PositionToleranceDeg = abs(float(position_tolerance_deg))
         self.SettleRateThresholdDegPerSec = abs(
@@ -119,8 +114,10 @@ class PointingManager:
         )
         self.Debug = bool(debug)
 
-        if self.RightLimitDeg <= self.LeftLimitDeg:
-            raise ValueError("right_limit_deg must be greater than left_limit_deg")
+        if not bool(getattr(self.Positioner, "UnlimitedAzimuth", False)):
+            raise ValueError(
+                "Vanguard X requires an unlimited-azimuth X6-60 controller"
+            )
 
         self.ActiveTask: Optional[RadarTask] = None
         self.ActiveMode = PointingMode.HOLD_CURRENT
@@ -157,15 +154,14 @@ class PointingManager:
         )
 
     def IsRelativeAzimuthReachable(self, relative_azimuth_deg: float) -> bool:
-        relative = wrap360(relative_azimuth_deg)
-        return self.LeftLimitDeg <= relative <= self.RightLimitDeg
+        # Every bearing is reachable on the unlimited multi-turn X6-60 axis.
+        wrap360(relative_azimuth_deg)
+        return True
 
     def ClampRelativeAzimuth(self, relative_azimuth_deg: float) -> float:
-        return clamp(
-            wrap360(relative_azimuth_deg),
-            self.LeftLimitDeg,
-            self.RightLimitDeg,
-        )
+        # Kept as an interface-compatible normaliser.  There are no X6-60
+        # azimuth end stops or software windows.
+        return wrap360(relative_azimuth_deg)
 
     # ------------------------------------------------------------------
     # Task lifecycle
@@ -177,13 +173,13 @@ class PointingManager:
         navigation: PlatformAttitude,
     ) -> None:
         """
-        Activate a task and issue its initial PTZ command.
+        Activate a task and issue its initial X6-60 command.
 
         Search:
             starts/resumes continuous slew toward the active sector endpoint.
 
         Track:
-            converts the target true bearing to a platform-relative PTZ angle
+            converts the target true bearing to a platform-relative X6-60 angle
             and commands goto-and-hold.
         """
         if task.TaskType == RadarTaskType.SEARCH:
@@ -194,7 +190,7 @@ class PointingManager:
             self.ActiveTask = task
             self.ActiveMode = task.Pointing.Mode
             if task.Pointing.Mode == PointingMode.HOLD_CURRENT:
-                self.Ptz.Stop()
+                self.Positioner.Stop()
 
     def _activate_search(
         self,
@@ -224,7 +220,7 @@ class PointingManager:
     ) -> None:
         if self.SearchTask is not None:
             try:
-                state = self.Ptz.Update()
+                state = self.Positioner.Update()
                 self.LastSearchRelativeDeg = float(state.AzimuthDeg)
                 self.SearchTask.Sector.InterruptedAzimuthDeg = (
                     self.LastSearchRelativeDeg
@@ -253,7 +249,7 @@ class PointingManager:
         self.LastCommandedTrueDeg = true_target
         self.LastCommandedRelativeDeg = command_target
 
-        self.Ptz.SetPanPositionNative(command_target)
+        self.Positioner.SetPanPositionNative(command_target)
 
         if self.Debug:
             print(
@@ -267,7 +263,7 @@ class PointingManager:
     def PauseSearchForTrack(self) -> None:
         if self.SearchTask is not None:
             self.SearchInterrupted = True
-        self.Ptz.Stop()
+        self.Positioner.Stop()
 
     def ResumeSearch(self, navigation: PlatformAttitude) -> None:
         if self.SearchTask is None:
@@ -288,8 +284,8 @@ class PointingManager:
     def Nudge(self, delta_deg: float) -> float:
         """Move the antenna by a relative operator-requested increment.
 
-        Manual positioning is owned here so callers never command the PTZ
-        directly. The target is clamped to the configured mechanical limits.
+        Manual positioning is owned here so callers never command the X6-60
+        directly. The target wraps through North on the unlimited X6-60 axis.
         Any active search or track task is cleared; the scheduler may reactivate
         search when the operator returns to SCAN mode.
 
@@ -298,21 +294,17 @@ class PointingManager:
         delta = float(delta_deg)
 
         try:
-            state = self.Ptz.Update()
+            state = self.Positioner.Update()
             current_relative = float(state.AzimuthDeg)
         except Exception:
             if self.LastCommandedRelativeDeg is None:
                 raise
             current_relative = float(self.LastCommandedRelativeDeg)
 
-        target_relative = clamp(
-            current_relative + delta,
-            self.LeftLimitDeg,
-            self.RightLimitDeg,
-        )
+        target_relative = wrap360(current_relative + delta)
 
-        self.Ptz.Stop()
-        self.Ptz.SetPanPositionNative(target_relative)
+        self.Positioner.Stop()
+        self.Positioner.SetPanPositionNative(target_relative)
 
         self.ActiveTask = None
         self.ActiveMode = PointingMode.HOLD_CURRENT
@@ -332,7 +324,7 @@ class PointingManager:
         return target_relative
 
     def Stop(self) -> None:
-        self.Ptz.Stop()
+        self.Positioner.Stop()
         self.ActiveTask = None
         self.ActiveMode = PointingMode.HOLD_CURRENT
         self._goto_ready_since_sec = None
@@ -348,13 +340,13 @@ class PointingManager:
     ) -> PointingState:
         now = time.time() if current_time_sec is None else float(current_time_sec)
 
-        ptz_state = self.Ptz.Update()
+        x660_state = self.Positioner.Update()
 
-        relative_az = float(ptz_state.AzimuthDeg)
-        relative_el = float(getattr(ptz_state, "ElevationDeg", 0.0))
-        rate = float(getattr(ptz_state, "PanRateDegPerSec", 0.0))
-        ptz_valid = bool(getattr(ptz_state, "Valid", True))
-        source = str(getattr(ptz_state, "Source", "PTZ"))
+        relative_az = float(x660_state.AzimuthDeg)
+        relative_el = float(getattr(x660_state, "ElevationDeg", 0.0))
+        rate = float(getattr(x660_state, "PanRateDegPerSec", 0.0))
+        x660_valid = bool(getattr(x660_state, "Valid", True))
+        source = str(getattr(x660_state, "Source", "X6-60"))
 
         beam_true = self.RelativeToTrueBearing(
             relative_az,
@@ -370,7 +362,7 @@ class PointingManager:
         ):
             search_task = self.ActiveTask
             self._update_search_endpoint(search_task, navigation, beam_true)
-            ready = ptz_valid
+            ready = x660_valid
             reachable = True
 
         elif (
@@ -404,7 +396,7 @@ class PointingManager:
             ):
                 self.LastCommandedRelativeDeg = command_target
                 self.LastCommandedTrueDeg = true_target
-                self.Ptz.SetPanPositionNative(command_target)
+                self.Positioner.SetPanPositionNative(command_target)
 
             error_deg = abs(
                 signed_angle_delta_deg(command_target, relative_az)
@@ -429,7 +421,7 @@ class PointingManager:
                 ready = False
 
         else:
-            ready = ptz_valid and abs(rate) <= self.SettleRateThresholdDegPerSec
+            ready = x660_valid and abs(rate) <= self.SettleRateThresholdDegPerSec
 
         active_task_id = (
             None if self.ActiveTask is None else int(self.ActiveTask.TaskId)
@@ -444,7 +436,11 @@ class PointingManager:
 
         if self.SearchTask is not None:
             search_cycle = int(self.SearchTask.Sector.ScanCycle)
-            search_endpoint = str(self.SearchTask.Sector.ActiveEndpoint)
+            search_endpoint = (
+                SearchPattern.CONTINUOUS_CW.value
+                if self.SearchTask.Sector.Pattern == SearchPattern.CONTINUOUS_CW
+                else str(self.SearchTask.Sector.ActiveEndpoint)
+            )
 
         return PointingState(
             TimestampSec=now,
@@ -459,7 +455,7 @@ class PointingManager:
             PanRateDegPerSec=rate,
             Ready=bool(ready),
             Reachable=bool(reachable),
-            Valid=bool(ptz_valid and navigation.Valid),
+            Valid=bool(x660_valid and navigation.Valid),
             Source=source,
             ActiveTaskId=active_task_id,
             ActiveTrackId=active_track_id,
@@ -476,10 +472,19 @@ class PointingManager:
         task: SearchTask,
         navigation: PlatformAttitude,
     ) -> None:
+        if task.Sector.Pattern == SearchPattern.CONTINUOUS_CW:
+            self.LastCommandedRelativeDeg = None
+            self.LastCommandedTrueDeg = None
+            self.Positioner.CommandSlew(
+                abs(float(task.Sector.ScanRateDegPerSec)),
+                0.0,
+            )
+            return
+
         endpoint_relative = self._search_endpoint_relative(task, navigation)
 
         try:
-            state = self.Ptz.Update()
+            state = self.Positioner.Update()
             current_relative = float(state.AzimuthDeg)
         except Exception:
             current_relative = endpoint_relative
@@ -488,9 +493,6 @@ class PointingManager:
             endpoint_relative,
             current_relative,
         )
-
-        if not self.PtzWrapMode:
-            delta = endpoint_relative - current_relative
 
         direction = 1.0 if delta >= 0.0 else -1.0
         rate = direction * float(task.Sector.ScanRateDegPerSec)
@@ -501,11 +503,7 @@ class PointingManager:
             navigation,
         )
 
-        self.Ptz.CommandSlew(rate, 0.0)
-
-    @property
-    def PtzWrapMode(self) -> bool:
-        return bool(getattr(self.Ptz, "WrapMode", False))
+        self.Positioner.CommandSlew(rate, 0.0)
 
     def _search_endpoint_relative(
         self,
@@ -556,40 +554,38 @@ class PointingManager:
         sector = task.Sector
 
         try:
-            ptz_state = self.Ptz.GetState()
-            relative_az = float(ptz_state.AzimuthDeg)
+            x660_state = self.Positioner.GetState()
+            relative_az = float(x660_state.AzimuthDeg)
         except Exception:
-            ptz_state = self.Ptz.Update()
-            relative_az = float(ptz_state.AzimuthDeg)
+            x660_state = self.Positioner.Update()
+            relative_az = float(x660_state.AzimuthDeg)
 
         measured = (
             wrap360(beam_true_deg)
             if sector.Frame == AngleFrame.TRUE
-            else (wrap360(relative_az) if self.PtzWrapMode else relative_az)
+            else wrap360(relative_az)
         )
         previous = sector.LastMeasuredAzimuthDeg
         sector.LastMeasuredAzimuthDeg = measured
 
-        target = (
-            wrap360(sector.ActiveEndpointDeg)
-            if sector.Frame == AngleFrame.TRUE or self.PtzWrapMode
-            else float(sector.ActiveEndpointDeg)
-        )
+        if sector.Pattern == SearchPattern.CONTINUOUS_CW:
+            # Positive X6-60 azimuth is clockwise.  Count each measured
+            # 359-to-0 crossing as another completed continuous revolution;
+            # never issue a reverse command at North.
+            if previous is not None:
+                motion = signed_angle_delta_deg(measured, previous)
+                if motion > 0.01 and measured < previous:
+                    sector.ScanCycle += 1
+            return
 
-        if sector.Frame == AngleFrame.TRUE or self.PtzWrapMode:
-            error = signed_angle_delta_deg(target, measured)
-        else:
-            error = target - measured
+        target = wrap360(sector.ActiveEndpointDeg)
+        error = signed_angle_delta_deg(target, measured)
 
         reached = abs(error) <= self.EndpointMarginDeg
 
         if not reached and previous is not None:
-            if sector.Frame == AngleFrame.TRUE or self.PtzWrapMode:
-                motion = signed_angle_delta_deg(measured, previous)
-                previous_error = signed_angle_delta_deg(target, previous)
-            else:
-                motion = measured - previous
-                previous_error = target - previous
+            motion = signed_angle_delta_deg(measured, previous)
+            previous_error = signed_angle_delta_deg(target, previous)
 
             motion_epsilon = 0.01
 

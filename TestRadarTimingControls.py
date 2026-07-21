@@ -23,7 +23,7 @@ def MakeConfig():
         "ReceiverRecoveryTimeSec": 1.0e-6,
         "RxEndMarginSec": 2.0e-6,
         "NextTxGuardTimeSec": 2.0e-6,
-        "PTZScanSlewRateDegPerSec": 14.0,
+        "X660ScanSlewRateDegPerSec": 14.0,
     }
 
 
