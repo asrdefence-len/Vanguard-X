@@ -734,6 +734,27 @@ def CreatePTZController(Config):
             **Common,
         )
 
+    if Mode in [
+        "x660-read-only",
+        "x6-60-read-only",
+        "x660_telemetry",
+        "x6-60-telemetry",
+    ]:
+        from X660ReadOnlyController import X660ReadOnlyController
+
+        return X660ReadOnlyController(
+            Interface=str(Config.get("X660CanInterface", "can0")),
+            NodeId=int(Config.get("X660NodeId", 1)),
+            TimeoutSec=float(Config.get("X660CanTimeoutSec", 0.25)),
+            QueryIntervalSec=float(Config.get("PTZQueryIntervalSec", 0.10)),
+            NorthRawAngleDeg=float(
+                Config.get("X660NorthRawAngleDeg", -361.53)
+            ),
+            DirectionSign=int(Config.get("X660DirectionSign", 0)),
+            Debug=bool(Config.get("PTZDebug", False)),
+            **Common,
+        )
+
     raise ValueError(f"Unknown PTZMode: {Mode}")
 
 

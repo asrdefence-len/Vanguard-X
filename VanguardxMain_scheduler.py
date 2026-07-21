@@ -223,6 +223,12 @@ def InitialisePTZToStartupPose(Ptz, Config, Display=None):
     if Ptz is None or not bool(Config.get("PTZStartupEnabled", True)):
         return
 
+    if not bool(getattr(Ptz, "MotionCommandsEnabled", True)):
+        print(
+            "X6-60 startup pose skipped: active controller is telemetry-only"
+        )
+        return
+
     TargetAzDeg = ClampDeg(
         float(Config.get("PTZStartupAzimuthDeg", 200.0)),
         float(Config.get("PTZLeftLimitDeg", 10.0)),
@@ -614,7 +620,7 @@ def Main(CommandLineArguments=None):
 
         # X6-60 motor/positioning unit controls (legacy PTZ keys/classes).
         "EnablePTZ": True,
-        "PTZMode": "sim", #"pelco"
+        "PTZMode": "x660-read-only", #"pelco"
         "PTZPort": "/dev/ttyACM0",
         "PTZBaudRate": 9600,
         "PTZAddress": 1,
@@ -640,6 +646,16 @@ def Main(CommandLineArguments=None):
         "PTZStartupElevationDeg": 60.0,
         "PTZStartupTimeoutSec": 20.0,
         "PTZStartupPositionToleranceDeg": 1.0,
+
+        # Stage 4B SocketCAN telemetry-only integration.  Select
+        # PTZMode="x660-read-only" to use these values.  DirectionSign remains
+        # zero until a controlled direction-calibration movement establishes
+        # whether increasing raw angle is clockwise (+1) or anticlockwise (-1).
+        "X660CanInterface": "can0",
+        "X660NodeId": 1,
+        "X660CanTimeoutSec": 0.25,
+        "X660NorthRawAngleDeg": -361.53,
+        "X660DirectionSign": 0,
 
         # Antenna attitude / IMU controls
         "EnableIMU": False,
