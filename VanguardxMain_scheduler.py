@@ -65,8 +65,11 @@ from DataLogger import DataLogger
 from EttusRadarSource import EttusRadarSource
 from EttusOperatingProfiles import (
     ApplyOperatingProfile,
+    ApplyX660OperatingProfile,
     ParseOperatingProfileArguments,
 )
+import os
+import sys
 import time
 
 try:
@@ -91,6 +94,22 @@ from TargetScenario import (
 # -----------------------------------------------------------------------------
 # Helper functions
 # -----------------------------------------------------------------------------
+
+def ParseSystemModeArguments(CommandLineArguments=None):
+    """Remove the top-level SIM/HARD selection before profile parsing."""
+
+    Arguments = list(
+        sys.argv[1:] if CommandLineArguments is None else CommandLineArguments
+    )
+    SimSelected = "--system-sim" in Arguments
+    HardSelected = "--system-hard" in Arguments
+    if SimSelected and HardSelected:
+        raise ValueError("Select only one of --system-sim or --system-hard")
+    Filtered = [
+        Argument for Argument in Arguments
+        if Argument not in ("--system-sim", "--system-hard")
+    ]
+    return ("HARD" if HardSelected else "SIM"), Filtered
 
 def BuildRadarParamsForScenario(Config):
     """
@@ -122,12 +141,6 @@ def SelectDisplay(Config):
         return RadarDisplay(Config)
 
     return SimpleDisplay(Config)
-
-
-def ClampDeg(Value, MinValue, MaxValue):
-    return max(float(MinValue), min(float(MaxValue), float(Value)))
-
-
 
 
 def GetControlledBoresightDeg(Display, ScanBoresightDeg, ControlState=None):
@@ -235,74 +248,45 @@ def RefreshX660MeasuredBeam(X660, Display):
 
 
 
-def InitialiseX660ToStartupPose(X660, Config, Display=None):
-    """Command the X6-60 motor/positioning unit to its startup AZ/EL pose.
+def InitialiseX660AtCurrentPose(X660, Config, Display=None):
+    """Adopt the measured X6-60 pose without commanding startup motion.
 
-    Default startup pose is reported EL=55 deg and AZ=200 deg.  This runs before the
-    radar dwell loop so the antenna starts from a known mechanical attitude.
+    The absolute encoder is the startup reference.  Opening Vanguard X must
+    therefore leave the X6-60 where it is, initialise the boresight and PPI
+    beam from valid telemetry, and wait for explicit operator scan, STARE, or
+    nudge intent before issuing a motion command.
     """
-    if X660 is None or not bool(Config.get("X660StartupEnabled", True)):
-        return
+    if X660 is None:
+        return None
 
-    if not bool(getattr(X660, "MotionCommandsEnabled", True)):
-        print(
-            "X6-60 startup pose skipped: active controller is telemetry-only"
+    State = X660.Update() if hasattr(X660, "Update") else X660.GetState()
+    if not bool(getattr(State, "Valid", False)):
+        raise RuntimeError(
+            "X6-60 startup encoder telemetry is invalid; no motion commanded"
         )
-        return
 
-    TargetAzDeg = float(Config.get("X660StartupAzimuthDeg", 200.0)) % 360.0
-    TargetElDeg = ClampDeg(float(Config.get("X660StartupElevationDeg", 45.0)), -90.0, 90.0)
-    TimeoutSec = float(Config.get("X660StartupTimeoutSec", 20.0))
-    ToleranceDeg = float(Config.get("X660StartupPositionToleranceDeg", Config.get("X660PositionToleranceDeg", 1.0)))
+    AzDeg = float(State.AzimuthDeg) % 360.0
+    ElDeg = float(
+        getattr(State, "ElevationDeg", Config.get("AntennaElDeg", 0.0))
+    )
 
-    print(f"X6-60 startup initialise: AZ={TargetAzDeg:.2f} deg, EL={TargetElDeg:.2f} deg")
+    Config["InitialBeamAngleDeg"] = AzDeg
+    Config["BoresightDeg"] = AzDeg
+    Config["AntennaAzDeg"] = AzDeg
+    Config["AntennaElDeg"] = ElDeg
+    Config["X660AzDeg"] = AzDeg
+    Config["X660RawAngleDeg"] = getattr(State, "RawAngleDeg", None)
 
-    if hasattr(X660, "CommandPosition"):
-        X660.CommandPosition(TargetAzDeg, TargetElDeg)
-    else:
-        if hasattr(X660, "SetPanPositionNative"):
-            X660.SetPanPositionNative(TargetAzDeg)
-        if hasattr(X660, "SetTiltPositionNative"):
-            X660.SetTiltPositionNative(TargetElDeg)
+    if hasattr(Display, "SetMeasuredBeamAngle"):
+        Display.SetMeasuredBeamAngle(AzDeg)
+    elif hasattr(Display, "BeamAngleDeg"):
+        Display.BeamAngleDeg = AzDeg
 
-    StartSec = time.time()
-    LastPrintSec = 0.0
-
-    while (time.time() - StartSec) < TimeoutSec:
-        try:
-            State = X660.Update() if hasattr(X660, "Update") else X660.GetState()
-            AzDeg = float(getattr(State, "AzimuthDeg", TargetAzDeg))
-            ElDeg = float(getattr(State, "ElevationDeg", TargetElDeg))
-        except Exception as exc:
-            print(f"X6-60 startup initialise warning: {exc}")
-            break
-
-        if hasattr(Display, "App"):
-            Display.App.processEvents()
-
-        AzOk = abs(AzDeg - TargetAzDeg) <= ToleranceDeg
-        ElOk = abs(ElDeg - TargetElDeg) <= ToleranceDeg
-
-        NowSec = time.time()
-        if NowSec - LastPrintSec > 1.0:
-            print(f"X6-60 startup position: AZ={AzDeg:.2f} deg, EL={ElDeg:.2f} deg")
-            LastPrintSec = NowSec
-
-        if AzOk and ElOk:
-            break
-
-        time.sleep(0.05)
-
-    try:
-        X660.Stop()
-    except Exception:
-        pass
-
-    Config["InitialBeamAngleDeg"] = TargetAzDeg
-    Config["BoresightDeg"] = TargetAzDeg
-    Config["AntennaElDeg"] = TargetElDeg
-    if hasattr(Display, "BeamAngleDeg"):
-        Display.BeamAngleDeg = TargetAzDeg
+    print(
+        "X6-60 startup position adopted from encoder: "
+        f"AZ={AzDeg:.2f} deg (no startup motion commanded)"
+    )
+    return State
 
 
 
@@ -448,9 +432,10 @@ def Main(CommandLineArguments=None):
     # Configuration dictionary
     # -------------------------------------------------------------------------
 
-    OperatingArguments = ParseOperatingProfileArguments(
+    SystemMode, ProfileArguments = ParseSystemModeArguments(
         CommandLineArguments
     )
+    OperatingArguments = ParseOperatingProfileArguments(ProfileArguments)
 
     Config = {
         # Operator timing selections. PRI, CPI duration, RX start and receive
@@ -479,7 +464,8 @@ def Main(CommandLineArguments=None):
         # Radar source
         # ---------------------------------------------------------------------
 
-        "RadarSource": "ETTUS",        # Validate SIM before "ETTUS"
+        "SystemMode": SystemMode,
+        "RadarSource": "SIM",
 
         # Ettus configuration
         "EttusSerial": "34A0320",
@@ -622,6 +608,16 @@ def Main(CommandLineArguments=None):
         "MaxPolarDetections": 500,
         "RangeRingStepM": 2000.0,
 
+        # Offline North-up map beneath the PPI. The radar remains at the
+        # centre; live GPS will later replace these fixed Bellambi coordinates.
+        "MapEnabled": True,
+        "MapLatitudeDeg": -34.368,
+        "MapLongitudeDeg": 150.929,
+        "MapDatasetPath": "NSWCoast_Newcastle_to_BatemansBay_OSM_20260722.json",
+        "MapLandColour": (92, 92, 92, 105),
+        "MapCoastColour": (255, 255, 255, 190),
+        "MapLabelColour": (255, 255, 255, 180),
+
         "RangeDopplerUpdateEveryNDwells": 0,
         "PolarUpdateEveryNDwells": 1,
         "PolarDetectionsUpdateEveryNDwells": 1,
@@ -636,26 +632,21 @@ def Main(CommandLineArguments=None):
         # ---------------------------------------------------------------------
         "InitialDisplayMode": "STOP",
         "InitialScanEnabled": False,
-        "InitialBeamAngleDeg": 200.0,
+        # Replaced from valid X6-60 encoder telemetry when the controller opens.
+        "InitialBeamAngleDeg": 0.0,
         "ManualBeamStepDeg": 1.0,
 
         # X6-60 motor/positioning unit: unlimited multi-turn azimuth.
         "EnableX660": True,
-        "X660Mode": "x660-read-only",
+        "X660Mode": "x660-sim",
         "X660Debug": False,
         "X660PositionToleranceDeg": 0.75,
         "X660ScanEndpointMarginDeg": 1.0,
-        "X660ScanSlewRateDegPerSec": 14.0,
+        "X660ScanSlewRateDegPerSec": 20.0,
         "X660ScanPattern": "SECTOR",
-        "X660SimMaxRateDegPerSec": 14.0,
+        "X660SimMaxRateDegPerSec": 20.0,
         "X660TelemetryIntervalSec": 0.10,
         "RadarDwellIntervalSec": 0.10,
-        "X660StartupEnabled": True,
-        "X660StartupAzimuthDeg": 200.0,
-        "X660StartupElevationDeg": 60.0,
-        "X660StartupTimeoutSec": 20.0,
-        "X660StartupPositionToleranceDeg": 1.0,
-
         # Stage 4B/4D SocketCAN telemetry-only integration.  The calibrated
         # mapping is North=000 deg, positive clockwise, naturally wrapping at
         # 360 deg while the raw multi-turn angle remains unchanged.
@@ -664,6 +655,17 @@ def Main(CommandLineArguments=None):
         "X660CanTimeoutSec": 0.25,
         "X660NorthRawAngleDeg": -361.53,
         "X660DirectionSign": +1,
+
+        # Operational CAN motion remains opt-in. To connect the proven motion
+        # transport to PointingManager, select x660-operational and set all
+        # three session-authorisation values to True. The public coordinate
+        # convention remains North=0 deg and clockwise-positive.
+        "X660MotionEnabled": False,
+        "X660IUnderstandMotionWillOccur": False,
+        "X660IConfirmMotionAreaIsClear": False,
+        "X660OperationalMaxRateDegPerSec": 20.0,
+        "X660PositionCommandSpeedDegPerSec": 14,
+        "X660MaximumNudgeDeg": 10.0,
 
         # Antenna attitude / IMU controls
         "EnableIMU": False,
@@ -679,6 +681,33 @@ def Main(CommandLineArguments=None):
         Config,
         OperatingArguments,
     )
+    X660OperatingProfile = ApplyX660OperatingProfile(
+        Config,
+        OperatingArguments,
+    )
+
+    # The top-bar selector owns the complete adapter pairing.  HARD is
+    # deliberately receive-only: it may move the X6-60, but never enables RF
+    # transmission.  SIM never opens Ettus or SocketCAN.
+    if SystemMode == "HARD":
+        Config["RadarSource"] = "ETTUS"
+        Config["EttusOperatingMode"] = "RECEIVE_ONLY"
+        Config["EttusTimedTransmitEnabled"] = False
+        Config["EttusAtrGpioEnabled"] = False
+        Config["InitialTransmitEnabled"] = False
+        Config["X660Mode"] = "x660-operational"
+        Config["X660MotionEnabled"] = True
+        Config["X660IUnderstandMotionWillOccur"] = True
+        Config["X660IConfirmMotionAreaIsClear"] = True
+    else:
+        Config["RadarSource"] = "SIM"
+        Config["X660Mode"] = "x660-sim"
+        Config["X660MotionEnabled"] = False
+    if X660OperatingProfile == "X660_OPERATIONAL":
+        print(
+            "X6-60 OPERATIONAL MOTION SELECTED "
+            "(clockwise-positive, encoder beam feedback enabled)"
+        )
     if OperatingProfile in (
         "STAGE3E1_LOOPBACK",
         "STAGE3F_RF_TARGET",
@@ -810,7 +839,7 @@ def Main(CommandLineArguments=None):
                 "X6-60 motor/positioning unit enabled. "
                 f"Mode={Config.get('X660Mode', 'x660-read-only')}"
             )
-            InitialiseX660ToStartupPose(X660, Config, Display)
+            InitialiseX660AtCurrentPose(X660, Config, Display)
         except Exception as exc:
             X660 = None
             print(f"X6-60 motor/positioning unit failed to open: {exc}")
@@ -851,6 +880,11 @@ def Main(CommandLineArguments=None):
     LastManualNudgeCommandId = 0
     LastScanEnabled = False
     LastDisplayMode = "STOP"
+    # Latched until PointingManager actually receives the search task.  The GUI
+    # loop runs faster than the radar-dwell loop, so a one-iteration edge flag
+    # can otherwise be consumed by the dwell-rate gate (especially after a
+    # manual nudge leaves PointingManager in STARE mode).
+    ScanStartPending = False
     LastRadarDwellTimeSec = 0.0
     LastPrintedBoresightDeg = None
 
@@ -905,6 +939,8 @@ def Main(CommandLineArguments=None):
     )
 
     LastAppliedTimingRevision = -1
+    LastSystemModeRevision = 0
+    RestartSystemMode = None
     InitialControlState = (
         Display.GetControlState()
         if hasattr(Display, "GetControlState")
@@ -963,6 +999,41 @@ def Main(CommandLineArguments=None):
                     if hasattr(Display, "GetControlState")
                     else None
                 )
+
+                if ControlState is not None:
+                    RequestedModeRevision = int(
+                        ControlState.get("SystemModeRevision", 0)
+                    )
+                    if RequestedModeRevision != LastSystemModeRevision:
+                        LastSystemModeRevision = RequestedModeRevision
+                        RequestedMode = str(
+                            ControlState.get("RequestedSystemMode", SystemMode)
+                        ).upper()
+                        IsStopped = bool(
+                            str(ControlState.get("DisplayMode", "STOP")) == "STOP"
+                            and not ControlState.get("ScanEnabled", False)
+                        )
+                        if RequestedMode not in ("SIM", "HARD"):
+                            if hasattr(Display, "SetSystemModeApplicationResult"):
+                                Display.SetSystemModeApplicationResult(
+                                    False, "Invalid mode"
+                                )
+                        elif not IsStopped:
+                            if hasattr(Display, "SetSystemModeApplicationResult"):
+                                Display.SetSystemModeApplicationResult(
+                                    False, "Stop radar first"
+                                )
+                        elif RequestedMode != SystemMode:
+                            RestartSystemMode = RequestedMode
+                            if hasattr(Display, "SetSystemModeApplicationResult"):
+                                Display.SetSystemModeApplicationResult(
+                                    True, f"Restarting in {RequestedMode}"
+                                )
+                            print(
+                                f"System mode change requested: "
+                                f"{SystemMode} -> {RequestedMode}"
+                            )
+                            break
 
                 TimingApplication = ApplyTimingControlState(
                     Config=Config,
@@ -1044,6 +1115,12 @@ def Main(CommandLineArguments=None):
                     and ScanEnabled
                     and not (LastDisplayMode == "SCAN" and PreviousScanEnabled)
                 )
+                if ScanJustStarted:
+                    ScanStartPending = True
+                elif DisplayMode != "SCAN" or not ScanEnabled:
+                    # Cancel an unissued start if the operator stops again
+                    # before the next eligible radar dwell.
+                    ScanStartPending = False
 
                 # -------------------------------------------------------------
                 # Apply operator pointing intent before any RF/dwell gate.
@@ -1211,7 +1288,7 @@ def Main(CommandLineArguments=None):
                         if hasattr(Imu, "SetSimulatedAntennaPosition"):
                             Imu.SetSimulatedAntennaPosition(
                                 AzimuthDeg=float(X660AzDeg if X660Valid else CommandedBoresightDeg),
-                                ElevationDeg=float(Config.get("AntennaElDeg", Config.get("X660StartupElevationDeg", 55.0))),
+                                ElevationDeg=float(Config.get("AntennaElDeg", 0.0)),
                             )
 
                         ImuData = Imu.Read()
@@ -1286,12 +1363,13 @@ def Main(CommandLineArguments=None):
                 # Pointing.Stop() clears the active task. Reissue the search
                 # command on every transition into active SCAN, including from
                 # STOP or STARE when ScanEnabled remained true.
-                if ScanJustStarted:
+                if ScanStartPending:
                     print(
                         f"PointingManager scan start: "
                         f"{ScanStartDeg:.2f} -> {ScanStopDeg:.2f}"
                     )
                     Pointing.ActivateTask(SearchTask, NavigationAttitude)
+                    ScanStartPending = False
 
                 ScheduledTask = Scheduler.GetNextTask(
                     current_time_sec=NowDwellSec,
@@ -1462,6 +1540,16 @@ def Main(CommandLineArguments=None):
             pass
 
         Source.Shutdown()
+
+    if RestartSystemMode is not None:
+        ModeArgument = (
+            "--system-hard" if RestartSystemMode == "HARD"
+            else "--system-sim"
+        )
+        os.execv(
+            sys.executable,
+            [sys.executable, os.path.abspath(__file__), ModeArgument],
+        )
 
 
 if __name__ == "__main__":

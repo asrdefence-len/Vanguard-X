@@ -40,8 +40,9 @@ from RangeProfileScaling import (
     CalculateNoiseReferencedRangeProfileLimits,
     SelectRangeProfileDb,
 )
+from RadarMapOverlay import RadarCentredMap
 
-DISPLAY_VERSION = "tracks-white-surface-symbol-v7-side-by-side-target"
+DISPLAY_VERSION = "tracks-white-surface-symbol-v9-radar-centred-map"
 
 # Force pyqtgraph to use the conda PyQt5 binding.
 # This avoids macOS/Anaconda failures when a pip PyQt6 install is also present.
@@ -83,6 +84,13 @@ class RadarDisplay:
 
         self.DisplayMode = self.Config.get("InitialDisplayMode", "STOP")
         self.ScanEnabled = bool(self.Config.get("InitialScanEnabled", False))
+
+        # Complete system selection.  Main consumes a new revision only while
+        # STOPPED, shuts down cleanly, and restarts with matching radar and
+        # X6-60 adapters.
+        self.SystemMode = str(Config.get("SystemMode", "SIM")).upper()
+        self.RequestedSystemMode = self.SystemMode
+        self.SystemModeRevision = 0
 
         self.BeamAngleDeg = float(Config.get("InitialBeamAngleDeg", 0.0))
         self.ManualBeamStepDeg = float(Config.get("ManualBeamStepDeg", 2.0))
@@ -168,6 +176,7 @@ class RadarDisplay:
         # Degree labels around the PPI/polar plot. This is a Cartesian PPI,
         # so labels are drawn manually around the outside range ring.
         self.ShowPolarDegreeLabels = bool(Config.get("ShowPolarDegreeLabels", True))
+        self.ShowPolarCardinalLabels = bool(Config.get("ShowPolarCardinalLabels", True))
         self.PolarDegreeLabelStepDeg = float(Config.get("PolarDegreeLabelStepDeg", 10.0))
         self.PolarDegreeLabelRadiusFraction = float(Config.get("PolarDegreeLabelRadiusFraction", 0.985))
 
@@ -283,6 +292,18 @@ class RadarDisplay:
         self.BoundaryColour = "#808080"
         self.RingColour = Config.get("RangeRingColour", "#505050")
 
+        # Offline, North-up, radar-centred map. Live GPS can later call
+        # SetRadarPosition() without changing the display architecture.
+        self.MapEnabled = bool(Config.get("MapEnabled", False))
+        self.MapLatitudeDeg = float(Config.get("MapLatitudeDeg", -34.368))
+        self.MapLongitudeDeg = float(Config.get("MapLongitudeDeg", 150.929))
+        self.MapDatasetPath = str(Config.get("MapDatasetPath", "BellambiRegionalMap.json"))
+        self.MapLandColour = Config.get("MapLandColour", (92, 92, 92, 105))
+        self.MapCoastColour = Config.get("MapCoastColour", (255, 255, 255, 190))
+        self.MapLabelColour = Config.get("MapLabelColour", (255, 255, 255, 180))
+        self.MapOverlay = None
+        self.MapGraphicsItems = []
+
         # Optional logo. Path is relative to the folder you run the script from,
         # or it may be an absolute path.
         self.LogoPath = Config.get("LogoPath", "")
@@ -393,7 +414,18 @@ class RadarDisplay:
             "SelectedPulsesPerCpi": self.SelectedPulsesPerCpi,
             "SelectedMaximumRangeM": self.SelectedMaximumRangeM,
             "TimingSelectionRevision": self.TimingSelectionRevision,
+            "SystemMode": self.SystemMode,
+            "RequestedSystemMode": self.RequestedSystemMode,
+            "SystemModeRevision": self.SystemModeRevision,
         }
+
+    def SetSystemModeApplicationResult(self, Applied, Message):
+        """Report a system-mode request accepted or rejected by Main."""
+
+        if hasattr(self, "SystemModeFeedbackLabel"):
+            Colour = "#00ff66" if Applied else "#ff6666"
+            self.SystemModeFeedbackLabel.setStyleSheet(f"color: {Colour};")
+            self.SystemModeFeedbackLabel.setText(str(Message))
 
     def SetMeasuredBeamAngle(self, AzimuthDeg):
         """Refresh the PPI beam from measured X6-60 encoder telemetry.
@@ -674,6 +706,22 @@ class RadarDisplay:
         self.ControlWidgets["SaveDataEnabled"].setChecked(self.SaveDataEnabled)
         self.ControlWidgets["SaveDataEnabled"].setMaximumWidth(70)
 
+        self.ControlWidgets["SystemMode"] = QtWidgets.QComboBox()
+        self.ControlWidgets["SystemMode"].addItems(["SIM", "HARD"])
+        self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
+        self.ControlWidgets["SystemMode"].setMinimumWidth(72)
+        self.ControlWidgets["SystemMode"].setMaximumWidth(82)
+        self.ControlWidgets["SystemMode"].setStyleSheet(
+            "QComboBox { color: #00ff66; font-weight: bold; }"
+            if self.SystemMode == "SIM"
+            else "QComboBox { color: #ffb347; font-weight: bold; }"
+        )
+        self.ControlWidgets["SystemMode"].currentTextChanged.connect(
+            self.OnSystemModeChanged
+        )
+        self.SystemModeFeedbackLabel = QtWidgets.QLabel("Active")
+        self.SystemModeFeedbackLabel.setStyleSheet("color: #bfbfbf;")
+
         self.ControlWidgets["WaveformId"] = QtWidgets.QComboBox()
         self.ControlWidgets["WaveformId"].addItems(
             self.AvailableWaveformIds
@@ -766,6 +814,9 @@ class RadarDisplay:
         Layout.addWidget(FileLabel, 4, 0)
         Layout.addWidget(self.ControlWidgets["DataLogFilename"], 4, 1, 1, 2)
         Layout.addWidget(self.ControlWidgets["SaveDataEnabled"], 4, 3)
+        Layout.addWidget(QtWidgets.QLabel("Mode"), 4, 6)
+        Layout.addWidget(self.ControlWidgets["SystemMode"], 4, 7)
+        Layout.addWidget(self.SystemModeFeedbackLabel, 4, 8)
 
         # A compact third functional column uses the previously empty width.
         # The sixth row replaces the removed Auto-min control, keeping the
@@ -783,7 +834,7 @@ class RadarDisplay:
         Layout.addWidget(self.TimingSummaryLabel, 5, 0, 1, 6)
 
         # Prevent the grid columns expanding controls across the full side panel.
-        for Column in range(6):
+        for Column in range(9):
             Layout.setColumnStretch(Column, 0)
 
         self.UpdateTimingSummary()
@@ -791,6 +842,8 @@ class RadarDisplay:
         return Box
 
     def CreateStaticPpiItems(self):
+        self.CreateMapOverlay()
+
         # Static range rings.
         if self.RangeRingStepM > 0:
             RingRanges = np.arange(
@@ -859,6 +912,88 @@ class RadarDisplay:
 
         self.UpdateBeamLine()
 
+    def CreateMapOverlay(self):
+        """Draw the cached regional map beneath all radar PPI layers."""
+        if not self.MapEnabled:
+            return
+
+        dataset_path = self.MapDatasetPath
+        if not os.path.isabs(dataset_path):
+            dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), dataset_path)
+
+        try:
+            self.MapOverlay = RadarCentredMap(
+                dataset_path,
+                self.MapLatitudeDeg,
+                self.MapLongitudeDeg,
+            )
+            coastlines = self.MapOverlay.ProjectCoastlines()
+            land_polygons = self.MapOverlay.ProjectLandPolygons()
+        except Exception as error:
+            print(f"Map overlay disabled: {error}")
+            self.MapOverlay = None
+            return
+
+        if not coastlines:
+            return
+
+        clip_path = QtGui.QPainterPath()
+        radius_m = self.PolarMaxRangeM
+        clip_path.addEllipse(QtCore.QPointF(0.0, 0.0), radius_m, radius_m)
+        for polygon in land_polygons:
+            if len(polygon) < 3:
+                continue
+            land_path = QtGui.QPainterPath(QtCore.QPointF(*polygon[0]))
+            for east_m, north_m in polygon[1:]:
+                land_path.lineTo(east_m, north_m)
+            land_path.closeSubpath()
+            land_item = QtWidgets.QGraphicsPathItem(land_path.intersected(clip_path))
+            land_item.setPen(pg.mkPen(None))
+            land_item.setBrush(pg.mkBrush(*self.MapLandColour))
+            land_item.setZValue(-100.0)
+            self.PpiPlot.addItem(land_item)
+            self.MapGraphicsItems.append(land_item)
+
+        for coastline in coastlines:
+            coast_item = self.PpiPlot.plot(
+                [point[0] for point in coastline],
+                [point[1] for point in coastline],
+                pen=pg.mkPen(self.MapCoastColour, width=1),
+            )
+            coast_item.setZValue(-90.0)
+            self.MapGraphicsItems.append(coast_item)
+
+        for name, east_m, north_m in self.MapOverlay.ProjectLabels(self.PolarMaxRangeM):
+            label = pg.TextItem(name, color=self.MapLabelColour, anchor=(0.5, 0.5))
+            label.setPos(east_m, north_m)
+            label.setZValue(-80.0)
+            self.PpiPlot.addItem(label)
+            self.MapGraphicsItems.append(label)
+
+        attribution = pg.TextItem(
+            "Map: © OpenStreetMap contributors",
+            color=(185, 185, 185, 150),
+            anchor=(0.0, 1.0),
+        )
+        attribution.setPos(-0.96 * radius_m, -0.96 * radius_m)
+        attribution.setZValue(-70.0)
+        self.PpiPlot.addItem(attribution)
+        self.MapGraphicsItems.append(attribution)
+
+    def SetRadarPosition(self, latitude_deg, longitude_deg):
+        """Future GPS entry point; keep radar centred and move the map."""
+        self.MapLatitudeDeg = float(latitude_deg)
+        self.MapLongitudeDeg = float(longitude_deg)
+        if self.MapOverlay is None:
+            return
+        for item in self.MapGraphicsItems:
+            try:
+                self.PpiPlot.removeItem(item)
+            except Exception:
+                pass
+        self.MapGraphicsItems = []
+        self.CreateMapOverlay()
+
     @staticmethod
     def CreateSurfaceVesselSymbolPath():
         """
@@ -903,7 +1038,7 @@ class RadarDisplay:
     # ------------------------------------------------------------------
 
     def UpdatePolarDegreeLabels(self):
-        """Draw degree labels around the outside of the PPI display."""
+        """Draw North-up, clockwise-positive bearing labels around the PPI."""
         if self.PpiPlot is None:
             return
 
@@ -914,26 +1049,52 @@ class RadarDisplay:
                 pass
         self.PolarDegreeLabelItems = []
 
-        if not self.ShowPolarDegreeLabels:
+        if not self.ShowPolarDegreeLabels and not self.ShowPolarCardinalLabels:
             return
 
         StepDeg = max(1.0, float(self.PolarDegreeLabelStepDeg))
         LabelRadius = float(self.PolarMaxRangeM) * float(self.PolarDegreeLabelRadiusFraction)
+        CardinalLabels = {
+            0.0: "N\n0°",
+            90.0: "E\n90°",
+            180.0: "S\n180°",
+            270.0: "W\n270°",
+        }
 
         # Keep labels just inside the outside ring so they remain visible
-        # inside the fixed plot range.
-        AngleDeg = 0.0
-        while AngleDeg < 360.0:
-            X, Y = self.AngleRangeToXY(AngleDeg, LabelRadius)
-            Label = pg.TextItem(
-                f"{int(round(AngleDeg))}°",
-                color=self.MutedTextColour,
-                anchor=(0.5, 0.5),
-            )
-            Label.setPos(X, Y)
-            self.PpiPlot.addItem(Label)
-            self.PolarDegreeLabelItems.append(Label)
-            AngleDeg += StepDeg
+        # inside the fixed plot range. Cardinal labels are drawn separately so
+        # N/E/S/W remain visible even when the degree-label interval changes.
+        if self.ShowPolarDegreeLabels:
+            AngleDeg = 0.0
+            while AngleDeg < 360.0:
+                NormalisedAngleDeg = float(AngleDeg % 360.0)
+                IsCardinal = any(
+                    math.isclose(NormalisedAngleDeg, CardinalDeg, abs_tol=1.0e-9)
+                    for CardinalDeg in CardinalLabels
+                )
+                if not (self.ShowPolarCardinalLabels and IsCardinal):
+                    X, Y = self.AngleRangeToXY(NormalisedAngleDeg, LabelRadius)
+                    Label = pg.TextItem(
+                        f"{int(round(NormalisedAngleDeg))}°",
+                        color=self.MutedTextColour,
+                        anchor=(0.5, 0.5),
+                    )
+                    Label.setPos(X, Y)
+                    self.PpiPlot.addItem(Label)
+                    self.PolarDegreeLabelItems.append(Label)
+                AngleDeg += StepDeg
+
+        if self.ShowPolarCardinalLabels:
+            for AngleDeg, LabelText in CardinalLabels.items():
+                X, Y = self.AngleRangeToXY(AngleDeg, LabelRadius)
+                Label = pg.TextItem(
+                    LabelText,
+                    color=self.TextColour,
+                    anchor=(0.5, 0.5),
+                )
+                Label.setPos(X, Y)
+                self.PpiPlot.addItem(Label)
+                self.PolarDegreeLabelItems.append(Label)
 
     def UpdateSectorBoundaryLines(self):
         """Redraw the scan-sector boundary lines after scan limits change."""
@@ -1642,6 +1803,46 @@ class RadarDisplay:
         self.UpdateTimingSummary()
         self.UpdateStatusPanel()
 
+    def OnSystemModeChanged(self, Mode):
+        """Request a complete SIM/HARD restart, but only from STOP."""
+
+        Requested = str(Mode).upper()
+        if Requested == self.SystemMode:
+            return
+
+        if self.DisplayMode != "STOP" or self.ScanEnabled:
+            QtWidgets.QMessageBox.warning(
+                None,
+                "Stop radar first",
+                "SIM/HARD mode can only be changed while the radar is stopped.",
+            )
+            self.ControlWidgets["SystemMode"].blockSignals(True)
+            self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
+            self.ControlWidgets["SystemMode"].blockSignals(False)
+            return
+
+        if Requested == "HARD":
+            Answer = QtWidgets.QMessageBox.question(
+                None,
+                "Enable Vanguard X hardware",
+                "HARD will restart the application, connect the Ettus in "
+                "receive-only mode, and enable operational X6-60 motion.\n\n"
+                "TX remains inhibited. Confirm the X6-60 motion area is clear "
+                "and the hardware is ready.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if Answer != QtWidgets.QMessageBox.Yes:
+                self.ControlWidgets["SystemMode"].blockSignals(True)
+                self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
+                self.ControlWidgets["SystemMode"].blockSignals(False)
+                return
+
+        self.RequestedSystemMode = Requested
+        self.SystemModeRevision += 1
+        self.SystemModeFeedbackLabel.setStyleSheet("color: #ffb347;")
+        self.SystemModeFeedbackLabel.setText("Restart requested")
+
     def OnRangeProfileMaxDbChanged(self):
         try:
             NewMaxDb = float(self.ControlWidgets["RangeProfileMaxDb"].text())
@@ -1683,7 +1884,13 @@ class RadarDisplay:
 
     @staticmethod
     def AngleRangeToXY(AngleDeg, RangeM):
+        """Convert radar bearing/range to East/North Cartesian coordinates.
+
+        Vanguard X uses the conventional North-up PPI convention: 0 degrees
+        is North (positive Y), 90 degrees is East (positive X), and bearing
+        increases clockwise.
+        """
         AngleRad = np.deg2rad(AngleDeg)
-        X = RangeM * np.cos(AngleRad)
-        Y = RangeM * np.sin(AngleRad)
+        X = RangeM * np.sin(AngleRad)
+        Y = RangeM * np.cos(AngleRad)
         return float(X), float(Y)

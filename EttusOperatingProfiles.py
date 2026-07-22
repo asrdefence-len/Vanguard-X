@@ -100,7 +100,75 @@ def ParseOperatingProfileArguments(argv=None):
         "--i-confirm-atr-cro-verified",
         action="store_true",
     )
+
+    # X6-60 operational motion is selected for one application session. These
+    # options are independent of the Ettus RF profile, so receive-only radar
+    # operation can still use the real motor and encoder.
+    parser.add_argument(
+        "--x660-operational",
+        action="store_true",
+        help="connect PointingManager to the real X6-60 CAN motion controller",
+    )
+    parser.add_argument(
+        "--i-understand-x660-motion-will-occur",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--i-confirm-x660-motion-area-is-clear",
+        action="store_true",
+    )
     return parser.parse_args(argv)
+
+
+def ApplyX660OperatingProfile(config, arguments):
+    """Apply one explicit operational X6-60 session or remain read-only."""
+
+    Selected = bool(getattr(arguments, "x660_operational", False))
+    UnderstandsMotion = bool(getattr(
+        arguments,
+        "i_understand_x660_motion_will_occur",
+        False,
+    ))
+    AreaIsClear = bool(getattr(
+        arguments,
+        "i_confirm_x660_motion_area_is_clear",
+        False,
+    ))
+
+    if not Selected:
+        if UnderstandsMotion or AreaIsClear:
+            raise ValueError(
+                "X6-60 motion acknowledgements require --x660-operational"
+            )
+        CurrentMode = str(config.get("X660Mode", "x660-read-only")).lower()
+        if CurrentMode in (
+            "x660-operational",
+            "x6-60-operational",
+            "x660-live",
+            "x6-60-live",
+        ):
+            config["X660Mode"] = "x660-read-only"
+        config["X660MotionEnabled"] = False
+        config["X660IUnderstandMotionWillOccur"] = False
+        config["X660IConfirmMotionAreaIsClear"] = False
+        if CurrentMode in ("sim", "x660-sim", "x6-60-sim", "simulated"):
+            return "X660_SIMULATED"
+        return "X660_READ_ONLY"
+
+    if not UnderstandsMotion:
+        raise ValueError(
+            "Missing --i-understand-x660-motion-will-occur"
+        )
+    if not AreaIsClear:
+        raise ValueError(
+            "Missing --i-confirm-x660-motion-area-is-clear"
+        )
+
+    config["X660Mode"] = "x660-operational"
+    config["X660MotionEnabled"] = True
+    config["X660IUnderstandMotionWillOccur"] = True
+    config["X660IConfirmMotionAreaIsClear"] = True
+    return "X660_OPERATIONAL"
 
 
 def _ValidateCommonLoopbackArguments(arguments, *, atr_enabled=False):

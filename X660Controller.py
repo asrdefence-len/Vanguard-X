@@ -272,6 +272,50 @@ def CreateX660Controller(Config):
             Debug=bool(Config.get("X660Debug", False)),
         )
 
+    if Mode in (
+        "x660-operational",
+        "x6-60-operational",
+        "x660-live",
+        "x6-60-live",
+    ):
+        from X660OperationalController import X660OperationalController
+
+        return X660OperationalController(
+            Interface=str(Config.get("X660CanInterface", "can0")),
+            NodeId=int(Config.get("X660NodeId", 1)),
+            TimeoutSec=float(Config.get("X660CanTimeoutSec", 0.25)),
+            QueryIntervalSec=float(
+                Config.get("X660TelemetryIntervalSec", 0.10)
+            ),
+            NorthRawAngleDeg=float(
+                Config.get("X660NorthRawAngleDeg", -361.53)
+            ),
+            DirectionSign=int(Config.get("X660DirectionSign", 0)),
+            MaxPanRateDegPerSec=float(
+                Config.get("X660OperationalMaxRateDegPerSec", 14.0)
+            ),
+            PositionCommandSpeedDegPerSec=int(
+                Config.get("X660PositionCommandSpeedDegPerSec", 14)
+            ),
+            MaximumNudgeDeg=float(
+                Config.get("X660MaximumNudgeDeg", 10.0)
+            ),
+            PositionToleranceDeg=float(
+                Config.get("X660PositionToleranceDeg", 0.75)
+            ),
+            MotionEnabled=Config.get("X660MotionEnabled", False),
+            IUnderstandMotionWillOccur=Config.get(
+                "X660IUnderstandMotionWillOccur",
+                False,
+            ),
+            IConfirmMotionAreaIsClear=Config.get(
+                "X660IConfirmMotionAreaIsClear",
+                False,
+            ),
+            Debug=bool(Config.get("X660Debug", False)),
+        )
+
     raise ValueError(
-        f"Unknown X660Mode: {Mode!r}. Expected 'x660-read-only' or 'x660-sim'."
+        f"Unknown X660Mode: {Mode!r}. Expected 'x660-read-only', "
+        "'x660-operational', or 'x660-sim'."
     )
