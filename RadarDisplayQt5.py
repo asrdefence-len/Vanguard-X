@@ -42,7 +42,7 @@ from RangeProfileScaling import (
 )
 from RadarMapOverlay import RadarCentredMap
 
-DISPLAY_VERSION = "tracks-white-surface-symbol-v9-radar-centred-map"
+DISPLAY_VERSION = "tracks-white-surface-symbol-v10-radar-link"
 
 # Force pyqtgraph to use the conda PyQt5 binding.
 # This avoids macOS/Anaconda failures when a pip PyQt6 install is also present.
@@ -81,6 +81,7 @@ class RadarDisplay:
         ) and self.TransmitAvailable
         self.ExitRequested = False
         self.UpdateCounter = 0
+        self.RadarLinkStatus = str(Config.get("RadarLinkStatus", "LOCAL"))
 
         self.DisplayMode = self.Config.get("InitialDisplayMode", "STOP")
         self.ScanEnabled = bool(self.Config.get("InitialScanEnabled", False))
@@ -427,6 +428,12 @@ class RadarDisplay:
             self.SystemModeFeedbackLabel.setStyleSheet(f"color: {Colour};")
             self.SystemModeFeedbackLabel.setText(str(Message))
 
+    def SetRadarLinkStatus(self, Connected, Message):
+        """Update the operator-visible radar server connection state."""
+
+        self.RadarLinkStatus = str(Message)
+        self.UpdateStatusPanel()
+
     def SetMeasuredBeamAngle(self, AzimuthDeg):
         """Refresh the PPI beam from measured X6-60 encoder telemetry.
 
@@ -707,10 +714,10 @@ class RadarDisplay:
         self.ControlWidgets["SaveDataEnabled"].setMaximumWidth(70)
 
         self.ControlWidgets["SystemMode"] = QtWidgets.QComboBox()
-        self.ControlWidgets["SystemMode"].addItems(["SIM", "HARD"])
+        self.ControlWidgets["SystemMode"].addItems(["SIM", "HARD", "RF LOOPBACK"])
         self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
         self.ControlWidgets["SystemMode"].setMinimumWidth(72)
-        self.ControlWidgets["SystemMode"].setMaximumWidth(82)
+        self.ControlWidgets["SystemMode"].setMaximumWidth(125)
         self.ControlWidgets["SystemMode"].setStyleSheet(
             "QComboBox { color: #00ff66; font-weight: bold; }"
             if self.SystemMode == "SIM"
@@ -1353,15 +1360,28 @@ class RadarDisplay:
             return
 
         Processed = self.LatestProcessed
-        if not hasattr(Processed, "MagnitudeDb") or not hasattr(Processed, "RangeAxisM"):
+        HasRemoteProfile = hasattr(Processed, "DisplayRangeProfileDb")
+        if (
+            not hasattr(Processed, "RangeAxisM")
+            or (not HasRemoteProfile and not hasattr(Processed, "MagnitudeDb"))
+        ):
             return
 
         try:
-            RangeProfileDb = SelectRangeProfileDb(
-                Processed.MagnitudeDb,
-                getattr(Processed, "DopplerAxisHz", None),
-                Mode=self.RangeProfileDopplerMode,
-            )
+            if HasRemoteProfile:
+                # The radar-server worker has already selected and peak-pooled
+                # a bounded display profile. Raw IQ/range-Doppler data never
+                # crosses the operator link.
+                RangeProfileDb = np.asarray(
+                    Processed.DisplayRangeProfileDb,
+                    dtype=float,
+                )
+            else:
+                RangeProfileDb = SelectRangeProfileDb(
+                    Processed.MagnitudeDb,
+                    getattr(Processed, "DopplerAxisHz", None),
+                    Mode=self.RangeProfileDopplerMode,
+                )
             RangeAxisM = np.asarray(Processed.RangeAxisM)
         except Exception:
             return
@@ -1618,6 +1638,7 @@ class RadarDisplay:
         Lines = [
             "Vanguard X Radar",
             "----------------",
+            f"Link:   {self.RadarLinkStatus}",
             f"Mode:   {self.DisplayMode}",
             f"Scan:   {self.ScanEnabled}",
             f"Tx:     {TransmitStatus}",
@@ -1804,7 +1825,7 @@ class RadarDisplay:
         self.UpdateStatusPanel()
 
     def OnSystemModeChanged(self, Mode):
-        """Request a complete SIM/HARD restart, but only from STOP."""
+        """Request a complete system-mode restart, but only from STOP."""
 
         Requested = str(Mode).upper()
         if Requested == self.SystemMode:
@@ -1814,7 +1835,7 @@ class RadarDisplay:
             QtWidgets.QMessageBox.warning(
                 None,
                 "Stop radar first",
-                "SIM/HARD mode can only be changed while the radar is stopped.",
+                "System mode can only be changed while the radar is stopped.",
             )
             self.ControlWidgets["SystemMode"].blockSignals(True)
             self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
@@ -1829,6 +1850,27 @@ class RadarDisplay:
                 "receive-only mode, and enable operational X6-60 motion.\n\n"
                 "TX remains inhibited. Confirm the X6-60 motion area is clear "
                 "and the hardware is ready.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if Answer != QtWidgets.QMessageBox.Yes:
+                self.ControlWidgets["SystemMode"].blockSignals(True)
+                self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
+                self.ControlWidgets["SystemMode"].blockSignals(False)
+                return
+
+        if Requested == "RF LOOPBACK":
+            Answer = QtWidgets.QMessageBox.warning(
+                None,
+                "Enable guarded RF loopback",
+                "RF LOOPBACK enables timed Ettus RF transmission.\n\n"
+                "Confirm ALL of the following:\n"
+                "• TX/RX is connected to RX2 through at least 30 dB attenuation.\n"
+                "• TRM, PA and antenna are disconnected or physically isolated.\n"
+                "• The X6-60 will remain stopped.\n"
+                "• Both external TX ATR and RX ATR must be forced low and "
+                "verified before TX is prepared.\n\n"
+                "Continue?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No,
             )

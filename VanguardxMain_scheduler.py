@@ -60,7 +60,7 @@ from RadarProcessor import RadarProcessor
 from CfarDetector import CfarDetector
 from RadarTracker import RadarTracker
 from SimpleDisplay import SimpleDisplay
-from RadarDisplayQt5 import RadarDisplay
+from RadarRemoteDisplay import RadarRemoteDisplay
 from DataLogger import DataLogger
 from EttusRadarSource import EttusRadarSource
 from EttusOperatingProfiles import (
@@ -95,20 +95,70 @@ from TargetScenario import (
 # Helper functions
 # -----------------------------------------------------------------------------
 
+def ParseUiArguments(CommandLineArguments=None):
+    """Remove radar/UI transport options before operating-profile parsing.
+
+    Local Qt remains the default. ``--remote-ui`` makes this process the
+    headless radar TCP server; the separate RunVanguardUiClient.py process then
+    owns Qt.  Binding defaults to loopback until authenticated LAN operation is
+    introduced deliberately.
+    """
+
+    Arguments = list(
+        sys.argv[1:] if CommandLineArguments is None else CommandLineArguments
+    )
+    Options = {
+        "DisplayTransport": "LOCAL_QT",
+        "RadarLinkHost": "127.0.0.1",
+        "RadarLinkPort": 5810,
+    }
+    Filtered = []
+    Index = 0
+    while Index < len(Arguments):
+        Argument = Arguments[Index]
+        if Argument == "--remote-ui":
+            Options["DisplayTransport"] = "TCP_SERVER"
+            Index += 1
+            continue
+        if Argument in ("--radar-link-host", "--radar-link-port"):
+            if Index + 1 >= len(Arguments):
+                raise ValueError(f"{Argument} requires a value")
+            Value = Arguments[Index + 1]
+            if Argument == "--radar-link-host":
+                Options["RadarLinkHost"] = str(Value)
+            else:
+                Options["RadarLinkPort"] = int(Value)
+            Index += 2
+            continue
+        Filtered.append(Argument)
+        Index += 1
+    return Options, Filtered
+
 def ParseSystemModeArguments(CommandLineArguments=None):
-    """Remove the top-level SIM/HARD selection before profile parsing."""
+    """Remove the top-level SIM/HARD/RF LOOPBACK selection."""
 
     Arguments = list(
         sys.argv[1:] if CommandLineArguments is None else CommandLineArguments
     )
     SimSelected = "--system-sim" in Arguments
     HardSelected = "--system-hard" in Arguments
-    if SimSelected and HardSelected:
-        raise ValueError("Select only one of --system-sim or --system-hard")
+    LoopbackSelected = "--system-rf-loopback" in Arguments
+    LoopbackSafetyConfirmed = "--i-confirm-rf-loopback-safety" in Arguments
+    if sum((SimSelected, HardSelected, LoopbackSelected)) > 1:
+        raise ValueError("Select only one system mode")
+    if LoopbackSelected and not LoopbackSafetyConfirmed:
+        raise ValueError(
+            "RF LOOPBACK requires --i-confirm-rf-loopback-safety"
+        )
     Filtered = [
         Argument for Argument in Arguments
-        if Argument not in ("--system-sim", "--system-hard")
+        if Argument not in (
+            "--system-sim", "--system-hard", "--system-rf-loopback",
+            "--i-confirm-rf-loopback-safety",
+        )
     ]
+    if LoopbackSelected:
+        return "RF LOOPBACK", Filtered
     return ("HARD" if HardSelected else "SIM"), Filtered
 
 def BuildRadarParamsForScenario(Config):
@@ -137,7 +187,13 @@ def SelectDisplay(Config):
     SimpleDisplay is kept as a fallback engineering display.
     """
 
+    if str(Config.get("DisplayTransport", "LOCAL_QT")).upper() == "TCP_SERVER":
+        return RadarRemoteDisplay(Config)
+
     if Config.get("DisplayType", "SimpleDisplay") == "RadarDisplay":
+        # Keep Qt out of the radar-server process.  This local import is only
+        # reached by the backwards-compatible single-process mode.
+        from RadarDisplayQt5 import RadarDisplay
         return RadarDisplay(Config)
 
     return SimpleDisplay(Config)
@@ -324,10 +380,26 @@ def ExecuteRadarDwell(
     """
 
     T0 = time.perf_counter()
-    ExecutionResult = Executor.ExecuteTaskStep(
-        task=ScheduledTask,
-        navigation=NavigationAttitude,
+    BeginRadarTimingCritical = getattr(
+        Display,
+        "BeginRadarTimingCritical",
+        None,
     )
+    EndRadarTimingCritical = getattr(
+        Display,
+        "EndRadarTimingCritical",
+        None,
+    )
+    if callable(BeginRadarTimingCritical):
+        BeginRadarTimingCritical()
+    try:
+        ExecutionResult = Executor.ExecuteTaskStep(
+            task=ScheduledTask,
+            navigation=NavigationAttitude,
+        )
+    finally:
+        if callable(EndRadarTimingCritical):
+            EndRadarTimingCritical()
     T1 = time.perf_counter()
 
     if not ExecutionResult.Executed:
@@ -432,8 +504,9 @@ def Main(CommandLineArguments=None):
     # Configuration dictionary
     # -------------------------------------------------------------------------
 
+    UiOptions, ArgumentsWithoutUi = ParseUiArguments(CommandLineArguments)
     SystemMode, ProfileArguments = ParseSystemModeArguments(
-        CommandLineArguments
+        ArgumentsWithoutUi
     )
     OperatingArguments = ParseOperatingProfileArguments(ProfileArguments)
 
@@ -587,6 +660,13 @@ def Main(CommandLineArguments=None):
         # Display controls
         # ---------------------------------------------------------------------
         "DisplayType": "RadarDisplay",
+        "DisplayTransport": UiOptions["DisplayTransport"],
+        "RadarLinkHost": UiOptions["RadarLinkHost"],
+        "RadarLinkPort": UiOptions["RadarLinkPort"],
+        # Prototype-safe policy: loss of the UI heartbeat stops scanning and
+        # inhibits TX. This can later become a mission-level operating policy.
+        "RadarLinkHeartbeatTimeoutSec": 2.0,
+        "RadarLinkMaxRangeProfilePoints": 1500,
 
         "UpdatePlots": True,
         "ShowRangeProfile": True,
@@ -689,11 +769,45 @@ def Main(CommandLineArguments=None):
     # The top-bar selector owns the complete adapter pairing.  HARD is
     # deliberately receive-only: it may move the X6-60, but never enables RF
     # transmission.  SIM never opens Ettus or SocketCAN.
-    if SystemMode == "HARD":
+    if SystemMode == "RF LOOPBACK":
+        Config.update({
+            "RadarSource": "ETTUS",
+            "EttusOperatingMode": "TIMED_TX_RX",
+            "EttusTimedTransmitEnabled": True,
+            "EttusRfOutputAcknowledged": True,
+            "EttusLoopbackConfirmed": True,
+            "EttusExternalAttenuationDb": 30.0,
+            # Preserve the verified Stage 3I RF path and gains.  This GUI
+            # profile differs only in keeping both ATR outputs forced low.
+            "EttusTxGainDb": 50.0,
+            "EttusRxGainDb": 30.0,
+            "EttusAtrGpioEnabled": False,
+            "EttusAtrIsolationRequired": True,
+            "EttusTrmPaAntennaIsolatedConfirmed": True,
+            "EttusAtrAllowOverlapForSimulation": False,
+            "Stage3E1LoopbackActive": True,
+            # Reproduce the proven delayed RF target-emulator test.  A fixed
+            # stationary target is emitted only while the simulated X6-60
+            # boresight is within +/-2 degrees of 80 degrees.
+            "EttusRfTargetEmulatorEnabled": True,
+            "EttusRfTargetUseScenario": False,
+            "EttusRfTargetRangeM": 6000.0,
+            "EttusRfTargetBearingDeg": 80.0,
+            "EttusRfTargetAngleHalfWidthDeg": 2.0,
+            "EttusRfTargetRadialVelocityMps": 0.0,
+            "EttusLoopbackHardwareDelaySamples": 166,
+            "RangeProfileDopplerMode": "ZERO_DOPPLER",
+            "InitialTransmitEnabled": False,
+            "X660Mode": "x660-sim",
+            "X660MotionEnabled": False,
+        })
+        OperatingProfile = "GUI_ATR_ISOLATED_LOOPBACK"
+    elif SystemMode == "HARD":
         Config["RadarSource"] = "ETTUS"
         Config["EttusOperatingMode"] = "RECEIVE_ONLY"
         Config["EttusTimedTransmitEnabled"] = False
         Config["EttusAtrGpioEnabled"] = False
+        Config["EttusAtrIsolationRequired"] = False
         Config["InitialTransmitEnabled"] = False
         Config["X660Mode"] = "x660-operational"
         Config["X660MotionEnabled"] = True
@@ -708,6 +822,18 @@ def Main(CommandLineArguments=None):
             "X6-60 OPERATIONAL MOTION SELECTED "
             "(clockwise-positive, encoder beam feedback enabled)"
         )
+    if OperatingProfile == "GUI_ATR_ISOLATED_LOOPBACK":
+        print("GUI_ATR_ISOLATED_LOOPBACK GUARDED PROFILE SELECTED")
+        print("  RF path:        TX/RX -> 30.0 dB or greater -> RX2")
+        print("  RF TX / RX:     TIMED / ENABLED")
+        print("  TX ATR:         FORCED LOW (manual GPIO, readback required)")
+        print("  RX ATR:         FORCED LOW (manual GPIO, readback required)")
+        print("  TRM / PA / ANT: DISCONNECTED OR PHYSICALLY ISOLATED")
+        print("  X6-60:          STOPPED (simulated adapter; no CAN motion)")
+        print("  TX/RX gains:    50.0 / 30.0 dB (verified Stage 3I values)")
+        print("  RF target:      FIXED POINT 6.000 km at 80.00 deg, 0.00 m/s")
+        print("  bearing gate:   80.00 deg +/-2.00 deg")
+        print("  calibrated delay: 166 samples")
     if OperatingProfile in (
         "STAGE3E1_LOOPBACK",
         "STAGE3F_RF_TARGET",
@@ -1013,7 +1139,7 @@ def Main(CommandLineArguments=None):
                             str(ControlState.get("DisplayMode", "STOP")) == "STOP"
                             and not ControlState.get("ScanEnabled", False)
                         )
-                        if RequestedMode not in ("SIM", "HARD"):
+                        if RequestedMode not in ("SIM", "HARD", "RF LOOPBACK"):
                             if hasattr(Display, "SetSystemModeApplicationResult"):
                                 Display.SetSystemModeApplicationResult(
                                     False, "Invalid mode"
@@ -1539,16 +1665,31 @@ def Main(CommandLineArguments=None):
         except Exception:
             pass
 
+        try:
+            if hasattr(Display, "Shutdown"):
+                Display.Shutdown()
+        except Exception:
+            pass
+
         Source.Shutdown()
 
     if RestartSystemMode is not None:
-        ModeArgument = (
-            "--system-hard" if RestartSystemMode == "HARD"
-            else "--system-sim"
-        )
+        ModeArgument = {
+            "HARD": "--system-hard",
+            "RF LOOPBACK": "--system-rf-loopback",
+        }.get(RestartSystemMode, "--system-sim")
+        RestartArguments = [ModeArgument]
+        if RestartSystemMode == "RF LOOPBACK":
+            RestartArguments.append("--i-confirm-rf-loopback-safety")
+        if str(Config.get("DisplayTransport", "LOCAL_QT")).upper() == "TCP_SERVER":
+            RestartArguments.extend([
+                "--remote-ui",
+                "--radar-link-host", str(Config.get("RadarLinkHost", "127.0.0.1")),
+                "--radar-link-port", str(int(Config.get("RadarLinkPort", 5810))),
+            ])
         os.execv(
             sys.executable,
-            [sys.executable, os.path.abspath(__file__), ModeArgument],
+            [sys.executable, os.path.abspath(__file__)] + RestartArguments,
         )
 
 
