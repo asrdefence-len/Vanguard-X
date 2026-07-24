@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import struct
@@ -26,6 +27,7 @@ except ImportError:
 
 import X660GuardedMotionTransport as GuardedTransport
 import X660MotionProtocol as MotionProtocol
+import X660PlannerProtocol as PlannerProtocol
 from EttusOperatingProfiles import (
     ApplyOperatingProfile,
     ApplyX660OperatingProfile,
@@ -42,6 +44,35 @@ from X660ReadOnlyController import X660ReadOnlyState
 class FakeBus:
     def __init__(self):
         self.shutdown_count = 0
+        self.planner_values = [1140, 1140, 1140, 1140]
+        self.requests = []
+        self.replies = deque()
+
+    def send(self, request, timeout):
+        data = bytes(request.data)
+        self.requests.append(data)
+        command = data[0]
+        index = data[1]
+        if command == PlannerProtocol.READ_PLANNER_PARAMETER:
+            reply_data = (
+                bytes([command, index, 0, 0])
+                + int(self.planner_values[index]).to_bytes(4, "little")
+            )
+        elif command == PlannerProtocol.WRITE_PLANNER_PARAMETER:
+            self.planner_values[index] = int.from_bytes(data[4:8], "little")
+            reply_data = data
+        else:
+            raise AssertionError(f"unexpected fake-bus command 0x{command:02X}")
+        self.replies.append(
+            GuardedTransport.CanFrame(
+                arbitration_id=0x241,
+                data=reply_data,
+                is_extended_id=False,
+            )
+        )
+
+    def recv(self, timeout):
+        return self.replies.popleft() if self.replies else None
 
     def shutdown(self):
         self.shutdown_count += 1
@@ -111,6 +142,22 @@ class RecordingTransportFactory:
         return self.Transport
 
 
+class RecordingPlannerInitialiserFactory:
+    def __init__(self, Failure):
+        self.Arguments = None
+        self.Failure = Failure
+
+    def __call__(self, **Arguments):
+        self.Arguments = Arguments
+        Failure = self.Failure
+
+        class FailingPlannerInitialiser:
+            def Initialise(self):
+                raise Failure
+
+        return FailingPlannerInitialiser()
+
+
 class RecordingShutdown:
     def __init__(self):
         self.Calls = []
@@ -167,6 +214,27 @@ class TestX660OperationalController(unittest.TestCase):
         self.assertFalse(Factory.Arguments["DryRun"])
         self.assertTrue(Factory.Arguments["IUnderstandMotionWillOccur"])
         self.assertTrue(Factory.Arguments["IConfirmMotionAreaIsClear"])
+        self.assertTrue(Controller.MotorReady)
+        self.assertEqual(
+            Controller.PlannerInitialisationResult.Values,
+            PlannerProtocol.VANGUARD_X_REQUIRED_VALUES,
+        )
+
+    def test_open_fails_closed_when_planner_initialisation_fails(self):
+        PlannerFactory = RecordingPlannerInitialiserFactory(
+            TimeoutError("injected planner timeout")
+        )
+        Controller, Telemetry, Transport, Factory, _ = MakeController(
+            PlannerInitialiserFactory=PlannerFactory,
+        )
+        with self.assertRaisesRegex(TimeoutError, "planner timeout"):
+            Controller.Open()
+        self.assertFalse(Controller.IsOpen)
+        self.assertFalse(Controller.MotorReady)
+        self.assertIsNone(Controller.Transport)
+        self.assertIsNone(Factory.Arguments)
+        self.assertEqual(Transport.Payloads, [])
+        self.assertEqual(Telemetry.close_count, 1)
 
     def test_clockwise_positive_slew_maps_through_calibrated_direction(self):
         for DirectionSign, ExpectedRawRate in ((+1, +6.0), (-1, -6.0)):
@@ -240,6 +308,7 @@ class TestX660OperationalController(unittest.TestCase):
         self.assertEqual(Shutdown.Calls[0][3], bytes.fromhex("80 00 00 00 00 00 00 00"))
         self.assertEqual(Telemetry.close_count, 1)
         self.assertFalse(Controller.IsOpen)
+        self.assertFalse(Controller.MotorReady)
 
     def test_reported_motor_error_stops_and_invalidates_state(self):
         Controller, Telemetry, Transport, _, _ = MakeController()
@@ -302,7 +371,15 @@ class TestX660OperationalController(unittest.TestCase):
         Source = (Path(__file__).parent / "VanguardxMain_scheduler.py").read_text()
         self.assertIn('"X660Mode": "x660-sim"', Source)
         self.assertIn('"X660MotionEnabled": False', Source)
-        self.assertIn('"X660OperationalMaxRateDegPerSec": 20.0', Source)
+        self.assertIn('"X660OperationalMaxRateDegPerSec": 60.0', Source)
+        self.assertIn(
+            '"X660PlannerInternalAccelerationDegPerSec2": 1140',
+            Source,
+        )
+        self.assertIn(
+            "Vanguard X startup aborted: operational X6-60 planner",
+            Source,
+        )
         self.assertIn("ApplyX660OperatingProfile", Source)
 
     def test_command_line_profile_enables_one_operational_session(self):

@@ -41,6 +41,7 @@ from RangeProfileScaling import (
     SelectRangeProfileDb,
 )
 from RadarMapOverlay import RadarCentredMap
+from MissionPage import MissionPage
 
 DISPLAY_VERSION = "tracks-white-surface-symbol-v10-radar-link"
 
@@ -107,6 +108,19 @@ class RadarDisplay:
         self.ScanStartDeg = float(Config.get("ScanStartDeg", -60.0))
         self.ScanStopDeg = float(Config.get("ScanStopDeg", 60.0))
         self.ScanStepDeg = float(Config.get("ScanStepDeg", 1.0))
+        self.MinScanRateDegPerSec = float(
+            Config.get("MinScanRateDegPerSec", 1.0)
+        )
+        self.MaxScanRateDegPerSec = float(
+            Config.get("X660OperationalMaxRateDegPerSec", 60.0)
+        )
+        self.ScanRateDegPerSec = float(
+            Config.get("X660ScanSlewRateDegPerSec", 20.0)
+        )
+        self.ScanRateDegPerSec = min(
+            max(self.ScanRateDegPerSec, self.MinScanRateDegPerSec),
+            self.MaxScanRateDegPerSec,
+        )
 
         # Operator timing selections. Editing widgets does not change the
         # running radar until Apply is pressed and Main validates the new
@@ -336,6 +350,12 @@ class RadarDisplay:
         self.ControlWidgets = {}
         self.TimingFeedbackLabel = None
         self.TimingSummaryLabel = None
+        self.MissionPage = None
+        self.OperatorHeaderModeLabel = None
+        self.OperatorHeaderTxLabel = None
+        self.OperatorHeaderAntennaLabel = None
+        self.OperatorHeaderMissionLabel = None
+        self.OperatorHeaderWarningLabel = None
 
         self.InitialiseWindow()
 
@@ -395,13 +415,14 @@ class RadarDisplay:
         """
         Return current operator control state.
         """
-        return {
+        state = {
             "DisplayMode": self.DisplayMode,
             "ScanEnabled": self.ScanEnabled,
             "BeamAngleDeg": self.BeamAngleDeg,
             "ScanStartDeg": self.ScanStartDeg,
             "ScanStopDeg": self.ScanStopDeg,
             "ScanStepDeg": self.ScanStepDeg,
+            "ScanRateDegPerSec": self.ScanRateDegPerSec,
             "TransmitAvailable": self.TransmitAvailable,
             "TransmitEnabled": self.TransmitEnabled,
             "ExitRequested": self.ExitRequested,
@@ -419,6 +440,29 @@ class RadarDisplay:
             "RequestedSystemMode": self.RequestedSystemMode,
             "SystemModeRevision": self.SystemModeRevision,
         }
+        if self.MissionPage is not None:
+            state.update(self.MissionPage.GetMissionControlState())
+        return state
+
+    def SetMissionRuntimeStatus(self, Status):
+        """Apply authoritative mission status returned by the radar process."""
+
+        status = dict(Status or {})
+        state = str(status.get("State", "STOPPED")).upper()
+        if self.MissionPage is not None:
+            self.MissionPage.SetRuntimeStatus(status)
+        if state in ("RUNNING_360", "RUNNING_SECTOR"):
+            self.DisplayMode = "SCAN"
+            self.ScanEnabled = True
+            if self.TransmitAvailable:
+                self.TransmitEnabled = True
+        elif state in (
+            "LOADED", "PAUSED", "COMPLETED", "ABORTED", "FAULTED",
+        ):
+            self.DisplayMode = "STOP"
+            self.ScanEnabled = False
+            self.TransmitEnabled = False
+        self.UpdateStatusPanel()
 
     def SetSystemModeApplicationResult(self, Applied, Message):
         """Report a system-mode request accepted or rejected by Main."""
@@ -502,8 +546,11 @@ class RadarDisplay:
 
     def InitialiseWindow(self):
         self.Window = QtWidgets.QMainWindow()
-        self.Window.setWindowTitle("Vanguard X Radar Display - PyQtGraph Clean Noise Logo File")
-        self.Window.resize(1500, 900)
+        self.Window.setWindowTitle("Vanguard X Radar and Mission Display")
+        # The original Radar page remains a 1500 x 900 layout.  The additional
+        # height accommodates the persistent status header and tab bar rather
+        # than taking space from the proven PPI/range-profile geometry.
+        self.Window.resize(1500, 970)
         self.Window.setStyleSheet(
             "QMainWindow { background-color: black; }"
             "QWidget { background-color: black; color: white; font-family: Arial; }"
@@ -511,6 +558,11 @@ class RadarDisplay:
             "QPushButton:hover { background-color: #404040; }"
             "QLineEdit { background-color: #101010; color: white; border: 1px solid #505050; padding: 2px 4px; }"
             "QComboBox, QSpinBox, QDoubleSpinBox { background-color: #101010; color: white; border: 1px solid #505050; padding: 2px 4px; }"
+            "QTableWidget, QPlainTextEdit { background-color: #050505; color: white; border: 1px solid #303030; }"
+            "QHeaderView::section { background-color: #202020; color: white; border: 1px solid #404040; padding: 4px; }"
+            "QTabWidget::pane { border: 1px solid #303030; }"
+            "QTabBar::tab { background-color: #151515; color: #bfbfbf; border: 1px solid #404040; padding: 7px 18px; }"
+            "QTabBar::tab:selected { background-color: #303030; color: white; }"
             "QLabel { color: white; }"
         )
 
@@ -604,7 +656,22 @@ class RadarDisplay:
 
         # Range-Doppler panel removed for compact high-speed display.
 
-        self.Window.setCentralWidget(CentralWidget)
+        # The existing display is kept intact as the Radar page. Mission
+        # planning lives in the same Qt application but in a separate tab.
+        # MissionPage has no direct radar, antenna, or hardware interface.
+        RootWidget = QtWidgets.QWidget()
+        RootLayout = QtWidgets.QVBoxLayout(RootWidget)
+        RootLayout.setContentsMargins(6, 6, 6, 6)
+        RootLayout.setSpacing(5)
+        RootLayout.addWidget(self.CreatePersistentOperatorHeader())
+
+        self.OperatorTabs = QtWidgets.QTabWidget()
+        self.OperatorTabs.addTab(CentralWidget, "Radar")
+        self.MissionPage = MissionPage(self.Config)
+        self.MissionPage.statusChanged.connect(self.UpdatePersistentOperatorHeader)
+        self.OperatorTabs.addTab(self.MissionPage, "Mission")
+        RootLayout.addWidget(self.OperatorTabs, stretch=1)
+        self.Window.setCentralWidget(RootWidget)
 
         self.CreateStaticPpiItems()
         self.RangeProfileCurve = self.RangePlot.plot(
@@ -622,6 +689,90 @@ class RadarDisplay:
 
         self.Window.show()
         self.App.processEvents()
+
+    def CreatePersistentOperatorHeader(self):
+        """Create the compact status and STOP strip visible from both tabs."""
+
+        header = QtWidgets.QFrame()
+        header.setStyleSheet(
+            "QFrame { background-color: #050505; border: 1px solid #303030; }"
+            "QLabel { border: none; font-family: Menlo, Consolas, monospace; }"
+        )
+        layout = QtWidgets.QHBoxLayout(header)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(16)
+
+        title = QtWidgets.QLabel("VANGUARD X")
+        title.setStyleSheet(
+            "border: none; font-size: 15px; font-weight: bold; color: white;"
+        )
+        layout.addWidget(title)
+
+        self.OperatorHeaderModeLabel = QtWidgets.QLabel()
+        self.OperatorHeaderTxLabel = QtWidgets.QLabel()
+        self.OperatorHeaderAntennaLabel = QtWidgets.QLabel()
+        self.OperatorHeaderMissionLabel = QtWidgets.QLabel()
+        self.OperatorHeaderWarningLabel = QtWidgets.QLabel()
+        for label in (
+            self.OperatorHeaderModeLabel,
+            self.OperatorHeaderTxLabel,
+            self.OperatorHeaderAntennaLabel,
+            self.OperatorHeaderMissionLabel,
+        ):
+            layout.addWidget(label)
+        layout.addWidget(self.OperatorHeaderWarningLabel, stretch=1)
+
+        stop_button = QtWidgets.QPushButton("STOP")
+        stop_button.setMinimumWidth(110)
+        stop_button.setStyleSheet(
+            "QPushButton { background-color: #8b0000; color: white; "
+            "font-weight: bold; border: 2px solid #ff6666; padding: 5px 18px; }"
+            "QPushButton:hover { background-color: #c00000; }"
+        )
+        stop_button.clicked.connect(self.OnStop)
+        layout.addWidget(stop_button)
+        self.UpdatePersistentOperatorHeader()
+        return header
+
+    def UpdatePersistentOperatorHeader(self):
+        """Refresh persistent operator state without touching radar geometry."""
+
+        if self.OperatorHeaderModeLabel is None:
+            return
+        tx_text = (
+            "RX ONLY" if not self.TransmitAvailable
+            else ("TX ENABLED" if self.TransmitEnabled else "TX OFF")
+        )
+        mission_text = (
+            self.MissionPage.MissionStatusText()
+            if self.MissionPage is not None else "MISSION: unavailable"
+        )
+        self.OperatorHeaderModeLabel.setText(
+            f"SYSTEM {self.SystemMode} | {self.DisplayMode}"
+        )
+        self.OperatorHeaderTxLabel.setText(tx_text)
+        self.OperatorHeaderTxLabel.setStyleSheet(
+            "border: none; color: "
+            + ("#ff6666;" if self.TransmitEnabled else "#bfbfbf;")
+        )
+        self.OperatorHeaderAntennaLabel.setText(
+            f"AZ {self.BeamAngleDeg:06.2f} deg"
+        )
+        self.OperatorHeaderMissionLabel.setText(mission_text)
+        if "LOST" in self.RadarLinkStatus.upper():
+            self.OperatorHeaderWarningLabel.setText(
+                "LINK LOST - RADAR FAIL-STOP"
+            )
+            self.OperatorHeaderWarningLabel.setStyleSheet(
+                "border: none; color: #ff6666; font-weight: bold;"
+            )
+        else:
+            self.OperatorHeaderWarningLabel.setText(
+                f"LINK {self.RadarLinkStatus}"
+            )
+            self.OperatorHeaderWarningLabel.setStyleSheet(
+                "border: none; color: #bfbfbf;"
+            )
 
     def LoadLogo(self):
         """Load the ASR logo into the header if the file exists."""
@@ -704,6 +855,17 @@ class RadarDisplay:
         self.ControlWidgets["ScanStart"] = CompactEdit(str(self.ScanStartDeg))
         self.ControlWidgets["ScanStop"] = CompactEdit(str(self.ScanStopDeg))
         self.ControlWidgets["ScanStep"] = CompactEdit(str(self.ScanStepDeg), 50)
+        self.ControlWidgets["ScanRate"] = QtWidgets.QDoubleSpinBox()
+        self.ControlWidgets["ScanRate"].setRange(
+            self.MinScanRateDegPerSec,
+            self.MaxScanRateDegPerSec,
+        )
+        self.ControlWidgets["ScanRate"].setDecimals(1)
+        self.ControlWidgets["ScanRate"].setSingleStep(1.0)
+        self.ControlWidgets["ScanRate"].setSuffix(" °/s")
+        self.ControlWidgets["ScanRate"].setValue(self.ScanRateDegPerSec)
+        self.ControlWidgets["ScanRate"].setMinimumWidth(82)
+        self.ControlWidgets["ScanRate"].setMaximumWidth(96)
         self.ControlWidgets["RangeProfileMaxDb"] = CompactEdit(str(self.RangeProfileMaxDb), 50)
         self.ControlWidgets["DataLogFilename"] = QtWidgets.QLineEdit(self.DataLogFilename)
         self.ControlWidgets["DataLogFilename"].setMinimumWidth(145)
@@ -796,6 +958,9 @@ class RadarDisplay:
         self.ControlWidgets["ScanStart"].editingFinished.connect(self.OnScanStartChanged)
         self.ControlWidgets["ScanStop"].editingFinished.connect(self.OnScanStopChanged)
         self.ControlWidgets["ScanStep"].editingFinished.connect(self.OnScanStepChanged)
+        self.ControlWidgets["ScanRate"].valueChanged.connect(
+            self.OnScanRateChanged
+        )
         self.ControlWidgets["RangeProfileMaxDb"].editingFinished.connect(self.OnRangeProfileMaxDbChanged)
         self.ControlWidgets["DataLogFilename"].editingFinished.connect(self.OnDataLogFilenameChanged)
         self.ControlWidgets["SaveDataEnabled"].stateChanged.connect(self.OnSaveDataEnabledChanged)
@@ -808,6 +973,7 @@ class RadarDisplay:
         WaveformLabel = QtWidgets.QLabel("Waveform")
         PrfLabel = QtWidgets.QLabel("PRF")
         PulsesLabel = QtWidgets.QLabel("Pulses/CPI")
+        ScanRateLabel = QtWidgets.QLabel("Scan rate")
         MaximumRangeLabel = QtWidgets.QLabel("Max range")
 
         Layout.addWidget(StartLabel, 2, 0)
@@ -834,6 +1000,8 @@ class RadarDisplay:
         Layout.addWidget(self.ControlWidgets["PrfKHz"], 1, 5)
         Layout.addWidget(PulsesLabel, 2, 4)
         Layout.addWidget(self.ControlWidgets["PulsesPerCpi"], 2, 5)
+        Layout.addWidget(ScanRateLabel, 2, 6)
+        Layout.addWidget(self.ControlWidgets["ScanRate"], 2, 7)
         Layout.addWidget(MaximumRangeLabel, 3, 4)
         Layout.addWidget(self.ControlWidgets["MaximumRangeKm"], 3, 5)
         Layout.addWidget(TimingApplyButton, 4, 4)
@@ -1670,6 +1838,7 @@ class RadarDisplay:
             )
 
         self.StatusLabel.setText("\n".join(Lines))
+        self.UpdatePersistentOperatorHeader()
 
     # ------------------------------------------------------------------
     # Detection history
@@ -1726,6 +1895,8 @@ class RadarDisplay:
     def OnStop(self):
         # STOP is a hard one-shot operator event. The main loop uses
         # StopCommandId to send a real X6-60 stop and then remains in idle.
+        if self.MissionPage is not None:
+            self.MissionPage.RequestStopFromPersistentStop()
         self.DisplayMode = "STOP"
         self.ScanEnabled = False
         self.TransmitEnabled = False
@@ -1801,6 +1972,16 @@ class RadarDisplay:
             self.UpdateStatusPanel()
         except ValueError:
             self.ControlWidgets["ScanStep"].setText(str(self.ScanStepDeg))
+
+    def OnScanRateChanged(self, NewRateDegPerSec):
+        """Apply the front-dashboard sector scan-rate selection."""
+
+        self.ScanRateDegPerSec = min(
+            max(float(NewRateDegPerSec), self.MinScanRateDegPerSec),
+            self.MaxScanRateDegPerSec,
+        )
+        self.Config["X660ScanSlewRateDegPerSec"] = self.ScanRateDegPerSec
+        self.UpdateStatusPanel()
 
     def OnTimingApply(self):
         """Queue the visible timing selection for Main to validate."""

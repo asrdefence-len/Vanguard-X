@@ -74,6 +74,7 @@ class SearchPattern(str, Enum):
 
     SECTOR = "SECTOR"
     CONTINUOUS_CW = "CONTINUOUS_CW"
+    CONTINUOUS_CCW = "CONTINUOUS_CCW"
 
 
 @dataclass
@@ -135,11 +136,15 @@ class SearchSector:
             raise ValueError("ScanRateDegPerSec must be greater than zero")
 
         if (
-            self.Pattern == SearchPattern.CONTINUOUS_CW
+            self.Pattern
+            in (
+                SearchPattern.CONTINUOUS_CW,
+                SearchPattern.CONTINUOUS_CCW,
+            )
             and self.Frame != AngleFrame.PLATFORM
         ):
             raise ValueError(
-                "CONTINUOUS_CW search must use the PLATFORM angle frame"
+                "continuous search must use the PLATFORM angle frame"
             )
 
         if int(self.Direction) not in (-1, 1):
@@ -156,8 +161,11 @@ class SearchSector:
         return self.StopDeg if self.ActiveEndpoint == "STOP" else self.StartDeg
 
     def Reverse(self) -> None:
-        if self.Pattern == SearchPattern.CONTINUOUS_CW:
-            raise RuntimeError("continuous-CW search does not reverse")
+        if self.Pattern in (
+            SearchPattern.CONTINUOUS_CW,
+            SearchPattern.CONTINUOUS_CCW,
+        ):
+            raise RuntimeError("continuous search does not reverse")
 
         if self.ActiveEndpoint == "STOP":
             self.ActiveEndpoint = "START"

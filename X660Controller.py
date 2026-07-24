@@ -303,6 +303,9 @@ def CreateX660Controller(Config):
             PositionToleranceDeg=float(
                 Config.get("X660PositionToleranceDeg", 0.75)
             ),
+            RequiredPlannerValues=(int(
+                Config.get("X660PlannerInternalAccelerationDegPerSec2", 1140)
+            ),) * 4,
             MotionEnabled=Config.get("X660MotionEnabled", False),
             IUnderstandMotionWillOccur=Config.get(
                 "X660IUnderstandMotionWillOccur",

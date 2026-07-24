@@ -44,6 +44,7 @@ This version adds the first scene-based scanning simulation:
 """
 from NavigationState import SimulatedNavigationSource
 from PointingManager import PointingManager
+from X660PointingControlLoop import X660PointingControlLoop
 from RadarExecutor import RadarExecutor
 from RadarScheduler import RadarScheduler
 from RadarTasks import (
@@ -53,6 +54,7 @@ from RadarTasks import (
     SearchPattern,
 )
 from RadarTimingControls import ApplyTimingControlState
+from MissionExecutionController import MissionExecutionController
 
 from SimulatedSource import SimulatedSource
 from WaveformLibrary import WaveformLibrary
@@ -715,6 +717,7 @@ def Main(CommandLineArguments=None):
         # Replaced from valid X6-60 encoder telemetry when the controller opens.
         "InitialBeamAngleDeg": 0.0,
         "ManualBeamStepDeg": 1.0,
+        "MinScanRateDegPerSec": 1.0,
 
         # X6-60 motor/positioning unit: unlimited multi-turn azimuth.
         "EnableX660": True,
@@ -723,9 +726,22 @@ def Main(CommandLineArguments=None):
         "X660PositionToleranceDeg": 0.75,
         "X660ScanEndpointMarginDeg": 1.0,
         "X660ScanSlewRateDegPerSec": 20.0,
+        # Reverse the speed command before the sector boundary so the X6-60
+        # planner decelerates through zero at the requested physical endpoint.
+        # The 60 deg/s^2 value is the verified output-shaft equivalent of the
+        # enforced 1140 motor-side planner setting.  The latency term accounts
+        # for telemetry age, scheduler cadence, and CAN command response.
+        "X660ScanBrakingEnabled": True,
+        "X660ScanDecelerationDegPerSec2": 60.0,
+        "X660ScanCommandLatencySec": 0.05,
         "X660ScanPattern": "SECTOR",
-        "X660SimMaxRateDegPerSec": 20.0,
-        "X660TelemetryIntervalSec": 0.10,
+        "X660SimMaxRateDegPerSec": 60.0,
+        # Endpoint control and the telemetry feeding it run at 50 Hz,
+        # independently of the 10 Hz radar dwell.  Both stay in this scheduler
+        # thread so CAN transactions remain serial.
+        "X660PointingControlIntervalSec": 0.020,
+        "X660PointingControlDebug": False,
+        "X660TelemetryIntervalSec": 0.020,
         "RadarDwellIntervalSec": 0.10,
         # Stage 4B/4D SocketCAN telemetry-only integration.  The calibrated
         # mapping is North=000 deg, positive clockwise, naturally wrapping at
@@ -743,9 +759,14 @@ def Main(CommandLineArguments=None):
         "X660MotionEnabled": False,
         "X660IUnderstandMotionWillOccur": False,
         "X660IConfirmMotionAreaIsClear": False,
-        "X660OperationalMaxRateDegPerSec": 20.0,
+        "X660OperationalMaxRateDegPerSec": 60.0,
         "X660PositionCommandSpeedDegPerSec": 14,
         "X660MaximumNudgeDeg": 10.0,
+        # Characterised X6-60 motor-side planner setting. With the unit's
+        # 19:1 gearbox, 1140 produces approximately 60 deg/s^2 at the output.
+        # Operational startup reads indexes 00-03, writes only mismatches,
+        # verifies all four, and refuses MotorReady if verification fails.
+        "X660PlannerInternalAccelerationDegPerSec2": 1140,
 
         # Antenna attitude / IMU controls
         "EnableIMU": False,
@@ -969,6 +990,17 @@ def Main(CommandLineArguments=None):
         except Exception as exc:
             X660 = None
             print(f"X6-60 motor/positioning unit failed to open: {exc}")
+            if str(Config.get("X660Mode", "")).lower() in (
+                "x660-operational",
+                "x6-60-operational",
+                "x660-live",
+                "x6-60-live",
+            ):
+                raise RuntimeError(
+                    "Vanguard X startup aborted: operational X6-60 planner "
+                    "limits were not verified; TX and mission motion remain "
+                    "inhibited"
+                ) from exc
     else:
         X660 = None
         if Config.get("EnableX660", False):
@@ -1036,7 +1068,31 @@ def Main(CommandLineArguments=None):
         position_tolerance_deg=float(
             Config.get("X660PositionToleranceDeg", 0.75)
         ),
+        # The current software simulator reverses rate instantaneously, so
+        # hardware braking anticipation is enabled only for the operational
+        # CAN controller.
+        scan_braking_enabled=bool(
+            Config.get("X660ScanBrakingEnabled", True)
+        ) and str(Config.get("X660Mode", "")).lower() in (
+            "x660-operational",
+            "x6-60-operational",
+            "x660-live",
+            "x6-60-live",
+        ),
+        scan_deceleration_deg_per_sec2=float(
+            Config.get("X660ScanDecelerationDegPerSec2", 60.0)
+        ),
+        scan_command_latency_sec=float(
+            Config.get("X660ScanCommandLatencySec", 0.05)
+        ),
     )
+    PointingControl = X660PointingControlLoop(
+        interval_sec=float(
+            Config.get("X660PointingControlIntervalSec", 0.020)
+        ),
+        debug=bool(Config.get("X660PointingControlDebug", False)),
+    )
+    LastPointingControlError = None
 
     SearchTask = MakeSearchTask(
         TaskId=1,
@@ -1050,6 +1106,13 @@ def Main(CommandLineArguments=None):
             str(Config.get("X660ScanPattern", "SECTOR")).upper()
         ),
     )
+
+    # Mission execution remains simulation-only in this stage.  The
+    # controller owns the immutable loaded snapshot and emits task intent; it
+    # has no source, UHD, Qt, or motion dependency.
+    MissionExecution = MissionExecutionController(Config)
+    LastMissionStatusRevision = -1
+    LastMissionTaskActivationRevision = 0
 
     Scheduler = RadarScheduler(
         search_task=SearchTask,
@@ -1096,6 +1159,9 @@ def Main(CommandLineArguments=None):
             Message="Applied",
             Profile=SearchProfile,
         )
+    if hasattr(Display, "SetMissionRuntimeStatus"):
+        Display.SetMissionRuntimeStatus(MissionExecution.GetStatus())
+        LastMissionStatusRevision = MissionExecution.StatusRevision
 
     SearchTiming = SearchProfile.Timing
     print(
@@ -1112,7 +1178,7 @@ def Main(CommandLineArguments=None):
         f"RX_samples={SearchTiming.NumRxSamples}, "
         f"max_range={SearchTiming.MaximumRangeM / 1e3:.3f} km"
     )
-    
+
     try:
         while not ExitRequested:
 
@@ -1161,6 +1227,53 @@ def Main(CommandLineArguments=None):
                             )
                             break
 
+                # -------------------------------------------------------------
+                # Mission requests and duration transitions are consumed at the
+                # top of the scheduler loop, after the preceding dwell has
+                # completed and before any new timed work can be armed.
+                # -------------------------------------------------------------
+
+                MissionResult = MissionExecution.ApplyControlState(
+                    ControlState,
+                    system_mode=SystemMode,
+                    now_sec=time.monotonic(),
+                )
+                ControlState = MissionExecution.BuildEffectiveControlState(
+                    ControlState
+                )
+                if (
+                    MissionExecution.StatusRevision
+                    != LastMissionStatusRevision
+                ):
+                    LastMissionStatusRevision = (
+                        MissionExecution.StatusRevision
+                    )
+                    MissionStatus = MissionExecution.GetStatus()
+                    if hasattr(Display, "SetMissionRuntimeStatus"):
+                        Display.SetMissionRuntimeStatus(MissionStatus)
+                    print(
+                        "Mission: "
+                        f"{MissionStatus['State']} - "
+                        f"{MissionStatus['Message']}"
+                    )
+
+                if (
+                    MissionExecution.IsRunning
+                    and MissionExecution.TaskActivationRevision
+                    != LastMissionTaskActivationRevision
+                ):
+                    LastMissionTaskActivationRevision = (
+                        MissionExecution.TaskActivationRevision
+                    )
+                    # A new primary task or Resume is a safe-boundary motion
+                    # reactivation.  Stop the previous search intent before the
+                    # updated SearchTask is handed to PointingManager below.
+                    try:
+                        Pointing.Stop()
+                    except Exception:
+                        pass
+                    ScanStartPending = True
+
                 TimingApplication = ApplyTimingControlState(
                     Config=Config,
                     ControlState=ControlState,
@@ -1191,6 +1304,24 @@ def Main(CommandLineArguments=None):
                             "Operator timing rejected: "
                             f"{TimingApplication.Message}"
                         )
+                        if MissionExecution.IsRunning:
+                            MissionExecution.Fault(
+                                "Mission timing rejected: "
+                                f"{TimingApplication.Message}",
+                                now_sec=time.monotonic(),
+                            )
+                            ControlState = (
+                                MissionExecution.BuildEffectiveControlState(
+                                    ControlState
+                                )
+                            )
+                            LastMissionStatusRevision = (
+                                MissionExecution.StatusRevision
+                            )
+                            if hasattr(Display, "SetMissionRuntimeStatus"):
+                                Display.SetMissionRuntimeStatus(
+                                    MissionExecution.GetStatus()
+                                )
 
                 # -------------------------------------------------------------
                 # Apply operator data-logging controls from the display.
@@ -1228,6 +1359,23 @@ def Main(CommandLineArguments=None):
                     ScanStartDeg = float(ControlState.get("ScanStartDeg", ScanStartDeg))
                     ScanStopDeg = float(ControlState.get("ScanStopDeg", ScanStopDeg))
                     ScanStepDeg = abs(float(ControlState.get("ScanStepDeg", ScanStepDeg)))
+                    if "ScanRateDegPerSec" in ControlState:
+                        RequestedDashboardRate = abs(float(
+                            ControlState["ScanRateDegPerSec"]
+                        ))
+                        MinimumDashboardRate = float(
+                            Config.get("MinScanRateDegPerSec", 1.0)
+                        )
+                        MaximumDashboardRate = float(
+                            Config.get(
+                                "X660OperationalMaxRateDegPerSec",
+                                60.0,
+                            )
+                        )
+                        Config["X660ScanSlewRateDegPerSec"] = min(
+                            max(RequestedDashboardRate, MinimumDashboardRate),
+                            MaximumDashboardRate,
+                        )
 
                     Config["ScanStartDeg"] = ScanStartDeg
                     Config["ScanStopDeg"] = ScanStopDeg
@@ -1292,42 +1440,46 @@ def Main(CommandLineArguments=None):
                 LastScanEnabled = bool(ScanEnabled)
                 LastDisplayMode = str(DisplayMode)
 
-                # X6-60 encoder telemetry is independent of radar dwells.  In
-                # STOP, keep the PPI beam tied to the measured antenna bearing
-                # even though no dwell is executed.  The read-only CAN adapter
-                # throttles these queries internally.
-                if (
-                    X660 is not None
-                    and DisplayMode == "STOP"
-                    and bool(getattr(X660, "TelemetryWhileStopped", False))
-                ):
+                # X6-60 endpoint control is independent of radar dwells.  This
+                # single-threaded 50 Hz tick reads fresh encoder angle/speed and
+                # lets PointingManager issue a braking/reversal command as soon
+                # as the calculated threshold is reached.  Missed periods are
+                # skipped, never replayed as a burst of CAN transactions.
+                if X660 is not None:
                     try:
-                        IdleX660State = RefreshX660MeasuredBeam(X660, Display)
-                        if (
-                            IdleX660State is not None
-                            and bool(getattr(IdleX660State, "Valid", False))
-                        ):
+                        FastPointingState = PointingControl.TickIfDue(
+                            pointing=Pointing,
+                            navigation=Navigation.get_attitude(),
+                            x660=X660,
+                            display=Display,
+                            config=Config,
+                            now_monotonic_sec=time.monotonic(),
+                        )
+                        if FastPointingState is not None:
                             CurrentScanBoresightDeg = float(
-                                IdleX660State.AzimuthDeg
+                                FastPointingState.AntennaAzimuthRelativeDeg
                             ) % 360.0
-                            Config["BoresightDeg"] = CurrentScanBoresightDeg
-                            Config["X660AzDeg"] = CurrentScanBoresightDeg
-                            Config["X660RawAngleDeg"] = getattr(
-                                IdleX660State,
-                                "RawAngleDeg",
-                                None,
+                            LastPointingControlError = None
+                    except Exception as exc:
+                        PointingControlError = str(exc)
+                        Config["X660Valid"] = False
+                        Config["X660Source"] = (
+                            f"POINTING CONTROL ERROR: {PointingControlError}"
+                        )
+                        if PointingControlError != LastPointingControlError:
+                            print(
+                                "X6-60 50 Hz pointing-control update failed: "
+                                f"{PointingControlError}"
                             )
-                    except Exception:
-                        # Keep the GUI responsive.  The normal dwell/status
-                        # path will report the telemetry error when active.
-                        pass
+                            LastPointingControlError = PointingControlError
 
                 # -------------------------------------------------------------
                 # Timed radar dwell scheduler.
                 #
-                # The active-dwell X6-60 update remains after this gate.  The
-                # small STOP-mode refresh above is only for controllers that
-                # explicitly advertise telemetry-while-stopped support.
+                # The active-dwell X6-60 state snapshot remains after this gate
+                # for dwell diagnostics.  Its adapter-level query is throttled,
+                # so it normally reuses the fresh 50 Hz state without another
+                # CAN transaction.
                 # -------------------------------------------------------------
 
                 NowDwellSec = time.time()
@@ -1346,9 +1498,9 @@ def Main(CommandLineArguments=None):
                     continue
 
                 if LastRadarDwellTimeSec > 0.0 and DwellWallDtSec < RadarDwellIntervalSec:
-                    # Between dwell instants, keep the GUI responsive but do not
-                    # spend time on additional X6-60 queries.  The X6-60 continues slewing
-                    # from the last command.
+                    # Between dwell instants, keep the GUI responsive.  The
+                    # independent 50 Hz block above continues X6-60 telemetry
+                    # and endpoint control while radar work remains at 10 Hz.
                     if hasattr(Display, "App"):
                         Display.App.processEvents()
                     time.sleep(0.002)
@@ -1482,18 +1634,54 @@ def Main(CommandLineArguments=None):
                 # operator-selected sector and scan rate.
                 SearchTask.Sector.StartDeg = float(ScanStartDeg)
                 SearchTask.Sector.StopDeg = float(ScanStopDeg)
-                SearchTask.Sector.ScanRateDegPerSec = abs(
-                    float(Config.get("X660ScanSlewRateDegPerSec", 14.0))
+                RequestedScanRateDegPerSec = (
+                    abs(float(ControlState["MissionScanRateDegSec"]))
+                    if (
+                        ControlState is not None
+                        and "MissionScanRateDegSec" in ControlState
+                    )
+                    else abs(float(
+                        Config.get("X660ScanSlewRateDegPerSec", 20.0)
+                    ))
+                )
+                SearchTask.Sector.ScanRateDegPerSec = min(
+                    RequestedScanRateDegPerSec,
+                    float(Config.get(
+                        "X660OperationalMaxRateDegPerSec",
+                        60.0,
+                    )),
+                )
+                RequestedScanPattern = str(
+                    ControlState.get(
+                        "MissionScanPattern",
+                        Config.get("X660ScanPattern", "SECTOR"),
+                    )
+                    if ControlState is not None
+                    else Config.get("X660ScanPattern", "SECTOR")
+                ).upper()
+                SearchTask.Sector.Pattern = SearchPattern(
+                    RequestedScanPattern
                 )
 
                 # Pointing.Stop() clears the active task. Reissue the search
                 # command on every transition into active SCAN, including from
                 # STOP or STARE when ScanEnabled remained true.
                 if ScanStartPending:
-                    print(
-                        f"PointingManager scan start: "
-                        f"{ScanStartDeg:.2f} -> {ScanStopDeg:.2f}"
-                    )
+                    # A task change starts a fresh measured-crossing history.
+                    # This prevents the final sector sample from being treated
+                    # as a North crossing in a new continuous task.
+                    SearchTask.Sector.LastMeasuredAzimuthDeg = None
+                    if SearchTask.Sector.Pattern == SearchPattern.SECTOR:
+                        print(
+                            f"PointingManager sector scan start: "
+                            f"{ScanStartDeg:.2f} -> {ScanStopDeg:.2f}"
+                        )
+                    else:
+                        print(
+                            "PointingManager continuous scan start: "
+                            f"{SearchTask.Sector.Pattern.value} at "
+                            f"{SearchTask.Sector.ScanRateDegPerSec:.2f} deg/s"
+                        )
                     Pointing.ActivateTask(SearchTask, NavigationAttitude)
                     ScanStartPending = False
 
@@ -1563,6 +1751,16 @@ def Main(CommandLineArguments=None):
                 Scheduler.CompleteActiveTask(
                     current_time_sec=time.time(),
                 )
+
+                # Mission duration is active surveillance time.  Account it
+                # only after this complete CPI/dwell, then publish the latest
+                # task/remaining-time status.  Any task transition selected
+                # here is applied before the next dwell is armed.
+                MissionExecution.Advance(time.monotonic())
+                if hasattr(Display, "SetMissionRuntimeStatus"):
+                    Display.SetMissionRuntimeStatus(
+                        MissionExecution.GetStatus()
+                    )
 
                 if DwellId % 1 == 0:
                     TimedTransportSummary = ""

@@ -249,6 +249,12 @@ class EttusRadarSource:
         self.AtrGpioEnabled = bool(
             Config.get("EttusAtrGpioEnabled", False)
         )
+        self.AtrIsolationRequired = bool(
+            Config.get("EttusAtrIsolationRequired", False)
+        )
+        self.TrmPaAntennaIsolatedConfirmed = bool(
+            Config.get("EttusTrmPaAntennaIsolatedConfirmed", False)
+        )
         self.AtrCroVerifiedAcknowledged = bool(
             Config.get("EttusAtrCroVerifiedAcknowledged", False)
         )
@@ -283,6 +289,29 @@ class EttusRadarSource:
         self.AtrGpioMask = (
             self.TxAtrMask | self.RxAtrMask | self.OverlapAtrMask
         )
+        if self.AtrIsolationRequired:
+            if not self.TimedTransmitEnabled:
+                raise RuntimeError(
+                    "ATR-isolated loopback requires timed TX/RX mode"
+                )
+            if self.AtrGpioEnabled:
+                raise RuntimeError(
+                    "ATR-isolated loopback forbids timed ATR control"
+                )
+            if not self.TrmPaAntennaIsolatedConfirmed:
+                raise RuntimeError(
+                    "ATR-isolated loopback requires TRM, PA and antenna "
+                    "isolation confirmation"
+                )
+            if (
+                self.GpioBank != "FP0"
+                or self.TxAtrGpioBit != 1
+                or self.RxAtrGpioBit != 2
+            ):
+                raise RuntimeError(
+                    "ATR-isolated loopback requires verified FP0 GPIO "
+                    "bits 1=TX and 2=RX"
+                )
         if self.AtrGpioEnabled:
             if not self.TimedTransmitEnabled:
                 raise RuntimeError("ATR GPIO requires timed TX/RX mode")
@@ -343,6 +372,14 @@ class EttusRadarSource:
 
         args = self._build_device_args()
         self.Usrp = uhd.usrp.MultiUSRP(args)
+
+        # Guarded direct-SDR loopback takes manual ownership before any TX
+        # configuration or streamer creation. Both external ATR outputs (and
+        # the witness output) must read back low before RF TX can be prepared.
+        if self.AtrIsolationRequired:
+            self._require_gpio_bank()
+            self._force_atr_safe_low()
+            self._require_external_atr_low()
 
         frequency_hz = float(
             self.Config.get("EttusRxFrequencyHz", 1.0e9)
@@ -425,7 +462,8 @@ class EttusRadarSource:
             f"antenna={self.Usrp.get_rx_antenna(self.Channel)}, "
             f"mode={self.OperatingMode}, "
             f"timed TX={'enabled' if self.TimedTransmitEnabled else 'disabled'}, "
-            f"ATR GPIO={'enabled' if self.AtrGpioEnabled else 'disabled'}"
+            f"ATR GPIO={'enabled' if self.AtrGpioEnabled else 'disabled'}, "
+            f"ATR isolation={'verified low' if self.AtrIsolationRequired else 'not required'}"
         )
         if self.TimedTransmitEnabled:
             print(
@@ -455,7 +493,7 @@ class EttusRadarSource:
                 )
 
     def Shutdown(self):
-        if self.AtrGpioEnabled and self.Usrp is not None:
+        if (self.AtrGpioEnabled or self.AtrIsolationRequired) and self.Usrp is not None:
             try:
                 self._force_atr_safe_low()
             except Exception as exc:
@@ -1241,6 +1279,26 @@ class EttusRadarSource:
             "ATR_XX="
             f"{'TX+RX+WITNESS' if self.AtrAllowOverlapForSimulation else 'WITNESS_ONLY'}"
         )
+
+    def _require_gpio_bank(self):
+        available_banks = list(self.Usrp.get_gpio_banks(0))
+        if self.GpioBank not in available_banks:
+            raise RuntimeError(
+                f"GPIO bank '{self.GpioBank}' is unavailable; "
+                f"available banks are {available_banks}"
+            )
+
+    def _require_external_atr_low(self):
+        """Verify the two external TX/RX ATR pins are manual outputs low."""
+        external_mask = self.TxAtrMask | self.RxAtrMask
+        ctrl = self._read_atr_gpio_attr("CTRL") & external_mask
+        ddr = self._read_atr_gpio_attr("DDR") & external_mask
+        out = self._read_atr_gpio_attr("OUT") & external_mask
+        if ctrl != 0 or ddr != external_mask or out != 0:
+            raise RuntimeError(
+                "External ATR isolation readback failed: "
+                f"CTRL=0x{ctrl:X}, DDR=0x{ddr:X}, OUT=0x{out:X}"
+            )
 
     def _set_atr_gpio_attr(self, attribute, value):
         self.Usrp.set_gpio_attr(

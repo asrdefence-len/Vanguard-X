@@ -65,6 +65,8 @@ def ApplyServerMessage(display, message):
             str(payload.get("message", "")),
             Profile=profile,
         )
+    elif message_type == "mission_status":
+        display.SetMissionRuntimeStatus(payload)
 
 
 def Main(arguments=None):

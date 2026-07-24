@@ -212,6 +212,8 @@ def _ApplyCommonTimedLoopback(config, arguments):
         "EttusTxAntenna": "TX/RX",
         "EttusTxChannel": int(config.get("EttusRxChannel", 0)),
         "EttusAtrGpioEnabled": False,
+        "EttusAtrIsolationRequired": False,
+        "EttusTrmPaAntennaIsolatedConfirmed": False,
         "EttusAtrAllowOverlapForSimulation": False,
         "Stage3E1LoopbackActive": True,
     })

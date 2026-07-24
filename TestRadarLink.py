@@ -91,7 +91,10 @@ class RadarLinkRoundTripTests(unittest.TestCase):
         client.SendControlState({
             "DisplayMode": "SCAN",
             "ScanEnabled": True,
+            "ScanRateDegPerSec": 37.5,
             "TransmitEnabled": True,
+            "MissionCommandRevision": 7,
+            "MissionCommand": "START",
         })
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -100,7 +103,11 @@ class RadarLinkRoundTripTests(unittest.TestCase):
             time.sleep(0.01)
         state = server.GetControlState()
         self.assertEqual(state["DisplayMode"], "SCAN")
+        self.assertEqual(state["ScanRateDegPerSec"], 37.5)
         self.assertTrue(state["TransmitEnabled"])
+        self.assertEqual(state["MissionCommandRevision"], 7)
+        self.assertEqual(state["MissionCommand"], "START")
+        mission_revision_before_disconnect = state["MissionCommandRevision"]
 
         processed = SimpleNamespace(
             MagnitudeDb=np.full((2, 20), -80.0),
@@ -119,6 +126,22 @@ class RadarLinkRoundTripTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(received_snapshot)
 
+        server.SetMissionRuntimeStatus({
+            "State": "RUNNING_SECTOR",
+            "MissionName": "Link test",
+            "ActiveTaskName": "Sector 1",
+        })
+        deadline = time.monotonic() + 2.0
+        mission_status = None
+        while time.monotonic() < deadline and mission_status is None:
+            for message in client.DrainMessages():
+                if message["type"] == "mission_status":
+                    mission_status = message["payload"]
+                    break
+            time.sleep(0.01)
+        self.assertIsNotNone(mission_status)
+        self.assertEqual(mission_status["State"], "RUNNING_SECTOR")
+
         client.Close()
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -128,6 +151,11 @@ class RadarLinkRoundTripTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(state["DisplayMode"], "STOP")
         self.assertFalse(state["TransmitEnabled"])
+        self.assertEqual(state["MissionCommand"], "STOP")
+        self.assertGreater(
+            state["MissionCommandRevision"],
+            mission_revision_before_disconnect,
+        )
         server.Shutdown()
 
     def test_timing_guard_defers_prepared_snapshot_transport(self):

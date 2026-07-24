@@ -1,0 +1,1095 @@
+diff --git a/EttusOperatingProfiles.py b/EttusOperatingProfiles.py
+index 8018cca8095a21b187ae8ce2ed6c81d0f03d6e92..0ce8bc2bf7ad0ca52f5c679c184dacc88544b775 100644
+--- a/EttusOperatingProfiles.py
++++ b/EttusOperatingProfiles.py
+@@ -111,9 +111,77 @@ def ParseOperatingProfileArguments(argv=None):
+         "--i-confirm-atr-cro-verified",
+         action="store_true",
+     )
++
++    # X6-60 operational motion is selected for one application session. These
++    # options are independent of the Ettus RF profile, so receive-only radar
++    # operation can still use the real motor and encoder.
++    parser.add_argument(
++        "--x660-operational",
++        action="store_true",
++        help="connect PointingManager to the real X6-60 CAN motion controller",
++    )
++    parser.add_argument(
++        "--i-understand-x660-motion-will-occur",
++        action="store_true",
++    )
++    parser.add_argument(
++        "--i-confirm-x660-motion-area-is-clear",
++        action="store_true",
++    )
+     return parser.parse_args(argv)
+ 
+ 
++def ApplyX660OperatingProfile(config, arguments):
++    """Apply one explicit operational X6-60 session or remain read-only."""
++
++    Selected = bool(getattr(arguments, "x660_operational", False))
++    UnderstandsMotion = bool(getattr(
++        arguments,
++        "i_understand_x660_motion_will_occur",
++        False,
++    ))
++    AreaIsClear = bool(getattr(
++        arguments,
++        "i_confirm_x660_motion_area_is_clear",
++        False,
++    ))
++
++    if not Selected:
++        if UnderstandsMotion or AreaIsClear:
++            raise ValueError(
++                "X6-60 motion acknowledgements require --x660-operational"
++            )
++        CurrentMode = str(config.get("X660Mode", "x660-read-only")).lower()
++        if CurrentMode in (
++            "x660-operational",
++            "x6-60-operational",
++            "x660-live",
++            "x6-60-live",
++        ):
++            config["X660Mode"] = "x660-read-only"
++        config["X660MotionEnabled"] = False
++        config["X660IUnderstandMotionWillOccur"] = False
++        config["X660IConfirmMotionAreaIsClear"] = False
++        if CurrentMode in ("sim", "x660-sim", "x6-60-sim", "simulated"):
++            return "X660_SIMULATED"
++        return "X660_READ_ONLY"
++
++    if not UnderstandsMotion:
++        raise ValueError(
++            "Missing --i-understand-x660-motion-will-occur"
++        )
++    if not AreaIsClear:
++        raise ValueError(
++            "Missing --i-confirm-x660-motion-area-is-clear"
++        )
++
++    config["X660Mode"] = "x660-operational"
++    config["X660MotionEnabled"] = True
++    config["X660IUnderstandMotionWillOccur"] = True
++    config["X660IConfirmMotionAreaIsClear"] = True
++    return "X660_OPERATIONAL"
++
++
+ def _ValidateCommonLoopbackArguments(arguments, *, atr_enabled=False):
+     if not arguments.i_understand_rf_output_is_enabled:
+         raise ValueError(
+diff --git a/STAGE_5D_X660_OPERATIONAL_CONTROLLER_README.md b/STAGE_5D_X660_OPERATIONAL_CONTROLLER_README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ddf9b80349ad53f98cd46ea5699c307ad6bf83b
+--- /dev/null
++++ b/STAGE_5D_X660_OPERATIONAL_CONTROLLER_README.md
+@@ -0,0 +1,75 @@
++# Stage 5D — operational X6-60 controller integration
++
++Stage 5D connects the already-proven X6-60 CAN motion transport to the
++Vanguard X `PointingManager` interface. It does not change the established
++coordinate calibration:
++
++- North is `0 deg`;
++- positive azimuth and positive scan rate are clockwise;
++- the azimuth axis is unlimited and wraps naturally through North;
++- raw multi-turn encoder position is retained for CAN position commands.
++
++The operational controller implements the same calls already used by the
++scheduler:
++
++- `CommandSlew()` for continuous search scanning;
++- `SetPanPositionNative()` for track and startup pointing;
++- `NudgePanPositionNative()` for operator increments;
++- `Stop()` for closed-loop hold;
++- `Update()` for measured encoder azimuth, rate, current and error telemetry.
++
++`PointingManager` remains the only owner of search, track, nudge and stop
++intent. The new controller only translates that intent to the proven `0xA2`,
++`0xA4`, `0xA8`, and `0x81` CAN commands.
++
++## Operational boundary
++
++The committed default remains `X660Mode = "x660-read-only"`. Real motion is
++selected explicitly for one application session:
++
++```bash
++python3 VanguardxMain_scheduler.py \
++    --x660-operational \
++    --i-understand-x660-motion-will-occur \
++    --i-confirm-x660-motion-area-is-clear
++```
++
++The X6-60 options are independent of the Ettus operating profile. With no RF
++profile selected, the radar remains receive-only while the real motor and
++encoder are operational. The X6-60 options can also be combined with an
++explicit guarded Ettus profile when that hardware stage is intended.
++
++The normal Vanguard rate is limited to `14 deg/s`. Position commands use the
++nearest multi-turn target, manual nudges are limited to `10 deg` per command,
++and any CAN motion failure latches further motion until the controller is
++closed and reopened. A stop is attempted when a motion transaction or reported
++motor fault fails. Normal close sends closed-loop stop and then confirms motor
++output shutdown.
++
++The Vanguard X installation uses the X6-60 as an azimuth-only axis. Startup
++initialisation now waits only for azimuth when the controller reports
++`SupportsElevation = False`.
++
++## Software-only verification
++
++```bash
++python3 -m py_compile \
++    X660OperationalController.py \
++    X660Controller.py \
++    EttusOperatingProfiles.py \
++    VanguardxMain_scheduler.py \
++    TestX660OperationalController.py
++
++python3 -m unittest -v \
++    TestX660ReadOnlySafety.py \
++    TestX660ReadOnlyController.py \
++    TestX660UnlimitedAzimuth.py \
++    TestX660MotionProtocol.py \
++    TestX660GuardedMotionTransport.py \
++    TestRunX660GuardedMotionTest.py \
++    TestX660OperationalController.py
++```
++
++All Stage 5D operational-controller tests use injected in-memory telemetry,
++transport and shutdown boundaries. They do not inspect or open `can0` and do
++not transmit a CAN frame.
+diff --git a/TestX660OperationalController.py b/TestX660OperationalController.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..214e1104905dddb39636a5073491fb9b1f0ae762
+--- /dev/null
++++ b/TestX660OperationalController.py
+@@ -0,0 +1,357 @@
++#!/usr/bin/env python3
++"""Software-only regressions for operational X6-60 controller integration."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from types import ModuleType, SimpleNamespace
++import struct
++import sys
++import unittest
++
++
++try:
++    import NavigationState  # noqa: F401
++except ImportError:
++    NavigationState = ModuleType("NavigationState")
++
++    class PlatformAttitude:
++        def __init__(self, HeadingTrueDeg=0.0, PitchDeg=0.0, Valid=True):
++            self.HeadingTrueDeg = float(HeadingTrueDeg)
++            self.PitchDeg = float(PitchDeg)
++            self.Valid = bool(Valid)
++
++    NavigationState.PlatformAttitude = PlatformAttitude
++    sys.modules["NavigationState"] = NavigationState
++
++import X660GuardedMotionTransport as GuardedTransport
++import X660MotionProtocol as MotionProtocol
++from EttusOperatingProfiles import (
++    ApplyOperatingProfile,
++    ApplyX660OperatingProfile,
++    ParseOperatingProfileArguments,
++)
++from NavigationState import PlatformAttitude
++from PointingManager import PointingManager
++from RadarTasks import AngleFrame, MakeSearchTask, SearchPattern
++from X660Controller import CreateX660Controller
++from X660OperationalController import X660OperationalController
++from X660ReadOnlyController import X660ReadOnlyState
++
++
++class FakeBus:
++    def __init__(self):
++        self.shutdown_count = 0
++
++    def shutdown(self):
++        self.shutdown_count += 1
++
++
++class FakeTelemetry:
++    def __init__(
++        self,
++        RawAngleDeg=-361.91,
++        AzimuthDeg=359.62,
++        PanRateDegPerSec=0.0,
++    ):
++        self.Bus = FakeBus()
++        self.CanModule = SimpleNamespace(Message=GuardedTransport.CanFrame)
++        self.Calibrated = True
++        self.IsOpen = False
++        self.open_count = 0
++        self.close_count = 0
++        self.State = X660ReadOnlyState(
++            AzimuthDeg=float(AzimuthDeg),
++            ElevationDeg=0.0,
++            Valid=True,
++            PanRateDegPerSec=float(PanRateDegPerSec),
++            Direction="stopped",
++            AtTarget=False,
++            Source="FAKE_X660_TELEMETRY",
++            RawAngleDeg=float(RawAngleDeg),
++            ErrorFlags=0,
++        )
++
++    def Open(self):
++        self.IsOpen = True
++        self.open_count += 1
++
++    def Close(self):
++        self.IsOpen = False
++        self.close_count += 1
++
++    def Update(self):
++        return self.State
++
++    def GetLastKnownState(self):
++        return self.State
++
++
++class RecordingTransport:
++    def __init__(self):
++        self.Payloads = []
++        self.FailNextNonStop = False
++
++    def Transact(self, Payload):
++        Data = bytes(Payload)
++        self.Payloads.append(Data)
++        if self.FailNextNonStop and Data[0] != MotionProtocol.MOTOR_STOP_COMMAND:
++            self.FailNextNonStop = False
++            raise TimeoutError("injected motion timeout")
++        return SimpleNamespace(Command=Data[0], ReplyData=Data)
++
++
++class RecordingTransportFactory:
++    def __init__(self, Transport):
++        self.Transport = Transport
++        self.Arguments = None
++
++    def __call__(self, **Arguments):
++        self.Arguments = Arguments
++        return self.Transport
++
++
++class RecordingShutdown:
++    def __init__(self):
++        self.Calls = []
++
++    def __call__(self, Bus, CanModule, NodeId, Payload, TimeoutSec):
++        self.Calls.append((Bus, CanModule, NodeId, bytes(Payload), TimeoutSec))
++        return bytes(Payload)
++
++
++def MakeController(DirectionSign=+1, **Overrides):
++    Telemetry = Overrides.pop("TelemetryController", FakeTelemetry())
++    Transport = Overrides.pop("Transport", RecordingTransport())
++    Shutdown = Overrides.pop("ShutdownTransaction", RecordingShutdown())
++    Factory = RecordingTransportFactory(Transport)
++    Controller = X660OperationalController(
++        DirectionSign=DirectionSign,
++        MotionEnabled=True,
++        IUnderstandMotionWillOccur=True,
++        IConfirmMotionAreaIsClear=True,
++        TelemetryController=Telemetry,
++        MotionTransportFactory=Factory,
++        ShutdownTransaction=Shutdown,
++        **Overrides,
++    )
++    return Controller, Telemetry, Transport, Factory, Shutdown
++
++
++class TestX660OperationalController(unittest.TestCase):
++    def test_live_session_requires_all_three_explicit_authorisations(self):
++        Cases = (
++            {},
++            {"MotionEnabled": True},
++            {
++                "MotionEnabled": True,
++                "IUnderstandMotionWillOccur": True,
++            },
++        )
++        for Arguments in Cases:
++            with self.subTest(Arguments=Arguments):
++                Controller = X660OperationalController(
++                    DirectionSign=+1,
++                    TelemetryController=FakeTelemetry(),
++                    **Arguments,
++                )
++                with self.assertRaises(RuntimeError):
++                    Controller.Open()
++
++    def test_open_joins_telemetry_bus_to_live_guarded_transport(self):
++        Controller, Telemetry, _, Factory, _ = MakeController()
++        Controller.Open()
++        self.assertTrue(Controller.IsOpen)
++        self.assertEqual(Telemetry.open_count, 1)
++        self.assertIs(Factory.Arguments["Bus"], Telemetry.Bus)
++        self.assertFalse(Factory.Arguments["DryRun"])
++        self.assertTrue(Factory.Arguments["IUnderstandMotionWillOccur"])
++        self.assertTrue(Factory.Arguments["IConfirmMotionAreaIsClear"])
++
++    def test_clockwise_positive_slew_maps_through_calibrated_direction(self):
++        for DirectionSign, ExpectedRawRate in ((+1, +6.0), (-1, -6.0)):
++            with self.subTest(DirectionSign=DirectionSign):
++                Controller, _, Transport, _, _ = MakeController(DirectionSign)
++                Controller.Open()
++                Controller.CommandSlew(+6.0)
++                Payload = Transport.Payloads[-1]
++                self.assertEqual(Payload[0], MotionProtocol.SPEED_CONTROL_COMMAND)
++                self.assertEqual(struct.unpack("<i", Payload[4:8])[0], int(ExpectedRawRate * 100))
++                self.assertEqual(Controller.MotionMode, "slew")
++
++    def test_operational_rate_limit_is_enforced_before_transport(self):
++        Controller, _, Transport, _, _ = MakeController(
++            MaxPanRateDegPerSec=14.0
++        )
++        Controller.Open()
++        with self.assertRaisesRegex(ValueError, "14 deg/s"):
++            Controller.CommandSlew(14.01)
++        self.assertEqual(Transport.Payloads, [])
++
++    def test_goto_uses_nearest_unlimited_multiturn_raw_target(self):
++        Controller, _, Transport, _, _ = MakeController(+1)
++        Controller.Open()
++        Controller.SetPanPositionNative(10.0)
++        Payload = Transport.Payloads[-1]
++        self.assertEqual(Payload[0], MotionProtocol.ABSOLUTE_POSITION_COMMAND)
++        self.assertEqual(int.from_bytes(Payload[2:4], "little"), 14)
++        self.assertEqual(struct.unpack("<i", Payload[4:8])[0], -35153)
++        self.assertAlmostEqual(Controller.TargetAzimuthDeg, 10.0)
++
++    def test_nudge_and_stop_use_proven_incremental_and_hold_commands(self):
++        Controller, _, Transport, _, _ = MakeController(+1)
++        Controller.Open()
++        Controller.NudgePanPositionNative(+1.0)
++        Controller.Stop()
++        self.assertEqual(
++            Transport.Payloads[0],
++            MotionProtocol.BuildIncrementalPositionRequest(+1.0, 14),
++        )
++        self.assertEqual(
++            Transport.Payloads[1],
++            MotionProtocol.BuildMotorStopRequest(),
++        )
++        self.assertEqual(Controller.MotionMode, "hold")
++
++    def test_motion_failure_attempts_stop_and_latches_until_reopen(self):
++        Controller, _, Transport, _, _ = MakeController()
++        Controller.Open()
++        Transport.FailNextNonStop = True
++        with self.assertRaisesRegex(RuntimeError, "fault latched"):
++            Controller.CommandSlew(4.0)
++        self.assertTrue(Controller.MotionFaulted)
++        self.assertEqual(
++            Transport.Payloads[-1],
++            MotionProtocol.BuildMotorStopRequest(),
++        )
++        with self.assertRaisesRegex(RuntimeError, "fault-latched"):
++            Controller.CommandSlew(2.0)
++
++    def test_close_always_stops_then_confirms_motor_output_shutdown(self):
++        Controller, Telemetry, Transport, _, Shutdown = MakeController()
++        Controller.Open()
++        Controller.CommandSlew(3.0)
++        Controller.Close()
++        self.assertEqual(
++            Transport.Payloads[-1],
++            MotionProtocol.BuildMotorStopRequest(),
++        )
++        self.assertEqual(len(Shutdown.Calls), 1)
++        self.assertEqual(Shutdown.Calls[0][3], bytes.fromhex("80 00 00 00 00 00 00 00"))
++        self.assertEqual(Telemetry.close_count, 1)
++        self.assertFalse(Controller.IsOpen)
++
++    def test_reported_motor_error_stops_and_invalidates_state(self):
++        Controller, Telemetry, Transport, _, _ = MakeController()
++        Controller.Open()
++        Telemetry.State.ErrorFlags = 0x0004
++        with self.assertRaisesRegex(RuntimeError, "0x0004"):
++            Controller.Update()
++        self.assertEqual(
++            Transport.Payloads[-1],
++            MotionProtocol.BuildMotorStopRequest(),
++        )
++        self.assertTrue(Controller.MotionFaulted)
++        self.assertFalse(Telemetry.State.Valid)
++
++    def test_factory_exposes_operational_mode_without_changing_default(self):
++        Default = CreateX660Controller({"X660DirectionSign": +1})
++        self.assertFalse(Default.MotionCommandsEnabled)
++        Operational = CreateX660Controller({
++            "X660Mode": "x660-operational",
++            "X660DirectionSign": +1,
++            "X660MotionEnabled": True,
++            "X660IUnderstandMotionWillOccur": True,
++            "X660IConfirmMotionAreaIsClear": True,
++        })
++        self.assertIsInstance(Operational, X660OperationalController)
++        self.assertTrue(Operational.MotionCommandsEnabled)
++        self.assertFalse(Operational.SupportsElevation)
++
++    def test_pointing_manager_drives_motion_and_reports_measured_beam(self):
++        Controller, Telemetry, Transport, _, _ = MakeController()
++        Controller.Open()
++        Pointing = PointingManager(x660=Controller)
++        Navigation = PlatformAttitude(
++            HeadingTrueDeg=20.0,
++            PitchDeg=0.0,
++            Valid=True,
++        )
++        Search = MakeSearchTask(
++            TaskId=1,
++            SectorStartDeg=0.0,
++            SectorStopDeg=0.0,
++            ScanRateDegPerSec=6.0,
++            SectorFrame=AngleFrame.PLATFORM,
++            Pattern=SearchPattern.CONTINUOUS_CW,
++        )
++        Pointing.ActivateTask(Search, Navigation)
++        self.assertEqual(
++            Transport.Payloads[-1],
++            MotionProtocol.BuildSpeedControlRequest(+6.0),
++        )
++
++        Telemetry.State.AzimuthDeg = 42.0
++        Telemetry.State.PanRateDegPerSec = 6.0
++        State = Pointing.Update(Navigation)
++        self.assertAlmostEqual(State.AntennaAzimuthRelativeDeg, 42.0)
++        self.assertAlmostEqual(State.BeamBearingTrueDeg, 62.0)
++        self.assertTrue(State.Valid)
++
++    def test_scheduler_source_selects_operational_mode_explicitly(self):
++        Source = (Path(__file__).parent / "VanguardxMain_scheduler.py").read_text()
++        self.assertIn('"X660Mode": "x660-read-only"', Source)
++        self.assertIn('"X660MotionEnabled": False', Source)
++        self.assertIn('"X660OperationalMaxRateDegPerSec": 14.0', Source)
++        self.assertIn('SupportsElevation = bool(getattr(X660, "SupportsElevation", True))', Source)
++        self.assertIn("ApplyX660OperatingProfile", Source)
++
++    def test_command_line_profile_enables_one_operational_session(self):
++        Arguments = ParseOperatingProfileArguments([
++            "--x660-operational",
++            "--i-understand-x660-motion-will-occur",
++            "--i-confirm-x660-motion-area-is-clear",
++        ])
++        Config = {
++            "EttusOperatingMode": "RECEIVE_ONLY",
++            "EttusTimedTransmitEnabled": False,
++        }
++        self.assertEqual(
++            ApplyOperatingProfile(Config, Arguments),
++            "RECEIVE_ONLY",
++        )
++        self.assertEqual(
++            ApplyX660OperatingProfile(Config, Arguments),
++            "X660_OPERATIONAL",
++        )
++        self.assertEqual(Config["X660Mode"], "x660-operational")
++        self.assertTrue(Config["X660MotionEnabled"])
++
++    def test_x660_command_line_profile_is_fail_closed(self):
++        for ArgumentsList in (
++            ["--i-understand-x660-motion-will-occur"],
++            ["--i-confirm-x660-motion-area-is-clear"],
++            ["--x660-operational"],
++            [
++                "--x660-operational",
++                "--i-understand-x660-motion-will-occur",
++            ],
++        ):
++            with self.subTest(ArgumentsList=ArgumentsList):
++                Arguments = ParseOperatingProfileArguments(ArgumentsList)
++                with self.assertRaises(ValueError):
++                    ApplyX660OperatingProfile({}, Arguments)
++
++    def test_no_live_option_preserves_software_simulator(self):
++        Arguments = ParseOperatingProfileArguments([])
++        Config = {"X660Mode": "x660-sim"}
++        self.assertEqual(
++            ApplyX660OperatingProfile(Config, Arguments),
++            "X660_SIMULATED",
++        )
++        self.assertEqual(Config["X660Mode"], "x660-sim")
++        self.assertFalse(Config["X660MotionEnabled"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/VanguardxMain_scheduler.py b/VanguardxMain_scheduler.py
+index 1762ce0b29e83a5dd44db5a46839f5c8a42347b5..dcc64237a925747c60ccb4a1888530e5266d8aab 100644
+--- a/VanguardxMain_scheduler.py
++++ b/VanguardxMain_scheduler.py
+@@ -65,6 +65,7 @@ from DataLogger import DataLogger
+ from EttusRadarSource import EttusRadarSource
+ from EttusOperatingProfiles import (
+     ApplyOperatingProfile,
++    ApplyX660OperatingProfile,
+     ParseOperatingProfileArguments,
+ )
+ import time
+@@ -251,18 +252,22 @@ def InitialiseX660ToStartupPose(X660, Config, Display=None):
+         return
+ 
+     TargetAzDeg = float(Config.get("X660StartupAzimuthDeg", 200.0)) % 360.0
++    SupportsElevation = bool(getattr(X660, "SupportsElevation", True))
+     TargetElDeg = ClampDeg(float(Config.get("X660StartupElevationDeg", 45.0)), -90.0, 90.0)
+     TimeoutSec = float(Config.get("X660StartupTimeoutSec", 20.0))
+     ToleranceDeg = float(Config.get("X660StartupPositionToleranceDeg", Config.get("X660PositionToleranceDeg", 1.0)))
+ 
+-    print(f"X6-60 startup initialise: AZ={TargetAzDeg:.2f} deg, EL={TargetElDeg:.2f} deg")
++    if SupportsElevation:
++        print(f"X6-60 startup initialise: AZ={TargetAzDeg:.2f} deg, EL={TargetElDeg:.2f} deg")
++    else:
++        print(f"X6-60 startup initialise: AZ={TargetAzDeg:.2f} deg (azimuth-only)")
+ 
+-    if hasattr(X660, "CommandPosition"):
++    if SupportsElevation and hasattr(X660, "CommandPosition"):
+         X660.CommandPosition(TargetAzDeg, TargetElDeg)
+     else:
+         if hasattr(X660, "SetPanPositionNative"):
+             X660.SetPanPositionNative(TargetAzDeg)
+-        if hasattr(X660, "SetTiltPositionNative"):
++        if SupportsElevation and hasattr(X660, "SetTiltPositionNative"):
+             X660.SetTiltPositionNative(TargetElDeg)
+ 
+     StartSec = time.time()
+@@ -281,11 +286,18 @@ def InitialiseX660ToStartupPose(X660, Config, Display=None):
+             Display.App.processEvents()
+ 
+         AzOk = abs(AzDeg - TargetAzDeg) <= ToleranceDeg
+-        ElOk = abs(ElDeg - TargetElDeg) <= ToleranceDeg
++        ElOk = (
++            abs(ElDeg - TargetElDeg) <= ToleranceDeg
++            if SupportsElevation
++            else True
++        )
+ 
+         NowSec = time.time()
+         if NowSec - LastPrintSec > 1.0:
+-            print(f"X6-60 startup position: AZ={AzDeg:.2f} deg, EL={ElDeg:.2f} deg")
++            if SupportsElevation:
++                print(f"X6-60 startup position: AZ={AzDeg:.2f} deg, EL={ElDeg:.2f} deg")
++            else:
++                print(f"X6-60 startup position: AZ={AzDeg:.2f} deg")
+             LastPrintSec = NowSec
+ 
+         if AzOk and ElOk:
+@@ -300,7 +312,8 @@ def InitialiseX660ToStartupPose(X660, Config, Display=None):
+ 
+     Config["InitialBeamAngleDeg"] = TargetAzDeg
+     Config["BoresightDeg"] = TargetAzDeg
+-    Config["AntennaElDeg"] = TargetElDeg
++    if SupportsElevation:
++        Config["AntennaElDeg"] = TargetElDeg
+     if hasattr(Display, "BeamAngleDeg"):
+         Display.BeamAngleDeg = TargetAzDeg
+ 
+@@ -665,6 +678,17 @@ def Main(CommandLineArguments=None):
+         "X660NorthRawAngleDeg": -361.53,
+         "X660DirectionSign": +1,
+ 
++        # Operational CAN motion remains opt-in. To connect the proven motion
++        # transport to PointingManager, select x660-operational and set all
++        # three session-authorisation values to True. The public coordinate
++        # convention remains North=0 deg and clockwise-positive.
++        "X660MotionEnabled": False,
++        "X660IUnderstandMotionWillOccur": False,
++        "X660IConfirmMotionAreaIsClear": False,
++        "X660OperationalMaxRateDegPerSec": 14.0,
++        "X660PositionCommandSpeedDegPerSec": 14,
++        "X660MaximumNudgeDeg": 10.0,
++
+         # Antenna attitude / IMU controls
+         "EnableIMU": False,
+         "UseIMUForBeamAngle": False,
+@@ -679,6 +703,15 @@ def Main(CommandLineArguments=None):
+         Config,
+         OperatingArguments,
+     )
++    X660OperatingProfile = ApplyX660OperatingProfile(
++        Config,
++        OperatingArguments,
++    )
++    if X660OperatingProfile == "X660_OPERATIONAL":
++        print(
++            "X6-60 OPERATIONAL MOTION SELECTED "
++            "(clockwise-positive, encoder beam feedback enabled)"
++        )
+     if OperatingProfile in (
+         "STAGE3E1_LOOPBACK",
+         "STAGE3F_RF_TARGET",
+diff --git a/X660Controller.py b/X660Controller.py
+index 17e4dc3a2eafef775d31f5ea6c24999562968d9e..9093457d29f72907b58bec5d81d6571e5065e904 100644
+--- a/X660Controller.py
++++ b/X660Controller.py
+@@ -272,6 +272,50 @@ def CreateX660Controller(Config):
+             Debug=bool(Config.get("X660Debug", False)),
+         )
+ 
++    if Mode in (
++        "x660-operational",
++        "x6-60-operational",
++        "x660-live",
++        "x6-60-live",
++    ):
++        from X660OperationalController import X660OperationalController
++
++        return X660OperationalController(
++            Interface=str(Config.get("X660CanInterface", "can0")),
++            NodeId=int(Config.get("X660NodeId", 1)),
++            TimeoutSec=float(Config.get("X660CanTimeoutSec", 0.25)),
++            QueryIntervalSec=float(
++                Config.get("X660TelemetryIntervalSec", 0.10)
++            ),
++            NorthRawAngleDeg=float(
++                Config.get("X660NorthRawAngleDeg", -361.53)
++            ),
++            DirectionSign=int(Config.get("X660DirectionSign", 0)),
++            MaxPanRateDegPerSec=float(
++                Config.get("X660OperationalMaxRateDegPerSec", 14.0)
++            ),
++            PositionCommandSpeedDegPerSec=int(
++                Config.get("X660PositionCommandSpeedDegPerSec", 14)
++            ),
++            MaximumNudgeDeg=float(
++                Config.get("X660MaximumNudgeDeg", 10.0)
++            ),
++            PositionToleranceDeg=float(
++                Config.get("X660PositionToleranceDeg", 0.75)
++            ),
++            MotionEnabled=Config.get("X660MotionEnabled", False),
++            IUnderstandMotionWillOccur=Config.get(
++                "X660IUnderstandMotionWillOccur",
++                False,
++            ),
++            IConfirmMotionAreaIsClear=Config.get(
++                "X660IConfirmMotionAreaIsClear",
++                False,
++            ),
++            Debug=bool(Config.get("X660Debug", False)),
++        )
++
+     raise ValueError(
+-        f"Unknown X660Mode: {Mode!r}. Expected 'x660-read-only' or 'x660-sim'."
++        f"Unknown X660Mode: {Mode!r}. Expected 'x660-read-only', "
++        "'x660-operational', or 'x660-sim'."
+     )
+diff --git a/X660OperationalController.py b/X660OperationalController.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9dee338e3a57454bbc5eebfeb071c5f10f45ff5
+--- /dev/null
++++ b/X660OperationalController.py
+@@ -0,0 +1,404 @@
++"""Operational SocketCAN controller for the Vanguard X X6-60 azimuth axis.
++
++This adapter joins the proven read-only telemetry controller and the guarded
++Stage 5B motion transport behind the interface already used by
++``PointingManager``. Public azimuth and rate are clockwise-positive. Raw
++multi-turn commands are mapped with the calibrated ``DirectionSign``.
++
++Selecting this controller is deliberately explicit. It will not open unless
++motion is enabled and both installation-level acknowledgements are exactly
++``True``. Once open, the acknowledgements apply for that controller session;
++normal scan, track, nudge and stop commands do not require repeated prompts.
++"""
++
++from __future__ import annotations
++
++from decimal import Decimal, ROUND_HALF_UP
++import math
++from typing import Any, Callable, Optional
++
++import RunX660MotorShutdown as Shutdown
++import X660GuardedMotionTransport as GuardedTransport
++import X660MotionProtocol as MotionProtocol
++from X660ReadOnlyController import X660ReadOnlyController
++
++
++def Wrap360(AngleDeg: float) -> float:
++    return float(AngleDeg) % 360.0
++
++
++def SignedAngleDeltaDeg(TargetDeg: float, CurrentDeg: float) -> float:
++    Delta = Wrap360(TargetDeg) - Wrap360(CurrentDeg)
++    if Delta > 180.0:
++        Delta -= 360.0
++    elif Delta < -180.0:
++        Delta += 360.0
++    return Delta
++
++
++def QuantizeHundredth(Value: float, Name: str) -> float:
++    if isinstance(Value, bool):
++        raise ValueError(f"{Name} must be numeric, not bool")
++    try:
++        Numeric = float(Value)
++    except (TypeError, ValueError, OverflowError) as Error:
++        raise ValueError(f"{Name} must be finite") from Error
++    if not math.isfinite(Numeric):
++        raise ValueError(f"{Name} must be finite")
++    return float(
++        Decimal(str(Numeric)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
++    )
++
++
++class X660OperationalController:
++    """Real X6-60 azimuth controller used by PointingManager and the scheduler."""
++
++    MotionCommandsEnabled = True
++    UnlimitedAzimuth = True
++    SupportsContinuousRotation = True
++    TelemetryWhileStopped = True
++    SupportsElevation = False
++
++    def __init__(
++        self,
++        Interface: str = "can0",
++        NodeId: int = 1,
++        TimeoutSec: float = 0.25,
++        QueryIntervalSec: float = 0.10,
++        NorthRawAngleDeg: float = -361.53,
++        DirectionSign: int = +1,
++        MaxPanRateDegPerSec: float = 14.0,
++        PositionCommandSpeedDegPerSec: int = 14,
++        MaximumNudgeDeg: float = 10.0,
++        PositionToleranceDeg: float = 0.75,
++        MotionEnabled: bool = False,
++        IUnderstandMotionWillOccur: bool = False,
++        IConfirmMotionAreaIsClear: bool = False,
++        Debug: bool = False,
++        TelemetryController=None,
++        MotionTransportFactory: Callable[..., Any] = (
++            GuardedTransport.X660GuardedMotionTransport
++        ),
++        ShutdownTransaction: Callable[..., bytes] = Shutdown.Transact,
++    ):
++        self.Interface = str(Interface)
++        self.NodeId = int(NodeId)
++        self.TimeoutSec = float(TimeoutSec)
++        self.NorthRawAngleDeg = float(NorthRawAngleDeg)
++        self.DirectionSign = int(DirectionSign)
++        self.MaxPanRateDegPerSec = abs(float(MaxPanRateDegPerSec))
++        self.PositionCommandSpeedDegPerSec = int(PositionCommandSpeedDegPerSec)
++        self.MaximumNudgeDeg = abs(float(MaximumNudgeDeg))
++        self.PositionToleranceDeg = abs(float(PositionToleranceDeg))
++        self.MotionEnabled = MotionEnabled
++        self.IUnderstandMotionWillOccur = IUnderstandMotionWillOccur
++        self.IConfirmMotionAreaIsClear = IConfirmMotionAreaIsClear
++        self.Debug = bool(Debug)
++        self.MotionTransportFactory = MotionTransportFactory
++        self.ShutdownTransaction = ShutdownTransaction
++
++        if self.DirectionSign not in (-1, 1):
++            raise ValueError(
++                "operational X6-60 requires calibrated DirectionSign +1 or -1"
++            )
++        if not 0.01 <= self.MaxPanRateDegPerSec <= 360.0:
++            raise ValueError("MaxPanRateDegPerSec must be between 0.01 and 360")
++        if not 1 <= self.PositionCommandSpeedDegPerSec <= int(
++            self.MaxPanRateDegPerSec
++        ):
++            raise ValueError(
++                "PositionCommandSpeedDegPerSec must be between 1 and the "
++                "operational pan-rate limit"
++            )
++        if not 0.01 <= self.MaximumNudgeDeg <= 180.0:
++            raise ValueError("MaximumNudgeDeg must be between 0.01 and 180")
++        if not 0.01 <= self.PositionToleranceDeg <= 10.0:
++            raise ValueError("PositionToleranceDeg must be between 0.01 and 10")
++        if not callable(self.MotionTransportFactory):
++            raise ValueError("MotionTransportFactory must be callable")
++        if not callable(self.ShutdownTransaction):
++            raise ValueError("ShutdownTransaction must be callable")
++
++        self.Telemetry = TelemetryController or X660ReadOnlyController(
++            Interface=self.Interface,
++            NodeId=self.NodeId,
++            TimeoutSec=self.TimeoutSec,
++            QueryIntervalSec=QueryIntervalSec,
++            NorthRawAngleDeg=self.NorthRawAngleDeg,
++            DirectionSign=self.DirectionSign,
++            Debug=self.Debug,
++        )
++        self.Transport = None
++        self.IsOpen = False
++        self.MotionFaulted = False
++        self.MotionMode = "closed"
++        self.TargetAzimuthDeg: Optional[float] = None
++        self.LastCommandName: Optional[str] = None
++        self.State = self.Telemetry.GetLastKnownState()
++
++    def _RequireSessionAuthorisation(self) -> None:
++        if self.MotionEnabled is not True:
++            raise RuntimeError("operational X6-60 requires MotionEnabled=True")
++        if self.IUnderstandMotionWillOccur is not True:
++            raise RuntimeError(
++                "operational X6-60 requires IUnderstandMotionWillOccur=True"
++            )
++        if self.IConfirmMotionAreaIsClear is not True:
++            raise RuntimeError(
++                "operational X6-60 requires IConfirmMotionAreaIsClear=True"
++            )
++
++    def _RequireOpen(self) -> None:
++        if not self.IsOpen or self.Transport is None:
++            raise RuntimeError("operational X6-60 controller is not open")
++
++    def _RequireMotionReady(self) -> None:
++        self._RequireOpen()
++        if self.MotionFaulted:
++            raise RuntimeError(
++                "X6-60 motion is fault-latched; close and reopen after inspection"
++            )
++
++    def Open(self):
++        if self.IsOpen:
++            return
++        self._RequireSessionAuthorisation()
++        self.Telemetry.Open()
++        try:
++            if not bool(getattr(self.Telemetry, "Calibrated", False)):
++                raise RuntimeError("X6-60 telemetry direction is not calibrated")
++            CanModule = self.Telemetry.CanModule
++            self.Transport = self.MotionTransportFactory(
++                NodeId=self.NodeId,
++                Bus=self.Telemetry.Bus,
++                MessageFactory=CanModule.Message,
++                TimeoutSec=self.TimeoutSec,
++                DryRun=False,
++                IUnderstandMotionWillOccur=True,
++                IConfirmMotionAreaIsClear=True,
++            )
++            self.IsOpen = True
++            self.MotionFaulted = False
++            self.MotionMode = "hold"
++            self.State = self.Telemetry.Update()
++        except Exception:
++            self.Transport = None
++            self.Telemetry.Close()
++            raise
++        print(
++            "X6-60 operational motion enabled "
++            f"on {self.Interface}, node {self.NodeId} "
++            f"(clockwise-positive, limit={self.MaxPanRateDegPerSec:.2f} deg/s)"
++        )
++
++    def _DirectBestEffortStop(self) -> None:
++        if self.Transport is None:
++            return
++        try:
++            self.Transport.Transact(MotionProtocol.BuildMotorStopRequest())
++        except BaseException:
++            pass
++
++    def _TransactMotion(self, Payload: bytes, CommandName: str):
++        self._RequireMotionReady()
++        try:
++            Result = self.Transport.Transact(Payload)
++        except BaseException as Error:
++            self.MotionFaulted = True
++            self.MotionMode = "fault"
++            self._DirectBestEffortStop()
++            raise RuntimeError(
++                f"X6-60 {CommandName} failed; stop attempted and motion fault latched"
++            ) from Error
++        self.LastCommandName = str(CommandName)
++        return Result
++
++    def _ShutdownMotorOutput(self) -> bytes:
++        self._RequireOpen()
++        Payload = Shutdown.BuildEmptyCommand(Shutdown.MOTOR_SHUTDOWN_COMMAND)
++        Reply = self.ShutdownTransaction(
++            self.Telemetry.Bus,
++            self.Telemetry.CanModule,
++            self.NodeId,
++            Payload,
++            self.TimeoutSec,
++        )
++        if bytes(Reply) != Payload:
++            raise RuntimeError("X6-60 0x80 shutdown reply did not echo request")
++        return bytes(Reply)
++
++    def Close(self):
++        if not self.IsOpen:
++            self.Telemetry.Close()
++            return
++        StopError = None
++        ShutdownError = None
++        try:
++            try:
++                self.Transport.Transact(MotionProtocol.BuildMotorStopRequest())
++            except BaseException as Error:
++                StopError = Error
++            try:
++                self._ShutdownMotorOutput()
++            except BaseException as Error:
++                ShutdownError = Error
++        finally:
++            self.IsOpen = False
++            self.Transport = None
++            self.MotionMode = "closed"
++            self.Telemetry.Close()
++        if ShutdownError is not None:
++            raise RuntimeError(
++                "FAIL-SAFE ERROR: X6-60 motor-output shutdown was not confirmed"
++            ) from ShutdownError
++        if StopError is not None:
++            raise RuntimeError(
++                "X6-60 closed-loop stop failed; motor-output shutdown was confirmed"
++            ) from StopError
++
++    def Stop(self):
++        if not self.IsOpen:
++            return None
++        try:
++            Result = self.Transport.Transact(MotionProtocol.BuildMotorStopRequest())
++        except BaseException as Error:
++            self.MotionFaulted = True
++            self.MotionMode = "fault"
++            raise RuntimeError("X6-60 closed-loop stop failed") from Error
++        self.LastCommandName = "Stop"
++        self.MotionMode = "hold"
++        self.TargetAzimuthDeg = float(self.State.AzimuthDeg)
++        self.State.AtTarget = True
++        return Result
++
++    def StopAndHold(self):
++        return self.Stop()
++
++    def CommandSlew(
++        self,
++        PanRateDegPerSec: float,
++        TiltRateDegPerSec: float = 0.0,
++    ):
++        if abs(float(TiltRateDegPerSec)) > 0.0:
++            raise ValueError("X6-60 operational controller has no elevation axis")
++        Rate = QuantizeHundredth(PanRateDegPerSec, "PanRateDegPerSec")
++        if abs(Rate) > self.MaxPanRateDegPerSec:
++            raise ValueError(
++                f"PanRateDegPerSec exceeds {self.MaxPanRateDegPerSec:g} deg/s limit"
++            )
++        if Rate == 0.0:
++            return self.Stop()
++        RawRate = QuantizeHundredth(
++            self.DirectionSign * Rate,
++            "RawRateDegPerSec",
++        )
++        Result = self._TransactMotion(
++            MotionProtocol.BuildSpeedControlRequest(RawRate),
++            "CommandSlew",
++        )
++        self.MotionMode = "slew"
++        self.TargetAzimuthDeg = None
++        self.State.AtTarget = False
++        return Result
++
++    def SetPanPositionNative(self, PanDeg: float):
++        TargetBearing = Wrap360(PanDeg)
++        State = self.Update()
++        if State.RawAngleDeg is None:
++            raise RuntimeError("X6-60 raw multi-turn angle is unavailable")
++        DeltaBearing = SignedAngleDeltaDeg(TargetBearing, State.AzimuthDeg)
++        TargetRawAngle = QuantizeHundredth(
++            float(State.RawAngleDeg) + self.DirectionSign * DeltaBearing,
++            "TargetRawAngleDeg",
++        )
++        Result = self._TransactMotion(
++            MotionProtocol.BuildAbsolutePositionRequest(
++                TargetRawAngle,
++                self.PositionCommandSpeedDegPerSec,
++            ),
++            "SetPanPositionNative",
++        )
++        self.MotionMode = "goto"
++        self.TargetAzimuthDeg = TargetBearing
++        self.State.AtTarget = False
++        return Result
++
++    def NudgePanPositionNative(self, IncrementDeg: float):
++        Increment = QuantizeHundredth(IncrementDeg, "IncrementDeg")
++        if abs(Increment) <= 0.0 or abs(Increment) > self.MaximumNudgeDeg:
++            raise ValueError(
++                f"IncrementDeg magnitude must be greater than zero and no more "
++                f"than {self.MaximumNudgeDeg:g} degrees"
++            )
++        State = self.Update()
++        RawIncrement = QuantizeHundredth(
++            self.DirectionSign * Increment,
++            "RawIncrementDeg",
++        )
++        Result = self._TransactMotion(
++            MotionProtocol.BuildIncrementalPositionRequest(
++                RawIncrement,
++                self.PositionCommandSpeedDegPerSec,
++            ),
++            "NudgePanPositionNative",
++        )
++        self.MotionMode = "goto"
++        self.TargetAzimuthDeg = Wrap360(State.AzimuthDeg + Increment)
++        self.State.AtTarget = False
++        return Result
++
++    def SetTiltPositionNative(self, TiltDeg: float):
++        if self.Debug:
++            print(
++                "X6-60 elevation command ignored: Vanguard X X6-60 is azimuth-only"
++            )
++        return None
++
++    def CommandPosition(self, AzimuthDeg: float, ElevationDeg: float = 0.0):
++        return self.SetPanPositionNative(AzimuthDeg)
++
++    def Update(self):
++        State = self.Telemetry.Update()
++        self.State = State
++        if int(getattr(State, "ErrorFlags", 0)) != 0:
++            if self.IsOpen and not self.MotionFaulted:
++                self._DirectBestEffortStop()
++            self.MotionFaulted = True
++            self.MotionMode = "fault"
++            State.Valid = False
++            State.AtTarget = False
++            raise RuntimeError(
++                f"X6-60 reported error flags 0x{int(State.ErrorFlags):04X}; "
++                "stop attempted and motion fault latched"
++            )
++
++        if self.MotionMode == "goto" and self.TargetAzimuthDeg is not None:
++            ErrorDeg = abs(
++                SignedAngleDeltaDeg(self.TargetAzimuthDeg, State.AzimuthDeg)
++            )
++            State.AtTarget = bool(
++                ErrorDeg <= self.PositionToleranceDeg
++                and abs(float(State.PanRateDegPerSec)) <= 0.25
++            )
++            if State.AtTarget:
++                self.MotionMode = "hold"
++        elif self.MotionMode == "slew":
++            State.AtTarget = False
++        elif self.MotionMode == "hold":
++            State.AtTarget = True
++        else:
++            State.AtTarget = False
++        return State
++
++    def GetState(self):
++        return self.State
++
++    def GetLastKnownState(self):
++        return self.State
++
++    def QueryPanPosition(self) -> float:
++        return float(self.Update().AzimuthDeg)
++
++    def QueryAzEl(self):
++        State = self.Update()
++        return float(State.AzimuthDeg), float(State.ElevationDeg)

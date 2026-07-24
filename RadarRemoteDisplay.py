@@ -35,6 +35,7 @@ CONTROL_KEYS = {
     "ScanStartDeg",
     "ScanStopDeg",
     "ScanStepDeg",
+    "ScanRateDegPerSec",
     "TransmitAvailable",
     "TransmitEnabled",
     "ExitRequested",
@@ -51,6 +52,9 @@ CONTROL_KEYS = {
     "SystemMode",
     "RequestedSystemMode",
     "SystemModeRevision",
+    "MissionCommandRevision",
+    "MissionCommand",
+    "MissionProfile",
 }
 
 
@@ -58,6 +62,8 @@ PUBLIC_CONFIG_KEYS = {
     "RfTransmitAvailable", "InitialTransmitEnabled", "InitialDisplayMode",
     "InitialScanEnabled", "SystemMode", "InitialBeamAngleDeg",
     "ManualBeamStepDeg", "ScanStartDeg", "ScanStopDeg", "ScanStepDeg",
+    "MinScanRateDegPerSec", "X660ScanSlewRateDegPerSec",
+    "X660OperationalMaxRateDegPerSec",
     "AvailableWaveformIds", "SearchWaveformId", "SelectedPrfHz",
     "SelectedPulsesPerCpi", "InstrumentedMaxRangeM", "MinPrfHz",
     "MaxPrfHz", "MinPulsesPerCpi", "MaxPulsesPerCpi",
@@ -77,6 +83,8 @@ PUBLIC_CONFIG_KEYS = {
     "ShowTracks", "TrackClickGateM", "MapEnabled", "MapLatitudeDeg",
     "MapLongitudeDeg", "MapDatasetPath", "MapLandColour",
     "MapCoastColour", "MapLabelColour", "LogoPath", "LogoWidthPx",
+    "RadarDwellIntervalSec", "MissionUsableBeamwidthDeg",
+    "AntennaMaximumRotationRpm", "AntennaMaximumScanRateDegSec",
 }
 
 
@@ -89,6 +97,9 @@ def _InitialControlState(config: Dict[str, Any]) -> Dict[str, Any]:
         "ScanStartDeg": float(config.get("ScanStartDeg", 0.0)),
         "ScanStopDeg": float(config.get("ScanStopDeg", 0.0)),
         "ScanStepDeg": float(config.get("ScanStepDeg", 1.0)),
+        "ScanRateDegPerSec": float(
+            config.get("X660ScanSlewRateDegPerSec", 20.0)
+        ),
         "TransmitAvailable": transmit_available,
         "TransmitEnabled": False,
         "ExitRequested": False,
@@ -105,6 +116,9 @@ def _InitialControlState(config: Dict[str, Any]) -> Dict[str, Any]:
         "SystemMode": str(config.get("SystemMode", "SIM")).upper(),
         "RequestedSystemMode": str(config.get("SystemMode", "SIM")).upper(),
         "SystemModeRevision": 0,
+        "MissionCommandRevision": 0,
+        "MissionCommand": "",
+        "MissionProfile": None,
     }
 
 
@@ -300,6 +314,9 @@ class RadarRemoteDisplay:
             }
         self._QueueEvent("timing_result", payload)
 
+    def SetMissionRuntimeStatus(self, Status):
+        self._QueueEvent("mission_status", dict(Status or {}))
+
     def Shutdown(self):
         self._stop_event.set()
         self._radar_idle.set()
@@ -348,6 +365,11 @@ class RadarRemoteDisplay:
             state["ExitRequested"] = False
             if not already_stopped:
                 state["StopCommandId"] = int(state.get("StopCommandId", 0)) + 1
+            state["MissionCommandRevision"] = (
+                int(state.get("MissionCommandRevision", 0)) + 1
+            )
+            state["MissionCommand"] = "STOP"
+            state["MissionProfile"] = None
         if was_connected:
             print(f"Radar UI link fail-stop: {reason}")
 

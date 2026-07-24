@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+import math
 import time
 
 from RadarTasks import (
@@ -100,6 +101,9 @@ class PointingManager:
         position_tolerance_deg: float = 1.0,
         settle_rate_threshold_deg_per_sec: float = 0.25,
         default_scan_rate_deg_per_sec: float = 14.0,
+        scan_braking_enabled: bool = False,
+        scan_deceleration_deg_per_sec2: float = 60.0,
+        scan_command_latency_sec: float = 0.05,
         debug: bool = False,
     ):
         self.Positioner = x660
@@ -112,7 +116,25 @@ class PointingManager:
         self.DefaultScanRateDegPerSec = abs(
             float(default_scan_rate_deg_per_sec)
         )
+        self.ScanBrakingEnabled = bool(scan_braking_enabled)
+        self.ScanDecelerationDegPerSec2 = float(
+            scan_deceleration_deg_per_sec2
+        )
+        self.ScanCommandLatencySec = float(scan_command_latency_sec)
         self.Debug = bool(debug)
+
+        if (
+            not math.isfinite(self.ScanDecelerationDegPerSec2)
+            or self.ScanDecelerationDegPerSec2 <= 0.0
+        ):
+            raise ValueError(
+                "scan_deceleration_deg_per_sec2 must be greater than zero"
+            )
+        if (
+            not math.isfinite(self.ScanCommandLatencySec)
+            or self.ScanCommandLatencySec < 0.0
+        ):
+            raise ValueError("scan_command_latency_sec must not be negative")
 
         if not bool(getattr(self.Positioner, "UnlimitedAzimuth", False)):
             raise ValueError(
@@ -437,8 +459,12 @@ class PointingManager:
         if self.SearchTask is not None:
             search_cycle = int(self.SearchTask.Sector.ScanCycle)
             search_endpoint = (
-                SearchPattern.CONTINUOUS_CW.value
-                if self.SearchTask.Sector.Pattern == SearchPattern.CONTINUOUS_CW
+                self.SearchTask.Sector.Pattern.value
+                if self.SearchTask.Sector.Pattern
+                in (
+                    SearchPattern.CONTINUOUS_CW,
+                    SearchPattern.CONTINUOUS_CCW,
+                )
                 else str(self.SearchTask.Sector.ActiveEndpoint)
             )
 
@@ -472,11 +498,19 @@ class PointingManager:
         task: SearchTask,
         navigation: PlatformAttitude,
     ) -> None:
-        if task.Sector.Pattern == SearchPattern.CONTINUOUS_CW:
+        if task.Sector.Pattern in (
+            SearchPattern.CONTINUOUS_CW,
+            SearchPattern.CONTINUOUS_CCW,
+        ):
             self.LastCommandedRelativeDeg = None
             self.LastCommandedTrueDeg = None
+            direction = (
+                1.0
+                if task.Sector.Pattern == SearchPattern.CONTINUOUS_CW
+                else -1.0
+            )
             self.Positioner.CommandSlew(
-                abs(float(task.Sector.ScanRateDegPerSec)),
+                direction * abs(float(task.Sector.ScanRateDegPerSec)),
                 0.0,
             )
             return
@@ -568,13 +602,26 @@ class PointingManager:
         previous = sector.LastMeasuredAzimuthDeg
         sector.LastMeasuredAzimuthDeg = measured
 
-        if sector.Pattern == SearchPattern.CONTINUOUS_CW:
-            # Positive X6-60 azimuth is clockwise.  Count each measured
-            # 359-to-0 crossing as another completed continuous revolution;
-            # never issue a reverse command at North.
+        if sector.Pattern in (
+            SearchPattern.CONTINUOUS_CW,
+            SearchPattern.CONTINUOUS_CCW,
+        ):
+            # Positive X6-60 azimuth is clockwise. Count one cycle at the
+            # measured North crossing in the commanded direction and never
+            # issue a reverse command there.
             if previous is not None:
                 motion = signed_angle_delta_deg(measured, previous)
-                if motion > 0.01 and measured < previous:
+                crossed_cw = (
+                    sector.Pattern == SearchPattern.CONTINUOUS_CW
+                    and motion > 0.01
+                    and measured < previous
+                )
+                crossed_ccw = (
+                    sector.Pattern == SearchPattern.CONTINUOUS_CCW
+                    and motion < -0.01
+                    and measured > previous
+                )
+                if crossed_cw or crossed_ccw:
                     sector.ScanCycle += 1
             return
 
@@ -582,6 +629,33 @@ class PointingManager:
         error = signed_angle_delta_deg(target, measured)
 
         reached = abs(error) <= self.EndpointMarginDeg
+        braking_advance_deg = 0.0
+
+        # A speed command reversal does not stop the antenna instantly.  Begin
+        # the reversal early enough for the X6-60 planner to decelerate through
+        # zero at the operator-selected physical sector boundary.  Use measured
+        # output-shaft speed so the advance automatically scales with scan rate.
+        #
+        #     advance = v^2 / (2a) + v * latency
+        #
+        # The direction check is essential: immediately after a reversal the
+        # motor may still be decelerating in the old direction, away from the
+        # newly active endpoint.
+        measured_rate = float(
+            getattr(x660_state, "PanRateDegPerSec", 0.0)
+        )
+        moving_toward_endpoint = (
+            (measured_rate > 0.01 and error > 0.0)
+            or (measured_rate < -0.01 and error < 0.0)
+        )
+        if self.ScanBrakingEnabled and moving_toward_endpoint:
+            speed = abs(measured_rate)
+            braking_advance_deg = (
+                speed * speed
+                / (2.0 * self.ScanDecelerationDegPerSec2)
+                + speed * self.ScanCommandLatencySec
+            )
+            reached = reached or abs(error) <= braking_advance_deg
 
         if not reached and previous is not None:
             motion = signed_angle_delta_deg(measured, previous)
@@ -597,6 +671,8 @@ class PointingManager:
                 reached = previous_error < 0.0 and error >= 0.0
 
         if reached:
+            reached_endpoint = str(sector.ActiveEndpoint)
+            reached_target_deg = float(sector.ActiveEndpointDeg)
             sector.Reverse()
 
             # Reset the crossing history for the new endpoint. Otherwise the
@@ -608,7 +684,11 @@ class PointingManager:
             if self.Debug:
                 print(
                     "PointingManager SEARCH reverse: "
-                    f"target={sector.ActiveEndpoint} "
+                    f"reached={reached_endpoint} "
+                    f"target={reached_target_deg:.2f} deg "
+                    f"advance={braking_advance_deg:.2f} deg "
+                    f"rate={measured_rate:+.2f} deg/s "
+                    f"next={sector.ActiveEndpoint} "
                     f"cycle={sector.ScanCycle}"
                 )
 

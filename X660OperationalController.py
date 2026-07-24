@@ -20,6 +20,8 @@ from typing import Any, Callable, Optional
 import RunX660MotorShutdown as Shutdown
 import X660GuardedMotionTransport as GuardedTransport
 import X660MotionProtocol as MotionProtocol
+import X660PlannerInitialiser as PlannerInitialiser
+import X660PlannerProtocol as PlannerProtocol
 from X660ReadOnlyController import X660ReadOnlyController
 
 
@@ -79,6 +81,10 @@ class X660OperationalController:
         MotionTransportFactory: Callable[..., Any] = (
             GuardedTransport.X660GuardedMotionTransport
         ),
+        PlannerInitialiserFactory: Callable[..., Any] = (
+            PlannerInitialiser.X660PlannerInitialiser
+        ),
+        RequiredPlannerValues=PlannerProtocol.VANGUARD_X_REQUIRED_VALUES,
         ShutdownTransaction: Callable[..., bytes] = Shutdown.Transact,
     ):
         self.Interface = str(Interface)
@@ -95,6 +101,11 @@ class X660OperationalController:
         self.IConfirmMotionAreaIsClear = IConfirmMotionAreaIsClear
         self.Debug = bool(Debug)
         self.MotionTransportFactory = MotionTransportFactory
+        self.PlannerInitialiserFactory = PlannerInitialiserFactory
+        self.RequiredPlannerValues = tuple(
+            PlannerProtocol.ValidatePlannerValue(Value)
+            for Value in RequiredPlannerValues
+        )
         self.ShutdownTransaction = ShutdownTransaction
 
         if self.DirectionSign not in (-1, 1):
@@ -116,6 +127,10 @@ class X660OperationalController:
             raise ValueError("PositionToleranceDeg must be between 0.01 and 10")
         if not callable(self.MotionTransportFactory):
             raise ValueError("MotionTransportFactory must be callable")
+        if not callable(self.PlannerInitialiserFactory):
+            raise ValueError("PlannerInitialiserFactory must be callable")
+        if len(self.RequiredPlannerValues) != 4:
+            raise ValueError("RequiredPlannerValues must contain four values")
         if not callable(self.ShutdownTransaction):
             raise ValueError("ShutdownTransaction must be callable")
 
@@ -129,6 +144,8 @@ class X660OperationalController:
             Debug=self.Debug,
         )
         self.Transport = None
+        self.PlannerInitialisationResult = None
+        self.MotorReady = False
         self.IsOpen = False
         self.MotionFaulted = False
         self.MotionMode = "closed"
@@ -154,6 +171,11 @@ class X660OperationalController:
 
     def _RequireMotionReady(self) -> None:
         self._RequireOpen()
+        if not self.MotorReady:
+            raise RuntimeError(
+                "X6-60 motion is inhibited because planner initialisation "
+                "has not been verified"
+            )
         if self.MotionFaulted:
             raise RuntimeError(
                 "X6-60 motion is fault-latched; close and reopen after inspection"
@@ -168,6 +190,14 @@ class X660OperationalController:
             if not bool(getattr(self.Telemetry, "Calibrated", False)):
                 raise RuntimeError("X6-60 telemetry direction is not calibrated")
             CanModule = self.Telemetry.CanModule
+            Initialiser = self.PlannerInitialiserFactory(
+                NodeId=self.NodeId,
+                Bus=self.Telemetry.Bus,
+                MessageFactory=CanModule.Message,
+                TimeoutSec=self.TimeoutSec,
+                RequiredValues=self.RequiredPlannerValues,
+            )
+            self.PlannerInitialisationResult = Initialiser.Initialise()
             self.Transport = self.MotionTransportFactory(
                 NodeId=self.NodeId,
                 Bus=self.Telemetry.Bus,
@@ -181,14 +211,25 @@ class X660OperationalController:
             self.MotionFaulted = False
             self.MotionMode = "hold"
             self.State = self.Telemetry.Update()
+            self.MotorReady = True
         except Exception:
+            self.MotorReady = False
+            self.PlannerInitialisationResult = None
             self.Transport = None
             self.Telemetry.Close()
             raise
+        Corrected = self.PlannerInitialisationResult.CorrectedIndices
+        CorrectionText = (
+            "no writes required"
+            if not Corrected
+            else "corrected indexes "
+            + ", ".join(f"0x{Index:02X}" for Index in Corrected)
+        )
         print(
             "X6-60 operational motion enabled "
             f"on {self.Interface}, node {self.NodeId} "
-            f"(clockwise-positive, limit={self.MaxPanRateDegPerSec:.2f} deg/s)"
+            f"(clockwise-positive, limit={self.MaxPanRateDegPerSec:.2f} deg/s; "
+            f"planner={self.RequiredPlannerValues[0]} verified, {CorrectionText})"
         )
 
     def _DirectBestEffortStop(self) -> None:
@@ -243,6 +284,7 @@ class X660OperationalController:
             except BaseException as Error:
                 ShutdownError = Error
         finally:
+            self.MotorReady = False
             self.IsOpen = False
             self.Transport = None
             self.MotionMode = "closed"
