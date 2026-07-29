@@ -46,6 +46,10 @@ from CoordinateFrames import GeodeticPosition
 from EarthReferencedMeasurements import (
     AnnotateDetectionsWithEarthReference,
 )
+from EarthReferencedTracker import (
+    BuildParallelTrackerComparison,
+    EarthReferencedTracker,
+)
 from NavigationState import (
     CircularRouteNavigationSource,
     SimulatedNavigationSource,
@@ -496,6 +500,7 @@ def ExecuteRadarDwell(
     X660Source,
     X660AtTarget,
     X660RawAngleDeg,
+    EarthTracker=None,
 ):
     """Execute one scheduled dwell and preserve the processing chain.
 
@@ -612,6 +617,73 @@ def ExecuteRadarDwell(
         Tracks, Plots = [], []
         TrackerDebug = {}
 
+    # Stage 6 validation boundary: run a second tracker in fixed mission ENU
+    # coordinates.  The legacy range/bearing tracker above remains the sole
+    # source of display and tasking tracks until this parallel stream passes
+    # moving-platform trials.
+    EarthTracks = []
+    EarthPlots = []
+    EarthTrackerDebug = {}
+    TrackerComparison = None
+    if (
+        Config.get("EarthTrackerEnabled", True)
+        and EarthTracker is not None
+    ):
+        EarthTracks, EarthPlots = EarthTracker.Update(
+            Detections,
+            Processed,
+            ThisDwell,
+        )
+        EarthTrackerDebug = EarthTracker.GetDebugInfo()
+        EarthConfirmedTracks = EarthTracker.GetConfirmedTracks()
+        LegacyConfirmedTracks = (
+            Tracker.GetConfirmedTracks()
+            if Config.get("TrackerEnabled", True)
+            and hasattr(Tracker, "GetConfirmedTracks")
+            else []
+        )
+        TrackerComparison = BuildParallelTrackerComparison(
+            EarthConfirmedTracks,
+            LegacyConfirmedTracks,
+            NavigationAttitude,
+        )
+
+    Processed.Diagnostics["EarthTrackerAuthoritative"] = False
+    Processed.Diagnostics["EarthTrackerEnabled"] = bool(
+        Config.get("EarthTrackerEnabled", True)
+        and EarthTracker is not None
+    )
+    Processed.Diagnostics["EarthTrackerCurrentScanPoints"] = int(
+        EarthTrackerDebug.get("CurrentScanPoints", 0)
+    )
+    Processed.Diagnostics["EarthTrackerLastCompletedBlobs"] = int(
+        EarthTrackerDebug.get("LastCompletedBlobs", 0)
+    )
+    Processed.Diagnostics["EarthTrackerTentativeTracks"] = int(
+        EarthTrackerDebug.get("TentativeTracks", 0)
+    )
+    Processed.Diagnostics["EarthTrackerConfirmedTracks"] = int(
+        EarthTrackerDebug.get("ConfirmedTracks", 0)
+    )
+    Processed.Diagnostics["ParallelTrackerComparisonValid"] = bool(
+        TrackerComparison is not None and TrackerComparison.Valid
+    )
+    Processed.Diagnostics["ParallelTrackerMatchedTrackCount"] = int(
+        TrackerComparison.MatchedTrackCount
+        if TrackerComparison is not None
+        else 0
+    )
+    Processed.Diagnostics["ParallelTrackerRmsSeparationM"] = (
+        TrackerComparison.RmsPositionSeparationM
+        if TrackerComparison is not None
+        else None
+    )
+    Processed.Diagnostics["ParallelTrackerMaximumSeparationM"] = (
+        TrackerComparison.MaximumPositionSeparationM
+        if TrackerComparison is not None
+        else None
+    )
+
     Processed.Diagnostics["TrackerCurrentScanPoints"] = int(TrackerDebug.get("CurrentScanPoints", 0))
     Processed.Diagnostics["TrackerLastCompletedBlobs"] = int(TrackerDebug.get("LastCompletedBlobs", 0))
     Processed.Diagnostics["TrackerTentativeTracks"] = int(TrackerDebug.get("TentativeTracks", 0))
@@ -633,6 +705,10 @@ def ExecuteRadarDwell(
         "Processed": Processed,
         "Detections": Detections,
         "EarthReferencedMeasurements": EarthReferencedMeasurements,
+        "EarthTracks": EarthTracks,
+        "EarthPlots": EarthPlots,
+        "EarthTrackerDebug": EarthTrackerDebug,
+        "ParallelTrackerComparison": TrackerComparison,
         "Tracks": Tracks,
         "Plots": Plots,
         "TrackerDebug": TrackerDebug,
@@ -787,6 +863,17 @@ def Main(CommandLineArguments=None):
 
         # Tracker / plot extraction parameters
         "TrackerEnabled": True,
+        # Stage 6 parallel Earth-referenced tracker.  This tracker is
+        # diagnostic only; legacy range/bearing tracks remain authoritative.
+        "EarthTrackerEnabled": True,
+        "EarthClusterDistanceM": 200.0,
+        "EarthInitiationGateM": 300.0,
+        "EarthAssociationGateM": 300.0,
+        "EarthInitiationWindow": 3,
+        "EarthInitiationRequiredHits": 2,
+        "EarthDeleteConfirmedAfterMisses": 5,
+        "EarthTrackAlpha": 0.65,
+        "EarthTrackBeta": 0.20,
         "ReturnBlobsForDebug": True,
         "InitiationWindow": 3,
         "InitiationRequiredHits": 2,
@@ -1128,6 +1215,7 @@ def Main(CommandLineArguments=None):
 
     Detector = CfarDetector(Config)
     Tracker = RadarTracker(Config)
+    EarthTracker = EarthReferencedTracker(Config)
     Display = SelectDisplay(Config)
     Logger = DataLogger(Config)
 
@@ -1906,6 +1994,7 @@ def Main(CommandLineArguments=None):
                     X660Source=X660Source,
                     X660AtTarget=X660AtTarget,
                     X660RawAngleDeg=X660RawAngleDeg,
+                    EarthTracker=EarthTracker,
                 )
 
                 if not DwellResult["Executed"]:
