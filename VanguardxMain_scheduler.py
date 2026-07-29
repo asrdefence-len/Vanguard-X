@@ -42,7 +42,11 @@ This version adds the first scene-based scanning simulation:
     - scene returns are passed into SimulatedSource for each dwell
 ===============================================================================
 """
-from NavigationState import SimulatedNavigationSource
+from CoordinateFrames import GeodeticPosition
+from NavigationState import (
+    CircularRouteNavigationSource,
+    SimulatedNavigationSource,
+)
 from PointingManager import PointingManager
 from X660PointingControlLoop import X660PointingControlLoop
 from RadarExecutor import RadarExecutor
@@ -163,22 +167,137 @@ def ParseSystemModeArguments(CommandLineArguments=None):
         return "RF LOOPBACK", Filtered
     return ("HARD" if HardSelected else "SIM"), Filtered
 
-def BuildRadarParamsForScenario(Config):
+def BuildRadarParamsForScenario(Config, NavigationPose=None):
     """
     Convert the main Config dictionary into the lower-case keys used by
     TargetScenario.py.
+
+    TargetScenario retains its legacy x/y names, where x is mission north and
+    y is mission east.  A valid NavigationPose is therefore mapped from ENU as:
+
+        x <- north
+        y <- east
+
+    Position and velocity come from the same timestamped pose so simulated
+    range, bearing and Doppler remain mutually consistent on a moving platform.
     """
 
-    return {
+    RadarParams = {
         "carrier_frequency_hz": Config["RfFrequency"],
         "radar_x_m": Config.get("RadarXM", 0.0),
         "radar_y_m": Config.get("RadarYM", 0.0),
+        "radar_vx_mps": Config.get("RadarVXMps", 0.0),
+        "radar_vy_mps": Config.get("RadarVYMps", 0.0),
         "boresight_deg": Config["BoresightDeg"],
         "beamwidth_deg": Config["BeamwidthDeg"],
         "reference_range_m": Config.get("ReferenceRangeM", 8000.0),
         "target_amplitude_scale": Config.get("TargetAmplitudeScale", 1.0),
         "sidelobe_floor_db": Config.get("SidelobeFloorDb", -50.0),
     }
+
+    if (
+        NavigationPose is not None
+        and bool(getattr(NavigationPose, "PositionValid", False))
+    ):
+        RadarParams["radar_x_m"] = float(
+            NavigationPose.PositionEnu.north_m
+        )
+        RadarParams["radar_y_m"] = float(
+            NavigationPose.PositionEnu.east_m
+        )
+        if bool(getattr(NavigationPose, "VelocityValid", False)):
+            RadarParams["radar_vx_mps"] = float(
+                NavigationPose.VelocityEnu.north_mps
+            )
+            RadarParams["radar_vy_mps"] = float(
+                NavigationPose.VelocityEnu.east_mps
+            )
+
+    return RadarParams
+
+
+def CreateNavigationSource(Config, time_source=time.time):
+    """Create the real-contract navigation digital twin selected in Config."""
+
+    MissionOrigin = GeodeticPosition(
+        latitude_deg=float(
+            Config.get(
+                "MissionOriginLatitudeDeg",
+                Config.get("MapLatitudeDeg", 0.0),
+            )
+        ),
+        longitude_deg=float(
+            Config.get(
+                "MissionOriginLongitudeDeg",
+                Config.get("MapLongitudeDeg", 0.0),
+            )
+        ),
+        altitude_m=float(Config.get("MissionOriginAltitudeM", 0.0)),
+    )
+    Mode = str(
+        Config.get("SimulatedNavigationMode", "STATIONARY")
+    ).strip().upper()
+
+    if Mode in ("CIRCLE", "CIRCULAR", "CIRCULAR_ROUTE"):
+        Navigation = CircularRouteNavigationSource(
+            mission_origin=MissionOrigin,
+            centre_east_m=float(
+                Config.get("SimulatedCircleCentreEastM", 0.0)
+            ),
+            centre_north_m=float(
+                Config.get("SimulatedCircleCentreNorthM", 0.0)
+            ),
+            radius_m=float(
+                Config.get("SimulatedCircleRadiusM", 1000.0)
+            ),
+            speed_mps=float(
+                Config.get("SimulatedCircleSpeedMps", 5.0)
+            ),
+            clockwise=bool(
+                Config.get("SimulatedCircleClockwise", True)
+            ),
+            initial_radial_bearing_deg=float(
+                Config.get(
+                    "SimulatedCircleInitialRadialBearingDeg",
+                    0.0,
+                )
+            ),
+            source_name="SIMULATED_CIRCULAR_ROUTE",
+            time_source=time_source,
+        )
+        print(
+            "Simulated platform navigation: CIRCLE "
+            f"centre_E={Navigation.CentreEastM:.1f} m, "
+            f"centre_N={Navigation.CentreNorthM:.1f} m, "
+            f"radius={Navigation.RadiusM:.1f} m, "
+            f"speed={Navigation.SpeedMps:.1f} m/s, "
+            f"clockwise={Navigation.Clockwise}"
+        )
+        return Navigation
+
+    if Mode not in ("STATIONARY", "LINEAR"):
+        raise ValueError(
+            f"Unsupported SimulatedNavigationMode: {Mode}"
+        )
+
+    return SimulatedNavigationSource(
+        mission_origin=MissionOrigin,
+        initial_heading_deg=float(
+            Config.get("SimulatedInitialHeadingDeg", 0.0)
+        ),
+        velocity_east_mps=float(
+            Config.get("SimulatedVelocityEastMps", 0.0)
+        ),
+        velocity_north_mps=float(
+            Config.get("SimulatedVelocityNorthMps", 0.0)
+        ),
+        source_name=(
+            "SIMULATED_LINEAR_ROUTE"
+            if Mode == "LINEAR"
+            else "SIMULATED_STATIONARY"
+        ),
+        time_source=time_source,
+    )
 
 
 def SelectDisplay(Config):
@@ -592,6 +711,25 @@ def Main(CommandLineArguments=None):
         # ---------------------------------------------------------------------
         "RadarXM": 0.0,
         "RadarYM": 0.0,
+        "RadarVXMps": 0.0,
+        "RadarVYMps": 0.0,
+        # The simulator publishes the same timestamped NavigationPose contract
+        # that the future operational GPS/WT901 source will publish.
+        # STATIONARY preserves the current default. Set this to CIRCLE for the
+        # deterministic offshore circular-route digital twin.
+        "SimulatedNavigationMode": "STATIONARY",
+        "MissionOriginLatitudeDeg": -34.368,
+        "MissionOriginLongitudeDeg": 150.929,
+        "MissionOriginAltitudeM": 0.0,
+        "SimulatedInitialHeadingDeg": 0.0,
+        "SimulatedVelocityEastMps": 0.0,
+        "SimulatedVelocityNorthMps": 0.0,
+        "SimulatedCircleCentreEastM": 5000.0,
+        "SimulatedCircleCentreNorthM": 0.0,
+        "SimulatedCircleRadiusM": 1000.0,
+        "SimulatedCircleSpeedMps": 5.0,
+        "SimulatedCircleClockwise": True,
+        "SimulatedCircleInitialRadialBearingDeg": 0.0,
         "ScanStartDeg": 120.0,
         "ScanStopDeg": 10.0,
         "ScanStepDeg": 1,
@@ -1056,9 +1194,7 @@ def Main(CommandLineArguments=None):
     # Stage 3C.3.
     # -------------------------------------------------------------------------
 
-    Navigation = SimulatedNavigationSource(
-        initial_heading_deg=0.0,
-    )
+    Navigation = CreateNavigationSource(Config)
 
     Pointing = PointingManager(
         x660=X660,
@@ -1619,7 +1755,10 @@ def Main(CommandLineArguments=None):
                 # Build the scene returns for this beam position.
                 # -------------------------------------------------------------
 
-                RadarParams = BuildRadarParamsForScenario(Config)
+                RadarParams = BuildRadarParamsForScenario(
+                    Config,
+                    NavigationPose,
+                )
 
                 SceneReturns = build_scene_returns_for_boresight(
                     SceneObjects,

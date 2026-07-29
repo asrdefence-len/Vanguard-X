@@ -11,9 +11,11 @@ from CoordinateFrames import (
     detection_to_enu_position,
     enu_delta_to_relative_polar,
     line_of_sight_velocity_mps,
+    measured_relative_radial_velocity_mps,
     normalise_bearing_degrees,
     relative_polar_to_enu_delta,
     signed_angle_difference_degrees,
+    target_los_velocity_from_measured_mps,
     target_relative_to_radar,
     true_bearing_to_x660_encoder,
     x660_encoder_to_true_bearing,
@@ -187,6 +189,52 @@ class TestVelocityProjection(unittest.TestCase):
         self.assertAlmostEqual(
             line_of_sight_velocity_mps(eastbound, true_bearing_deg=270.0),
             -10.0,
+        )
+
+    def test_measured_doppler_combines_target_and_platform_motion_once(self):
+        target_velocity = EnuVelocity(
+            east_mps=0.0,
+            north_mps=8.0,
+        )
+        radar_velocity = EnuVelocity(
+            east_mps=0.0,
+            north_mps=5.0,
+        )
+
+        measured = measured_relative_radial_velocity_mps(
+            target_velocity,
+            radar_velocity,
+            true_bearing_deg=0.0,
+        )
+
+        self.assertAlmostEqual(measured, 3.0)
+        self.assertAlmostEqual(
+            target_los_velocity_from_measured_mps(
+                measured,
+                radar_velocity,
+                true_bearing_deg=0.0,
+            ),
+            8.0,
+        )
+
+    def test_stationary_target_has_ownship_induced_measured_doppler(self):
+        stationary_target = EnuVelocity(0.0, 0.0)
+        radar_velocity = EnuVelocity(0.0, 5.0)
+
+        measured = measured_relative_radial_velocity_mps(
+            stationary_target,
+            radar_velocity,
+            true_bearing_deg=0.0,
+        )
+
+        self.assertAlmostEqual(measured, -5.0)
+        self.assertAlmostEqual(
+            target_los_velocity_from_measured_mps(
+                measured,
+                radar_velocity,
+                true_bearing_deg=0.0,
+            ),
+            0.0,
         )
 
 

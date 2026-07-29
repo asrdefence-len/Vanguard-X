@@ -409,3 +409,53 @@ def line_of_sight_velocity_mps(
         + velocity.north_mps * math.cos(bearing_rad)
     )
 
+
+def measured_relative_radial_velocity_mps(
+    target_velocity: EnuVelocity,
+    radar_velocity: EnuVelocity,
+    true_bearing_deg: float,
+) -> float:
+    """Return the radial velocity a moving monostatic radar measures.
+
+    Positive is outward/receding along the radar-to-target line of sight:
+
+        measured = LOS(target velocity) - LOS(radar velocity)
+
+    This value already contains ownship motion. It must not be compensated a
+    second time before entering an Earth-referenced tracking measurement model.
+    """
+
+    return (
+        line_of_sight_velocity_mps(
+            target_velocity,
+            true_bearing_deg,
+        )
+        - line_of_sight_velocity_mps(
+            radar_velocity,
+            true_bearing_deg,
+        )
+    )
+
+
+def target_los_velocity_from_measured_mps(
+    measured_relative_radial_velocity_mps_value: float,
+    radar_velocity: EnuVelocity,
+    true_bearing_deg: float,
+) -> float:
+    """Recover the target Earth-velocity component along the current LOS.
+
+    A single Doppler measurement does not determine the full two-dimensional
+    target velocity. This function returns only its line-of-sight component:
+
+        target LOS = measured relative radial + radar LOS
+    """
+
+    measured = float(measured_relative_radial_velocity_mps_value)
+    if not math.isfinite(measured):
+        raise ValueError(
+            "measured_relative_radial_velocity_mps_value must be finite"
+        )
+    return measured + line_of_sight_velocity_mps(
+        radar_velocity,
+        true_bearing_deg,
+    )

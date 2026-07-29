@@ -294,3 +294,162 @@ class SimulatedNavigationSource:
         """Return the legacy attitude view used by PointingManager."""
 
         return self.get_pose(current_time_sec).as_attitude()
+
+
+class CircularRouteNavigationSource:
+    """Deterministic offshore circular-route navigation digital twin.
+
+    The platform follows a circle in the mission ENU plane.  Position,
+    velocity, true heading and yaw rate are derived from one analytic motion
+    model, so the simulated navigation fields cannot drift out of agreement.
+
+    ``initial_radial_bearing_deg`` is the true bearing from the circle centre
+    to the platform at the initial time.  For example, zero degrees starts the
+    platform at the north point of the circle.  Clockwise motion from that
+    point initially heads east.
+    """
+
+    def __init__(
+        self,
+        *,
+        mission_origin: GeodeticPosition,
+        centre_east_m: float = 0.0,
+        centre_north_m: float = 0.0,
+        radius_m: float = 1000.0,
+        speed_mps: float = 5.0,
+        clockwise: bool = True,
+        initial_radial_bearing_deg: float = 0.0,
+        altitude_m: float = 0.0,
+        pitch_deg: float = 0.0,
+        roll_deg: float = 0.0,
+        source_name: str = "SIMULATED_CIRCULAR_ROUTE",
+        time_source: Callable[[], float] = time.time,
+    ):
+        if not callable(time_source):
+            raise TypeError("time_source must be callable")
+
+        radius = _finite(radius_m, "radius_m")
+        speed = _finite(speed_mps, "speed_mps")
+        if radius <= 0.0:
+            raise ValueError("radius_m must be greater than zero")
+        if speed < 0.0:
+            raise ValueError("speed_mps must not be negative")
+
+        self.MissionOrigin = mission_origin
+        self.Frame = LocalEnuFrame(mission_origin)
+        self.CentreEastM = _finite(centre_east_m, "centre_east_m")
+        self.CentreNorthM = _finite(centre_north_m, "centre_north_m")
+        self.RadiusM = radius
+        self.SpeedMps = speed
+        self.Clockwise = bool(clockwise)
+        self.InitialRadialBearingDeg = wrap360(
+            _finite(
+                initial_radial_bearing_deg,
+                "initial_radial_bearing_deg",
+            )
+        )
+        self.AltitudeM = _finite(altitude_m, "altitude_m")
+        self.PitchDeg = _finite(pitch_deg, "pitch_deg")
+        self.RollDeg = _finite(roll_deg, "roll_deg")
+        self.SourceName = str(source_name)
+        self._time_source = time_source
+        self._start_time = _finite(self._time_source(), "time_source result")
+        self._last_time = self._start_time
+        self._sequence_number = 0
+
+        direction = 1.0 if self.Clockwise else -1.0
+        self._angular_rate_rad_per_sec = direction * self.SpeedMps / self.RadiusM
+
+    @property
+    def OrbitPeriodSec(self) -> float:
+        """Return the time for one circuit, or infinity when stationary."""
+
+        if self.SpeedMps == 0.0:
+            return math.inf
+        return 2.0 * math.pi * self.RadiusM / self.SpeedMps
+
+    def _now(self, current_time_sec: Optional[float] = None) -> float:
+        now = _finite(
+            self._time_source() if current_time_sec is None else current_time_sec,
+            "current_time_sec",
+        )
+        if now < self._last_time:
+            raise ValueError("navigation time cannot move backwards")
+        self._last_time = now
+        return now
+
+    def get_pose(
+        self,
+        current_time_sec: Optional[float] = None,
+    ) -> NavigationPose:
+        """Return the analytically derived navigation pose at one epoch."""
+
+        timestamp = self._now(current_time_sec)
+        elapsed_sec = timestamp - self._start_time
+        initial_angle_rad = math.radians(self.InitialRadialBearingDeg)
+        radial_angle_rad = (
+            initial_angle_rad
+            + self._angular_rate_rad_per_sec * elapsed_sec
+        )
+
+        sin_angle = math.sin(radial_angle_rad)
+        cos_angle = math.cos(radial_angle_rad)
+        east_m = self.CentreEastM + self.RadiusM * sin_angle
+        north_m = self.CentreNorthM + self.RadiusM * cos_angle
+        east_mps = (
+            self.RadiusM
+            * cos_angle
+            * self._angular_rate_rad_per_sec
+        )
+        north_mps = (
+            -self.RadiusM
+            * sin_angle
+            * self._angular_rate_rad_per_sec
+        )
+
+        if self.SpeedMps > 0.0:
+            heading_true_deg = wrap360(
+                math.degrees(math.atan2(east_mps, north_mps))
+            )
+        else:
+            tangent_offset_deg = 90.0 if self.Clockwise else -90.0
+            heading_true_deg = wrap360(
+                self.InitialRadialBearingDeg + tangent_offset_deg
+            )
+
+        position_enu = EnuPosition(
+            east_m=east_m,
+            north_m=north_m,
+            up_m=self.AltitudeM,
+        )
+        velocity_enu = EnuVelocity(
+            east_mps=east_mps,
+            north_mps=north_mps,
+            up_mps=0.0,
+        )
+        self._sequence_number += 1
+        return NavigationPose(
+            TimestampSec=timestamp,
+            SequenceNumber=self._sequence_number,
+            Geodetic=self.Frame.to_geodetic(position_enu),
+            PositionEnu=position_enu,
+            VelocityEnu=velocity_enu,
+            HeadingTrueDeg=heading_true_deg,
+            PitchDeg=self.PitchDeg,
+            RollDeg=self.RollDeg,
+            YawRateDegPerSec=math.degrees(
+                self._angular_rate_rad_per_sec
+            ),
+            PositionValid=True,
+            HeadingValid=True,
+            VelocityValid=True,
+            Source=self.SourceName,
+        )
+
+    def get_attitude(
+        self,
+        current_time_sec: Optional[float] = None,
+    ) -> PlatformAttitude:
+        """Return the same legacy attitude view as other navigation sources."""
+
+        return self.get_pose(current_time_sec).as_attitude()

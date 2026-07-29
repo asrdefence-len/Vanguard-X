@@ -10,8 +10,8 @@ This file defines a simple 2D radar scene model for the X-band prototype.
 
 It supports:
     - multiple scene objects / targets
-    - x/y target positions
-    - x/y target velocities
+    - Earth-fixed north/east target positions
+    - Earth-fixed north/east target velocities
     - radar range, bearing, radial velocity and Doppler calculation
     - scanning radar boresight angles
     - sinc-squared antenna beam pattern
@@ -66,18 +66,18 @@ def make_scene_object_from_range_bearing(
         Initial range from radar in metres.
 
     bearing_deg : float
-        Initial bearing from radar in degrees.
-        0 degrees is along +x.
-        90 degrees is along +y.
+        Initial true bearing from radar in degrees.
+        0 degrees is north (+x).
+        90 degrees is east (+y).
 
     speed_mps : float
         Object speed in metres per second.
 
     heading_deg : float
-        Direction of motion in degrees.
-        0 degrees is along +x.
-        90 degrees is along +y.
-        180 degrees is along -x.
+        Direction of motion in degrees true.
+        0 degrees is north (+x).
+        90 degrees is east (+y).
+        180 degrees is south (-x).
 
     rcs : float
         Relative radar cross section. This is a simulation scaling value.
@@ -246,6 +246,14 @@ def calculate_object_geometry(obj, radar_params):
     radar_params : dict
         Must include carrier_frequency_hz.
         Can include radar_x_m and radar_y_m. Defaults to 0,0.
+        Can also include radar_vx_mps and radar_vy_mps. These are required for
+        physically correct Doppler when the radar platform is moving.
+
+        Legacy x/y convention:
+            x = mission north
+            y = mission east
+
+        This convention is retained so existing scenes remain compatible.
 
     Returns
     -------
@@ -258,6 +266,8 @@ def calculate_object_geometry(obj, radar_params):
 
     radar_x = radar_params.get("radar_x_m", 0.0)
     radar_y = radar_params.get("radar_y_m", 0.0)
+    radar_vx = radar_params.get("radar_vx_mps", 0.0)
+    radar_vy = radar_params.get("radar_vy_mps", 0.0)
 
     dx = obj["x_m"] - radar_x
     dy = obj["y_m"] - radar_y
@@ -272,16 +282,39 @@ def calculate_object_geometry(obj, radar_params):
     los_x = dx / range_m
     los_y = dy / range_m
 
-    radial_velocity_mps = obj["vx_mps"] * los_x + obj["vy_mps"] * los_y
+    relative_vx_mps = obj["vx_mps"] - radar_vx
+    relative_vy_mps = obj["vy_mps"] - radar_vy
+    # This is the Doppler-bearing radial velocity the radar actually measures,
+    # not the target's Earth-referenced LOS velocity. Positive is outward /
+    # receding. Ownship velocity is subtracted exactly once here.
+    measured_relative_radial_velocity_mps = (
+        relative_vx_mps * los_x
+        + relative_vy_mps * los_y
+    )
 
     # Monostatic radar Doppler.
-    doppler_hz = 2.0 * radial_velocity_mps / wavelength_m
+    doppler_hz = (
+        2.0
+        * measured_relative_radial_velocity_mps
+        / wavelength_m
+    )
 
     return {
         "range_m": range_m,
         "bearing_deg": bearing_deg,
-        "radial_velocity_mps": radial_velocity_mps,
+        # Retain radial_velocity_mps for SimulatedSource compatibility. Its
+        # meaning is explicitly the measured relative radial velocity.
+        "radial_velocity_mps": measured_relative_radial_velocity_mps,
+        "measured_relative_radial_velocity_mps": (
+            measured_relative_radial_velocity_mps
+        ),
         "doppler_hz": doppler_hz,
+        "radar_los_velocity_mps": (
+            radar_vx * los_x + radar_vy * los_y
+        ),
+        "target_los_velocity_mps": (
+            obj["vx_mps"] * los_x + obj["vy_mps"] * los_y
+        ),
     }
 
 
@@ -387,6 +420,8 @@ def build_scene_returns_for_boresight(scene_objects, radar_params):
         Optional:
             radar_x_m
             radar_y_m
+            radar_vx_mps
+            radar_vy_mps
             reference_range_m
             target_amplitude_scale
             sidelobe_floor_db
