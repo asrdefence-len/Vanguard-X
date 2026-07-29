@@ -43,6 +43,9 @@ This version adds the first scene-based scanning simulation:
 ===============================================================================
 """
 from CoordinateFrames import GeodeticPosition
+from EarthReferencedMeasurements import (
+    AnnotateDetectionsWithEarthReference,
+)
 from NavigationState import (
     CircularRouteNavigationSource,
     SimulatedNavigationSource,
@@ -573,6 +576,34 @@ def ExecuteRadarDwell(
     )
 
     Detections = Detector.Detect(Processed, ThisDwell)
+    EarthReferencedMeasurements = AnnotateDetectionsWithEarthReference(
+        Detections,
+        NavigationAttitude,
+    )
+
+    # Stage 5 validation boundary: detections now carry a parallel mission-ENU
+    # interpretation, but the established range/bearing tracker remains
+    # authoritative until circular-platform trials validate this measurement
+    # stream.  Tracker.Update deliberately receives the same legacy detections.
+    Processed.Diagnostics["EarthReferenceAuthoritative"] = False
+    Processed.Diagnostics["EarthReferencedDetectionCount"] = sum(
+        1 for Measurement in EarthReferencedMeasurements
+        if Measurement.Valid
+    )
+    Processed.Diagnostics["EarthReferencedVelocityCount"] = sum(
+        1 for Measurement in EarthReferencedMeasurements
+        if Measurement.Valid and Measurement.VelocityValid
+    )
+    Processed.Diagnostics["NavigationPoseSequenceNumber"] = getattr(
+        NavigationAttitude,
+        "SequenceNumber",
+        None,
+    )
+    Processed.Diagnostics["NavigationPoseTimestampSec"] = getattr(
+        NavigationAttitude,
+        "TimestampSec",
+        None,
+    )
 
     if Config.get("TrackerEnabled", True):
         Tracks, Plots = Tracker.Update(Detections, Processed, ThisDwell)
@@ -601,6 +632,7 @@ def ExecuteRadarDwell(
         "Dwell": ThisDwell,
         "Processed": Processed,
         "Detections": Detections,
+        "EarthReferencedMeasurements": EarthReferencedMeasurements,
         "Tracks": Tracks,
         "Plots": Plots,
         "TrackerDebug": TrackerDebug,
