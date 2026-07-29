@@ -34,6 +34,9 @@ class FakePointing:
         self.UpdateCount += 1
         return SimpleNamespace(
             AntennaAzimuthRelativeDeg=self.Positioner.State.AzimuthDeg,
+            BeamBearingTrueDeg=(
+                self.Positioner.State.AzimuthDeg + 30.0
+            ) % 360.0,
             PanRateDegPerSec=self.Positioner.State.PanRateDegPerSec,
             Valid=True,
             Source="TEST_POINTING",
@@ -120,7 +123,9 @@ class PointingControlLoopTests(unittest.TestCase):
             now_monotonic_sec=3.021,
         )
 
-        self.assertEqual(display.Angles, [42.5, 43.3])
+        self.assertEqual(display.Angles, [72.5, 73.3])
+        self.assertAlmostEqual(config["BoresightDeg"], 73.3)
+        self.assertAlmostEqual(config["X660BeamBearingTrueDeg"], 73.3)
         self.assertAlmostEqual(config["X660AzDeg"], 43.3)
         self.assertAlmostEqual(config["X660RateDegPerSec"], 40.0)
         self.assertAlmostEqual(

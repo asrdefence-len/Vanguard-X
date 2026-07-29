@@ -90,23 +90,31 @@ class X660PointingControlLoop:
         pointing_state = pointing.Update(navigation)
         measured_state = self._GetMeasuredState(pointing, x660)
 
-        azimuth_deg = float(
+        encoder_azimuth_deg = float(
             getattr(
                 measured_state,
                 "AzimuthDeg",
                 pointing_state.AntennaAzimuthRelativeDeg,
             )
         ) % 360.0
+        beam_bearing_true_deg = float(
+            getattr(
+                pointing_state,
+                "BeamBearingTrueDeg",
+                encoder_azimuth_deg,
+            )
+        ) % 360.0
 
         if display is not None:
             if hasattr(display, "SetMeasuredBeamAngle"):
-                display.SetMeasuredBeamAngle(azimuth_deg)
+                display.SetMeasuredBeamAngle(beam_bearing_true_deg)
             elif hasattr(display, "BeamAngleDeg"):
-                display.BeamAngleDeg = azimuth_deg
+                display.BeamAngleDeg = beam_bearing_true_deg
 
         if config is not None:
-            config["BoresightDeg"] = azimuth_deg
-            config["X660AzDeg"] = azimuth_deg
+            config["BoresightDeg"] = beam_bearing_true_deg
+            config["X660BeamBearingTrueDeg"] = beam_bearing_true_deg
+            config["X660AzDeg"] = encoder_azimuth_deg
             config["X660RateDegPerSec"] = float(
                 getattr(
                     measured_state,

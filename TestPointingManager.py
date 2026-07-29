@@ -34,7 +34,8 @@ manager = PointingManager(
     position_tolerance_deg=0.5,
 )
 
-# Coordinate conversion.
+# The X6-60 adapter has already converted raw motor angle into a calibrated
+# bow-zero, clockwise-positive platform bearing.
 assert abs(manager.RelativeToTrueBearing(20.0, 30.0) - 50.0) < 1e-9
 assert abs(manager.TrueToRelativeAzimuth(50.0, 30.0) - 20.0) < 1e-9
 
@@ -47,13 +48,13 @@ search = MakeSearchTask(
     SectorFrame=AngleFrame.PLATFORM,
 )
 
-manager.ActivateTask(search, nav.get_attitude())
+manager.ActivateTask(search, nav.get_pose())
 
 deadline = time.time() + 1.0
 reversed_once = False
 
 while time.time() < deadline:
-    state = manager.Update(nav.get_attitude())
+    state = manager.Update(nav.get_pose())
     if search.Sector.ScanCycle >= 2:
         reversed_once = True
         break
@@ -79,16 +80,16 @@ track = MakeTrackTaskFromRevisit(
     Request=request,
 )
 
-manager.ActivateTask(track, nav.get_attitude())
+manager.ActivateTask(track, nav.get_pose())
 
-# Heading 30 true and target 70 true -> command relative 40 deg.
+# Heading 30 true and target 70 true -> platform command 40 deg.
 assert abs(manager.LastCommandedRelativeDeg - 40.0) < 0.01
 
 deadline = time.time() + 1.0
 track_ready = False
 
 while time.time() < deadline:
-    state = manager.Update(nav.get_attitude())
+    state = manager.Update(nav.get_pose())
     if state.Ready:
         track_ready = True
         break
@@ -97,16 +98,21 @@ while time.time() < deadline:
 assert track_ready
 assert state.ActiveTrackId == 12
 assert abs(state.BeamBearingTrueDeg - 70.0) < 1.0
+assert state.NavigationTimestampSec is not None
+assert state.NavigationSequenceNumber is not None
+assert state.NavigationSource == "SIMULATED_NAVIGATION"
+assert abs(state.AntennaBearingPlatformDeg - 40.0) < 1.0
+assert state.AntennaRawAngleDeg is not None
 
 # Moving-platform correction: turn heading to 35 true.
 nav.set_heading(35.0)
-state = manager.Update(nav.get_attitude())
+state = manager.Update(nav.get_pose())
 
-# True target remains 70, so relative command should move to 35.
+# True target remains 70, so platform command moves to 35 deg.
 assert abs(manager.LastCommandedRelativeDeg - 35.0) < 0.1
 
-manager.ResumeSearch(nav.get_attitude())
-state = manager.Update(nav.get_attitude())
+manager.ResumeSearch(nav.get_pose())
+state = manager.Update(nav.get_pose())
 
 assert state.Mode.value == "CONTINUOUS_SCAN"
 assert state.ActiveTrackId is None

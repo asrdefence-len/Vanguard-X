@@ -1449,7 +1449,7 @@ def Main(CommandLineArguments=None):
                     try:
                         FastPointingState = PointingControl.TickIfDue(
                             pointing=Pointing,
-                            navigation=Navigation.get_attitude(),
+                            navigation=Navigation.get_pose(),
                             x660=X660,
                             display=Display,
                             config=Config,
@@ -1457,7 +1457,7 @@ def Main(CommandLineArguments=None):
                         )
                         if FastPointingState is not None:
                             CurrentScanBoresightDeg = float(
-                                FastPointingState.AntennaAzimuthRelativeDeg
+                                FastPointingState.BeamBearingTrueDeg
                             ) % 360.0
                             LastPointingControlError = None
                     except Exception as exc:
@@ -1507,6 +1507,7 @@ def Main(CommandLineArguments=None):
                     continue
 
                 LastRadarDwellTimeSec = NowDwellSec
+                NavigationPose = Navigation.get_pose()
 
                 # -------------------------------------------------------------
                 # X660 / X6-60 state and operator controls.
@@ -1541,9 +1542,16 @@ def Main(CommandLineArguments=None):
                         )
 
                         if X660Valid:
-                            CurrentScanBoresightDeg = float(X660AzDeg)
+                            CurrentScanBoresightDeg = (
+                                Pointing.RelativeToTrueBearing(
+                                    X660AzDeg,
+                                    NavigationPose.HeadingTrueDeg,
+                                )
+                            )
                             if hasattr(Display, "BeamAngleDeg"):
-                                Display.BeamAngleDeg = float(X660AzDeg)
+                                Display.BeamAngleDeg = float(
+                                    CurrentScanBoresightDeg
+                                )
 
                     except Exception as exc:
                         X660Valid = False
@@ -1585,7 +1593,10 @@ def Main(CommandLineArguments=None):
                 if Config.get("UseIMUForBeamAngle", False) and ImuValid:
                     BoresightDeg = float(MeasuredAntennaAzDeg)
                 elif X660Valid:
-                    BoresightDeg = float(X660AzDeg)
+                    BoresightDeg = Pointing.RelativeToTrueBearing(
+                        X660AzDeg,
+                        NavigationPose.HeadingTrueDeg,
+                    )
                 else:
                     BoresightDeg = float(CommandedBoresightDeg)
 
@@ -1596,6 +1607,7 @@ def Main(CommandLineArguments=None):
                 Config["IMUValid"] = bool(ImuValid)
                 Config["IMUSource"] = str(ImuSource)
                 Config["X660AzDeg"] = float(X660AzDeg)
+                Config["X660BeamBearingTrueDeg"] = float(BoresightDeg)
                 Config["X660RateDegPerSec"] = float(X660RateDegPerSec)
                 Config["X660Valid"] = bool(X660Valid)
                 Config["X660Source"] = str(X660Source)
@@ -1628,7 +1640,7 @@ def Main(CommandLineArguments=None):
                 # endpoint reversal, and stop handling for the X6-60.
                 # -------------------------------------------------------------
 
-                NavigationAttitude = Navigation.get_attitude()
+                NavigationAttitude = NavigationPose
 
                 # Keep the persistent scheduler search task aligned with the
                 # operator-selected sector and scan rate.

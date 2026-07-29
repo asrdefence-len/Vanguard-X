@@ -33,10 +33,11 @@ The X6-60 object must provide the public interface already used by Vanguard:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 import math
 import time
 
+from CoordinateFrames import normalise_bearing_degrees
 from RadarTasks import (
     AngleFrame,
     PointingMode,
@@ -46,7 +47,10 @@ from RadarTasks import (
     SearchTask,
     TrackTask,
 )
-from NavigationState import PlatformAttitude
+from NavigationState import NavigationPose, PlatformAttitude
+
+
+NavigationInput = Union[NavigationPose, PlatformAttitude]
 
 
 def wrap360(angle_deg: float) -> float:
@@ -87,6 +91,12 @@ class PointingState:
     ActiveTrackId: Optional[int] = None
     SearchCycle: Optional[int] = None
     SearchActiveEndpoint: Optional[str] = None
+    NavigationTimestampSec: Optional[float] = None
+    NavigationSequenceNumber: Optional[int] = None
+    NavigationSource: Optional[str] = None
+    AntennaBearingPlatformDeg: Optional[float] = None
+    AntennaRawAngleDeg: Optional[float] = None
+    CommandedBearingPlatformDeg: Optional[float] = None
 
 
 class PointingManager:
@@ -135,7 +145,6 @@ class PointingManager:
             or self.ScanCommandLatencySec < 0.0
         ):
             raise ValueError("scan_command_latency_sec must not be negative")
-
         if not bool(getattr(self.Positioner, "UnlimitedAzimuth", False)):
             raise ValueError(
                 "Vanguard X requires an unlimited-azimuth X6-60 controller"
@@ -162,7 +171,13 @@ class PointingManager:
         antenna_relative_deg: float,
         platform_heading_true_deg: float,
     ) -> float:
-        return wrap360(
+        """Convert calibrated platform bearing to true beam bearing.
+
+        ``X660Controller`` owns the raw motor installation mapping. Its public
+        ``AzimuthDeg`` is already bow-zero and clockwise-positive.
+        """
+
+        return normalise_bearing_degrees(
             float(platform_heading_true_deg) + float(antenna_relative_deg)
         )
 
@@ -171,7 +186,9 @@ class PointingManager:
         true_bearing_deg: float,
         platform_heading_true_deg: float,
     ) -> float:
-        return wrap360(
+        """Convert true beam bearing to calibrated platform bearing."""
+
+        return normalise_bearing_degrees(
             float(true_bearing_deg) - float(platform_heading_true_deg)
         )
 
@@ -192,7 +209,7 @@ class PointingManager:
     def ActivateTask(
         self,
         task: RadarTask,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
     ) -> None:
         """
         Activate a task and issue its initial X6-60 command.
@@ -217,7 +234,7 @@ class PointingManager:
     def _activate_search(
         self,
         task: SearchTask,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
     ) -> None:
         self.ActiveTask = task
         self.SearchTask = task
@@ -238,7 +255,7 @@ class PointingManager:
     def _activate_track(
         self,
         task: TrackTask,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
     ) -> None:
         if self.SearchTask is not None:
             try:
@@ -287,7 +304,7 @@ class PointingManager:
             self.SearchInterrupted = True
         self.Positioner.Stop()
 
-    def ResumeSearch(self, navigation: PlatformAttitude) -> None:
+    def ResumeSearch(self, navigation: NavigationInput) -> None:
         if self.SearchTask is None:
             return
 
@@ -357,7 +374,7 @@ class PointingManager:
 
     def Update(
         self,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
         current_time_sec: Optional[float] = None,
     ) -> PointingState:
         now = time.time() if current_time_sec is None else float(current_time_sec)
@@ -487,6 +504,16 @@ class PointingManager:
             ActiveTrackId=active_track_id,
             SearchCycle=search_cycle,
             SearchActiveEndpoint=search_endpoint,
+            NavigationTimestampSec=float(navigation.TimestampSec),
+            NavigationSequenceNumber=getattr(
+                navigation,
+                "SequenceNumber",
+                None,
+            ),
+            NavigationSource=getattr(navigation, "Source", None),
+            AntennaBearingPlatformDeg=relative_az,
+            AntennaRawAngleDeg=getattr(x660_state, "RawAngleDeg", None),
+            CommandedBearingPlatformDeg=self.LastCommandedRelativeDeg,
         )
 
     # ------------------------------------------------------------------
@@ -496,7 +523,7 @@ class PointingManager:
     def _command_search_slew(
         self,
         task: SearchTask,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
     ) -> None:
         if task.Sector.Pattern in (
             SearchPattern.CONTINUOUS_CW,
@@ -542,7 +569,7 @@ class PointingManager:
     def _search_endpoint_relative(
         self,
         task: SearchTask,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
     ) -> float:
         endpoint = float(task.Sector.ActiveEndpointDeg)
 
@@ -559,22 +586,21 @@ class PointingManager:
     def _search_endpoint_true(
         self,
         task: SearchTask,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
     ) -> float:
         endpoint = float(task.Sector.ActiveEndpointDeg)
 
         if task.Sector.Frame == AngleFrame.TRUE:
             return wrap360(endpoint)
 
-        return self.RelativeToTrueBearing(
-            endpoint,
-            navigation.HeadingTrueDeg,
+        return normalise_bearing_degrees(
+            float(navigation.HeadingTrueDeg) + endpoint
         )
 
     def _update_search_endpoint(
         self,
         task: SearchTask,
-        navigation: PlatformAttitude,
+        navigation: NavigationInput,
         beam_true_deg: float,
     ) -> None:
         """Reverse search only when the measured beam reaches or crosses the
