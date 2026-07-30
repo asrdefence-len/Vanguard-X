@@ -150,6 +150,7 @@ class MissionExecutionTests(unittest.TestCase):
             effective["MissionScanPattern"],
             "CONTINUOUS_CW",
         )
+        self.assertEqual(effective["MissionScanFrame"], "TRUE")
         status = runtime.GetStatus()
         self.assertEqual(status["ActiveWaveformId"], "Frank10_20MHz")
         self.assertEqual(status["ActivePrfHz"], 2000.0)
@@ -423,6 +424,7 @@ class MissionExecutionTests(unittest.TestCase):
         self.assertEqual(runtime.ActiveTask.TaskId, "periodic-sector")
         sector_control = runtime.BuildEffectiveControlState({})
         self.assertEqual(sector_control["MissionScanPattern"], "SECTOR")
+        self.assertEqual(sector_control["MissionScanFrame"], "TRUE")
 
         runtime.Advance(7.0)
         self.assertEqual(runtime.State, "RUNNING_360")
@@ -432,6 +434,7 @@ class MissionExecutionTests(unittest.TestCase):
             baseline_control["MissionScanPattern"],
             "CONTINUOUS_CW",
         )
+        self.assertEqual(baseline_control["MissionScanFrame"], "TRUE")
         self.assertAlmostEqual(runtime.ActiveTaskElapsedSec, 5.0)
         status = runtime.GetStatus()
         self.assertTrue(status["PeriodicScheduling"])

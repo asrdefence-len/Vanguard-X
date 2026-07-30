@@ -58,11 +58,53 @@ class OperationalDisplayTrackValidationTests(unittest.TestCase):
 
     def test_remote_config_publishes_requested_track_source(self):
         filtered = FilterPublicConfig(
-            {"DisplayTrackSource": "EARTH", "PrivateKey": "not public"},
+            {
+                "DisplayTrackSource": "EARTH",
+                "PlatformTrajectoryEnabled": True,
+                "PlatformTrajectoryColour": (255, 40, 40, 210),
+                "MapPositionUpdateMinimumM": 25.0,
+                "PrivateKey": "not public",
+            },
             PUBLIC_CONFIG_KEYS,
         )
         self.assertEqual(filtered["DisplayTrackSource"], "EARTH")
+        self.assertTrue(filtered["PlatformTrajectoryEnabled"])
+        self.assertEqual(
+            filtered["PlatformTrajectoryColour"],
+            [255, 40, 40, 210],
+        )
+        self.assertEqual(filtered["MapPositionUpdateMinimumM"], 25.0)
         self.assertNotIn("PrivateKey", filtered)
+
+    def test_navigation_diagnostics_survive_ethernet_snapshot(self):
+        selection = SelectDisplayTrackProducts(
+            {"DisplayTrackSource": "EARTH"},
+            [_legacy_track()],
+            [],
+            [_earth_track(9, 1500.0, 2500.0, 0.0, 0.0)],
+            [],
+            _pose(0.25),
+        )
+        processed = _processed(selection)
+        processed.Diagnostics.update({
+            "NavigationPositionValid": True,
+            "NavigationLatitudeDeg": -34.35,
+            "NavigationLongitudeDeg": 150.98,
+            "NavigationEastM": 5000.0,
+            "NavigationNorthM": 1000.0,
+            "NavigationHeadingTrueDeg": 90.0,
+        })
+        remote = _wire_delivery(
+            {"RadarLinkMaxRangeProfilePoints": 1500},
+            processed,
+            selection.Tracks,
+            selection.Plots,
+        )
+
+        self.assertEqual(
+            remote.Processed.Diagnostics,
+            processed.Diagnostics,
+        )
 
     def test_one_snapshot_preserves_track_source_and_earth_coordinates(self):
         selection = SelectDisplayTrackProducts(

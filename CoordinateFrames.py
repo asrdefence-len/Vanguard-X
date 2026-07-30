@@ -46,6 +46,26 @@ def signed_angle_difference_degrees(
     )
 
 
+def angle_in_frame_to_true_bearing(
+    angle_degrees: float,
+    frame: str,
+    platform_heading_true_degrees: float,
+) -> float:
+    """Convert a TRUE or PLATFORM bearing into north-up true bearing."""
+
+    frame_name = str(
+        getattr(frame, "value", frame)
+    ).strip().upper()
+    if frame_name == "TRUE":
+        return normalise_bearing_degrees(angle_degrees)
+    if frame_name == "PLATFORM":
+        return normalise_bearing_degrees(
+            float(platform_heading_true_degrees)
+            + float(angle_degrees)
+        )
+    raise ValueError(f"unsupported angle frame: {frame}")
+
+
 @dataclass(frozen=True)
 class GeodeticPosition:
     """A WGS-84 latitude, longitude, and ellipsoidal altitude."""

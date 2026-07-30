@@ -4,7 +4,11 @@ import os
 import tempfile
 import unittest
 
-from RadarMapOverlay import LocalEastNorthM, RadarCentredMap
+from RadarMapOverlay import (
+    LocalEastNorthM,
+    PlatformTrajectory,
+    RadarCentredMap,
+)
 
 
 class TestRadarMapOverlay(unittest.TestCase):
@@ -35,6 +39,34 @@ class TestRadarMapOverlay(unittest.TestCase):
         moved = radar_map.ProjectCoastline()[0]
         self.assertLess(moved[0], original[0])
         self.assertLess(moved[1], original[1])
+
+    def test_platform_trajectory_ends_at_radar_centre(self):
+        trajectory = PlatformTrajectory(
+            maximum_points=10,
+            minimum_step_m=2.0,
+        )
+        trajectory.AddPosition(0.0, 0.0)
+        trajectory.AddPosition(3.0, 4.0)
+        trajectory.AddPosition(6.0, 8.0)
+
+        self.assertEqual(
+            trajectory.RelativePoints(),
+            [(-6.0, -8.0), (-3.0, -4.0), (0.0, 0.0)],
+        )
+
+    def test_platform_trajectory_keeps_live_endpoint_between_samples(self):
+        trajectory = PlatformTrajectory(
+            maximum_points=10,
+            minimum_step_m=5.0,
+        )
+        trajectory.AddPosition(100.0, 200.0)
+        accepted = trajectory.AddPosition(101.0, 202.0)
+
+        self.assertFalse(accepted)
+        self.assertEqual(
+            trajectory.RelativePoints()[-1],
+            (0.0, 0.0),
+        )
 
 
 if __name__ == "__main__":

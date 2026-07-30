@@ -537,7 +537,11 @@ class PointingManager:
                 else -1.0
             )
             self.Positioner.CommandSlew(
-                direction * abs(float(task.Sector.ScanRateDegPerSec)),
+                self._search_relative_slew_rate(
+                    task,
+                    navigation,
+                    direction,
+                ),
                 0.0,
             )
             return
@@ -556,7 +560,11 @@ class PointingManager:
         )
 
         direction = 1.0 if delta >= 0.0 else -1.0
-        rate = direction * float(task.Sector.ScanRateDegPerSec)
+        rate = self._search_relative_slew_rate(
+            task,
+            navigation,
+            direction,
+        )
 
         self.LastCommandedRelativeDeg = endpoint_relative
         self.LastCommandedTrueDeg = self._search_endpoint_true(
@@ -565,6 +573,35 @@ class PointingManager:
         )
 
         self.Positioner.CommandSlew(rate, 0.0)
+
+    @staticmethod
+    def _search_relative_slew_rate(
+        task: SearchTask,
+        navigation: NavigationInput,
+        direction: float,
+    ) -> float:
+        """Return the X6-60 rate required for the requested scan frame.
+
+        The X6-60 rate is relative to the vessel.  For an Earth-fixed scan,
+        the vessel yaw rate must therefore be removed from the desired true
+        beam rate:
+
+            antenna_relative_rate = beam_true_rate - vessel_yaw_rate
+
+        Platform-relative Dashboard scans retain their historical behaviour.
+        """
+
+        requested_rate = (
+            (1.0 if float(direction) >= 0.0 else -1.0)
+            * abs(float(task.Sector.ScanRateDegPerSec))
+        )
+        if task.Sector.Frame != AngleFrame.TRUE:
+            return requested_rate
+
+        platform_yaw_rate = float(
+            getattr(navigation, "YawRateDegPerSec", 0.0)
+        )
+        return requested_rate - platform_yaw_rate
 
     def _search_endpoint_relative(
         self,

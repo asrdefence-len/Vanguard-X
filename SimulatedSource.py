@@ -357,8 +357,16 @@ class SimulatedSource:
                     * DopplerMultiplier
                     * TxWaveform
                 )
-
-            if not Inserted:
+                
+            if (
+                not Inserted
+                and bool(
+                    self.Config.get(
+                        "WarnOnOutOfWindowSimulatedReturns",
+                        False,
+                    )
+                )
+            ):
                 print(
                     f"Warning: simulated return {TargetName} at "
                     f"{TargetRangeM:.1f} m is outside receive window"

@@ -36,11 +36,16 @@ import math
 import os
 import numpy as np
 
+from CoordinateFrames import angle_in_frame_to_true_bearing
 from RangeProfileScaling import (
     CalculateNoiseReferencedRangeProfileLimits,
     SelectRangeProfileDb,
 )
-from RadarMapOverlay import RadarCentredMap
+from RadarMapOverlay import (
+    LocalEastNorthM,
+    PlatformTrajectory,
+    RadarCentredMap,
+)
 from MissionPage import MissionPage
 
 DISPLAY_VERSION = "tracks-white-surface-symbol-v10-radar-link"
@@ -115,6 +120,8 @@ class RadarDisplay:
 
         self.ScanStartDeg = float(Config.get("ScanStartDeg", -60.0))
         self.ScanStopDeg = float(Config.get("ScanStopDeg", 60.0))
+        self.PpiSectorStartTrueDeg = self.ScanStartDeg % 360.0
+        self.PpiSectorStopTrueDeg = self.ScanStopDeg % 360.0
         self.ScanStepDeg = float(Config.get("ScanStepDeg", 1.0))
         self.MinScanRateDegPerSec = float(
             Config.get("MinScanRateDegPerSec", 1.0)
@@ -324,8 +331,46 @@ class RadarDisplay:
         self.MapLandColour = Config.get("MapLandColour", (92, 92, 92, 105))
         self.MapCoastColour = Config.get("MapCoastColour", (255, 255, 255, 190))
         self.MapLabelColour = Config.get("MapLabelColour", (255, 255, 255, 180))
+        self.MapPositionUpdateMinimumM = max(
+            0.0,
+            float(Config.get("MapPositionUpdateMinimumM", 25.0)),
+        )
         self.MapOverlay = None
         self.MapGraphicsItems = []
+        self.MapMovableGraphicsItems = []
+        self.MapRenderedLatitudeDeg = None
+        self.MapRenderedLongitudeDeg = None
+        self.MapAppliedShiftEastM = 0.0
+        self.MapAppliedShiftNorthM = 0.0
+
+        # The vessel trail is held in fixed mission East/North coordinates,
+        # then reprojected about the latest navigation fix.  Its newest point
+        # therefore remains at the PPI origin while the travelled path moves.
+        self.PlatformTrajectoryEnabled = bool(
+            Config.get("PlatformTrajectoryEnabled", True)
+        )
+        self.PlatformTrajectoryColour = Config.get(
+            "PlatformTrajectoryColour",
+            (255, 40, 40, 210),
+        )
+        self.PlatformTrajectoryWidthPx = max(
+            0.5,
+            float(Config.get("PlatformTrajectoryWidthPx", 1.0)),
+        )
+        self.PlatformTrajectoryModel = PlatformTrajectory(
+            maximum_points=int(
+                Config.get("PlatformTrajectoryMaximumPoints", 4096)
+            ),
+            minimum_step_m=float(
+                Config.get("PlatformTrajectoryMinimumStepM", 2.0)
+            ),
+        )
+        self.PlatformTrajectoryCurve = None
+        self.NavigationLatitudeDeg = None
+        self.NavigationLongitudeDeg = None
+        self.NavigationEastM = None
+        self.NavigationNorthM = None
+        self.NavigationHeadingTrueDeg = None
 
         # Optional logo. Path is relative to the folder you run the script from,
         # or it may be an absolute path.
@@ -410,6 +455,8 @@ class RadarDisplay:
                 self.DisplayTrackSourceReason,
             )
         )
+        self.UpdateNavigationFromDiagnostics(Diagnostics)
+        self.UpdateDisplayedSectorFromDiagnostics(Diagnostics)
 
         if self.ShowRawDetections:
             self.AppendPolarDetections(Detections)
@@ -1060,6 +1107,17 @@ class RadarDisplay:
     def CreateStaticPpiItems(self):
         self.CreateMapOverlay()
 
+        if self.PlatformTrajectoryEnabled:
+            self.PlatformTrajectoryCurve = self.PpiPlot.plot(
+                [],
+                [],
+                pen=pg.mkPen(
+                    self.PlatformTrajectoryColour,
+                    width=self.PlatformTrajectoryWidthPx,
+                ),
+            )
+            self.PlatformTrajectoryCurve.setZValue(-50.0)
+
         # Static range rings.
         if self.RangeRingStepM > 0:
             RingRanges = np.arange(
@@ -1138,11 +1196,17 @@ class RadarDisplay:
             dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), dataset_path)
 
         try:
-            self.MapOverlay = RadarCentredMap(
-                dataset_path,
-                self.MapLatitudeDeg,
-                self.MapLongitudeDeg,
-            )
+            if self.MapOverlay is None:
+                self.MapOverlay = RadarCentredMap(
+                    dataset_path,
+                    self.MapLatitudeDeg,
+                    self.MapLongitudeDeg,
+                )
+            else:
+                self.MapOverlay.SetRadarPosition(
+                    self.MapLatitudeDeg,
+                    self.MapLongitudeDeg,
+                )
             coastlines = self.MapOverlay.ProjectCoastlines()
             land_polygons = self.MapOverlay.ProjectLandPolygons()
         except Exception as error:
@@ -1169,6 +1233,7 @@ class RadarDisplay:
             land_item.setZValue(-100.0)
             self.PpiPlot.addItem(land_item)
             self.MapGraphicsItems.append(land_item)
+            self.MapMovableGraphicsItems.append(land_item)
 
         for coastline in coastlines:
             coast_item = self.PpiPlot.plot(
@@ -1178,6 +1243,7 @@ class RadarDisplay:
             )
             coast_item.setZValue(-90.0)
             self.MapGraphicsItems.append(coast_item)
+            self.MapMovableGraphicsItems.append(coast_item)
 
         for name, east_m, north_m in self.MapOverlay.ProjectLabels(self.PolarMaxRangeM):
             label = pg.TextItem(name, color=self.MapLabelColour, anchor=(0.5, 0.5))
@@ -1185,6 +1251,7 @@ class RadarDisplay:
             label.setZValue(-80.0)
             self.PpiPlot.addItem(label)
             self.MapGraphicsItems.append(label)
+            self.MapMovableGraphicsItems.append(label)
 
         attribution = pg.TextItem(
             "Map: © OpenStreetMap contributors",
@@ -1195,20 +1262,123 @@ class RadarDisplay:
         attribution.setZValue(-70.0)
         self.PpiPlot.addItem(attribution)
         self.MapGraphicsItems.append(attribution)
+        self.MapRenderedLatitudeDeg = self.MapLatitudeDeg
+        self.MapRenderedLongitudeDeg = self.MapLongitudeDeg
+        self.MapAppliedShiftEastM = 0.0
+        self.MapAppliedShiftNorthM = 0.0
 
     def SetRadarPosition(self, latitude_deg, longitude_deg):
-        """Future GPS entry point; keep radar centred and move the map."""
+        """Keep the radar centred and redraw the map about the live GPS fix."""
+
+        latitude_deg = float(latitude_deg)
+        longitude_deg = float(longitude_deg)
         self.MapLatitudeDeg = float(latitude_deg)
         self.MapLongitudeDeg = float(longitude_deg)
         if self.MapOverlay is None:
             return
+        if (
+            self.MapRenderedLatitudeDeg is not None
+            and self.MapRenderedLongitudeDeg is not None
+        ):
+            moved_east_m, moved_north_m = LocalEastNorthM(
+                latitude_deg,
+                longitude_deg,
+                self.MapRenderedLatitudeDeg,
+                self.MapRenderedLongitudeDeg,
+            )
+            delta_shift_east_m = (
+                moved_east_m - self.MapAppliedShiftEastM
+            )
+            delta_shift_north_m = (
+                moved_north_m - self.MapAppliedShiftNorthM
+            )
+            for item in self.MapMovableGraphicsItems:
+                try:
+                    item.moveBy(
+                        -delta_shift_east_m,
+                        -delta_shift_north_m,
+                    )
+                except Exception:
+                    pass
+            self.MapAppliedShiftEastM = moved_east_m
+            self.MapAppliedShiftNorthM = moved_north_m
+            if (
+                math.hypot(moved_east_m, moved_north_m)
+                < self.MapPositionUpdateMinimumM
+            ):
+                return
         for item in self.MapGraphicsItems:
             try:
                 self.PpiPlot.removeItem(item)
             except Exception:
                 pass
         self.MapGraphicsItems = []
+        self.MapMovableGraphicsItems = []
         self.CreateMapOverlay()
+
+    def UpdateNavigationFromDiagnostics(self, diagnostics):
+        """Apply the dwell-synchronous platform pose to map and trail."""
+
+        if not bool(diagnostics.get("NavigationPositionValid", False)):
+            return
+
+        required = (
+            "NavigationLatitudeDeg",
+            "NavigationLongitudeDeg",
+            "NavigationEastM",
+            "NavigationNorthM",
+        )
+        if any(diagnostics.get(name) is None for name in required):
+            return
+
+        self.SetNavigationState(
+            latitude_deg=diagnostics["NavigationLatitudeDeg"],
+            longitude_deg=diagnostics["NavigationLongitudeDeg"],
+            east_m=diagnostics["NavigationEastM"],
+            north_m=diagnostics["NavigationNorthM"],
+            heading_true_deg=diagnostics.get("NavigationHeadingTrueDeg"),
+        )
+
+    def SetNavigationState(
+        self,
+        latitude_deg,
+        longitude_deg,
+        east_m,
+        north_m,
+        heading_true_deg=None,
+    ):
+        """Update north-up map translation and the platform breadcrumb trail."""
+
+        latitude_deg = float(latitude_deg)
+        longitude_deg = float(longitude_deg)
+        east_m = float(east_m)
+        north_m = float(north_m)
+        values = (latitude_deg, longitude_deg, east_m, north_m)
+        if not all(math.isfinite(value) for value in values):
+            return
+
+        self.NavigationLatitudeDeg = latitude_deg
+        self.NavigationLongitudeDeg = longitude_deg
+        self.NavigationEastM = east_m
+        self.NavigationNorthM = north_m
+        if heading_true_deg is not None and math.isfinite(
+            float(heading_true_deg)
+        ):
+            self.NavigationHeadingTrueDeg = float(heading_true_deg) % 360.0
+
+        self.PlatformTrajectoryModel.AddPosition(east_m, north_m)
+        self.UpdatePlatformTrajectoryLine()
+        if self.MapEnabled:
+            self.SetRadarPosition(latitude_deg, longitude_deg)
+
+    def UpdatePlatformTrajectoryLine(self):
+        if self.PlatformTrajectoryCurve is None:
+            return
+        points = self.PlatformTrajectoryModel.RelativePoints()
+        self.PlatformTrajectoryCurve.setData(
+            [point[0] for point in points],
+            [point[1] for point in points],
+        )
 
     @staticmethod
     def CreateSurfaceVesselSymbolPath():
@@ -1331,10 +1501,66 @@ class RadarDisplay:
             style=QtCore.Qt.PenStyle.DashLine,
         )
 
-        for AngleDeg in [self.ScanStartDeg, self.ScanStopDeg]:
+        for AngleDeg in [
+            self.PpiSectorStartTrueDeg,
+            self.PpiSectorStopTrueDeg,
+        ]:
             X, Y = self.AngleRangeToXY(AngleDeg, self.PolarMaxRangeM)
             Line = self.PpiPlot.plot([0, X], [0, Y], pen=BoundaryPen)
             self.SectorBoundaryLines.append(Line)
+
+    def UpdateDisplayedSectorFromDiagnostics(self, diagnostics):
+        """Draw scheduler sector limits in north-up true bearings.
+
+        Operator control values remain in their declared task frame; these
+        separate PPI-only values prevent display conversion from feeding back
+        into the X6-60 command path.
+        """
+
+        if (
+            diagnostics.get("SearchSectorStartDeg") is None
+            or diagnostics.get("SearchSectorStopDeg") is None
+        ):
+            return
+
+        sector_start_deg = float(
+            diagnostics["SearchSectorStartDeg"]
+        )
+        sector_stop_deg = float(
+            diagnostics["SearchSectorStopDeg"]
+        )
+        sector_frame = str(
+            diagnostics.get("SearchSectorFrame", "TRUE")
+        ).upper()
+        heading_true_deg = diagnostics.get("NavigationHeadingTrueDeg")
+        if sector_frame == "PLATFORM" and heading_true_deg is None:
+            return
+        sector_start_deg = angle_in_frame_to_true_bearing(
+            sector_start_deg,
+            sector_frame,
+            0.0 if heading_true_deg is None else heading_true_deg,
+        )
+        sector_stop_deg = angle_in_frame_to_true_bearing(
+            sector_stop_deg,
+            sector_frame,
+            0.0 if heading_true_deg is None else heading_true_deg,
+        )
+        changed = (
+            not math.isclose(
+                sector_start_deg,
+                self.PpiSectorStartTrueDeg,
+                abs_tol=1.0e-6,
+            )
+            or not math.isclose(
+                sector_stop_deg,
+                self.PpiSectorStopTrueDeg,
+                abs_tol=1.0e-6,
+            )
+        )
+        self.PpiSectorStartTrueDeg = sector_start_deg
+        self.PpiSectorStopTrueDeg = sector_stop_deg
+        if changed:
+            self.UpdateSectorBoundaryLines()
 
     def UpdateBeamLine(self):
         X, Y = self.AngleRangeToXY(self.BeamAngleDeg, self.PolarMaxRangeM)
@@ -2007,6 +2233,7 @@ class RadarDisplay:
     def OnScanStartChanged(self):
         try:
             self.ScanStartDeg = float(self.ControlWidgets["ScanStart"].text())
+            self.PpiSectorStartTrueDeg = self.ScanStartDeg % 360.0
             self.Config["ScanStartDeg"] = self.ScanStartDeg
             self.UpdateSectorBoundaryLines()
             self.UpdateStatusPanel()
@@ -2016,6 +2243,7 @@ class RadarDisplay:
     def OnScanStopChanged(self):
         try:
             self.ScanStopDeg = float(self.ControlWidgets["ScanStop"].text())
+            self.PpiSectorStopTrueDeg = self.ScanStopDeg % 360.0
             self.Config["ScanStopDeg"] = self.ScanStopDeg
             self.UpdateSectorBoundaryLines()
             self.UpdateStatusPanel()

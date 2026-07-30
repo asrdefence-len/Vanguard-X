@@ -53,6 +53,50 @@ class TestMinimumDetectionRange(unittest.TestCase):
             main_text = source.read()
         self.assertIn('"MinRangeM": 2000.0', main_text)
 
+    def test_high_dynamic_range_integral_does_not_create_negative_noise(self):
+        detector = CfarDetector({
+            "TrainingCellsRange": 12,
+            "TrainingCellsDoppler": 4,
+            "GuardCellsRange": 4,
+            "GuardCellsDoppler": 1,
+            "CfarThresholdDb": 12.3,
+            "MaxDetections": 3000,
+            "MinRangeM": 0.0,
+            "MaxRangeM": 20000.0,
+        })
+
+        doppler_bins = 64
+        range_bins = 4043
+        range_doppler = np.ones(
+            (doppler_bins, range_bins),
+            dtype=np.complex64,
+        )
+        # Repeated high-power columns reproduce the accumulated float32
+        # cancellation seen in the operational log without using random data.
+        range_doppler[:, ::100] = 1000.0 + 0.0j
+        processed = SimpleNamespace(
+            RangeDopplerMap=range_doppler,
+            RangeAxisM=np.arange(range_bins, dtype=float) * 4.0,
+            DopplerAxisHz=np.arange(doppler_bins, dtype=float),
+            VelocityAxisMps=np.arange(doppler_bins, dtype=float),
+            Diagnostics={"BoresightDeg": 40.0},
+            DwellId=1,
+            TimeStamp=0.0,
+        )
+
+        detections = detector.Detect(processed)
+
+        self.assertGreater(len(detections), 0)
+        self.assertLess(len(detections), detector.MaxDetections)
+        self.assertTrue(all(
+            np.isfinite(detection.NoiseEstimateDb)
+            for detection in detections
+        ))
+        self.assertTrue(all(
+            np.isfinite(detection.ThresholdDb)
+            for detection in detections
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

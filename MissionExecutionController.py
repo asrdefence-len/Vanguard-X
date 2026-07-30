@@ -604,6 +604,7 @@ class MissionExecutionController:
                     if str(task.Direction).upper() == "CW"
                     else "CONTINUOUS_CCW"
                 )
+                result["MissionScanFrame"] = "TRUE"
             else:
                 start_deg = float(task.StartDeg)
                 stop_deg = float(task.StopDeg)
@@ -617,6 +618,10 @@ class MissionExecutionController:
                 result["MissionScanRateDegSec"] = float(task.ScanRateDegSec)
                 result["MissionScanDirection"] = str(task.InitialDirection)
                 result["MissionScanPattern"] = "SECTOR"
+                # Mission sector bearings are geographic/true bearings.  The
+                # scheduler and PointingManager convert them continuously to
+                # vessel-relative X6-60 commands as platform heading changes.
+                result["MissionScanFrame"] = "TRUE"
         elif self.State in ("LOADED", "PAUSED"):
             result["DisplayMode"] = "STOP"
             result["ScanEnabled"] = False

@@ -571,8 +571,17 @@ def ExecuteRadarDwell(
     Processed = Processor.Process(Raw, ThisDwell)
     T2 = time.perf_counter()
 
-    Processed.Diagnostics["BoresightDeg"] = float(BoresightDeg)
-    Processed.Diagnostics["BeamAngleDeg"] = float(BoresightDeg)
+    # Use the same timestamped true-bearing snapshot that RadarExecutor used
+    # to construct ThisDwell. The pre-dwell main-loop boresight can be older
+    # than the executor's pointing update, especially during a 60 deg/s scan.
+    # Labelling detections with that older angle separates the PPI, simulator
+    # beam and Earth tracker by a moving angular error.
+    ExecutedBoresightDeg = float(
+        ExecutionResult.Pointing.BeamBearingTrueDeg
+    ) % 360.0
+    Processed.Diagnostics["BoresightDeg"] = ExecutedBoresightDeg
+    Processed.Diagnostics["BeamAngleDeg"] = ExecutedBoresightDeg
+    Processed.Diagnostics["PreDwellBoresightDeg"] = float(BoresightDeg)
     Processed.Diagnostics["CommandedBoresightDeg"] = float(CommandedBoresightDeg)
     Processed.Diagnostics["AntennaAzDeg"] = float(MeasuredAntennaAzDeg)
     Processed.Diagnostics["AntennaElDeg"] = float(MeasuredAntennaElDeg)
@@ -592,6 +601,16 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["ScheduledWaveformProfileId"] = str(
         getattr(ScheduledTask, "WaveformProfileId", "")
     )
+    if "SearchSectorFrame" in ThisDwell.Metadata:
+        Processed.Diagnostics["SearchSectorFrame"] = str(
+            ThisDwell.Metadata["SearchSectorFrame"]
+        )
+        Processed.Diagnostics["SearchSectorStartDeg"] = float(
+            ThisDwell.Metadata["SearchSectorStartDeg"]
+        )
+        Processed.Diagnostics["SearchSectorStopDeg"] = float(
+            ThisDwell.Metadata["SearchSectorStopDeg"]
+        )
 
     Detections = Detector.Detect(Processed, ThisDwell)
     EarthReferencedMeasurements = AnnotateDetectionsWithEarthReference(
@@ -620,6 +639,48 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["NavigationPoseTimestampSec"] = getattr(
         NavigationAttitude,
         "TimestampSec",
+        None,
+    )
+    NavigationGeodetic = getattr(NavigationAttitude, "Geodetic", None)
+    NavigationPositionEnu = getattr(
+        NavigationAttitude,
+        "PositionEnu",
+        None,
+    )
+    Processed.Diagnostics["NavigationPositionValid"] = bool(
+        getattr(NavigationAttitude, "PositionValid", False)
+    )
+    Processed.Diagnostics["NavigationHeadingValid"] = bool(
+        getattr(NavigationAttitude, "HeadingValid", False)
+    )
+    Processed.Diagnostics["NavigationLatitudeDeg"] = getattr(
+        NavigationGeodetic,
+        "latitude_deg",
+        None,
+    )
+    Processed.Diagnostics["NavigationLongitudeDeg"] = getattr(
+        NavigationGeodetic,
+        "longitude_deg",
+        None,
+    )
+    Processed.Diagnostics["NavigationEastM"] = getattr(
+        NavigationPositionEnu,
+        "east_m",
+        None,
+    )
+    Processed.Diagnostics["NavigationNorthM"] = getattr(
+        NavigationPositionEnu,
+        "north_m",
+        None,
+    )
+    Processed.Diagnostics["NavigationHeadingTrueDeg"] = getattr(
+        NavigationAttitude,
+        "HeadingTrueDeg",
+        None,
+    )
+    Processed.Diagnostics["NavigationYawRateDegPerSec"] = getattr(
+        NavigationAttitude,
+        "YawRateDegPerSec",
         None,
     )
 
@@ -875,9 +936,9 @@ def Main(CommandLineArguments=None):
         "RadarVYMps": 0.0,
         # The simulator publishes the same timestamped NavigationPose contract
         # that the future operational GPS/WT901 source will publish.
-        # STATIONARY preserves the current default. Set this to CIRCLE for the
-        # deterministic offshore circular-route digital twin.
-        "SimulatedNavigationMode": "STATIONARY",
+        # Normal simulation uses the deterministic offshore circular-route
+        # digital twin. Operational HARD and RF LOOPBACK modes are unaffected.
+        "SimulatedNavigationMode": "CIRCLE",
         "MissionOriginLatitudeDeg": -34.368,
         "MissionOriginLongitudeDeg": 150.929,
         "MissionOriginAltitudeM": 0.0,
@@ -1004,8 +1065,8 @@ def Main(CommandLineArguments=None):
         "MaxPolarDetections": 500,
         "RangeRingStepM": 2000.0,
 
-        # Offline North-up map beneath the PPI. The radar remains at the
-        # centre; live GPS will later replace these fixed Bellambi coordinates.
+        # Offline North-up map beneath the PPI. Navigation updates recalculate
+        # the map about the live platform fix while the radar remains centred.
         "MapEnabled": True,
         "MapLatitudeDeg": -34.368,
         "MapLongitudeDeg": 150.929,
@@ -1013,6 +1074,14 @@ def Main(CommandLineArguments=None):
         "MapLandColour": (92, 92, 92, 105),
         "MapCoastColour": (255, 255, 255, 190),
         "MapLabelColour": (255, 255, 255, 180),
+        # Translate vector items every navigation update; rebuild their
+        # circular clip only after 25 m of movement.
+        "MapPositionUpdateMinimumM": 25.0,
+        "PlatformTrajectoryEnabled": True,
+        "PlatformTrajectoryColour": (255, 40, 40, 210),
+        "PlatformTrajectoryWidthPx": 1.0,
+        "PlatformTrajectoryMaximumPoints": 4096,
+        "PlatformTrajectoryMinimumStepM": 2.0,
 
         "RangeDopplerUpdateEveryNDwells": 0,
         "PolarUpdateEveryNDwells": 1,
@@ -1979,6 +2048,15 @@ def Main(CommandLineArguments=None):
                         60.0,
                     )),
                 )
+                RequestedScanFrame = str(
+                    ControlState.get(
+                        "MissionScanFrame",
+                        Config.get("X660ScanFrame", "PLATFORM"),
+                    )
+                    if ControlState is not None
+                    else Config.get("X660ScanFrame", "PLATFORM")
+                ).upper()
+                SearchTask.Sector.Frame = AngleFrame(RequestedScanFrame)
                 RequestedScanPattern = str(
                     ControlState.get(
                         "MissionScanPattern",
@@ -2000,9 +2078,30 @@ def Main(CommandLineArguments=None):
                     # as a North crossing in a new continuous task.
                     SearchTask.Sector.LastMeasuredAzimuthDeg = None
                     if SearchTask.Sector.Pattern == SearchPattern.SECTOR:
+                        RelativeStartDeg = (
+                            Pointing.TrueToRelativeAzimuth(
+                                ScanStartDeg,
+                                NavigationAttitude.HeadingTrueDeg,
+                            )
+                            if SearchTask.Sector.Frame == AngleFrame.TRUE
+                            else ScanStartDeg
+                        )
+                        RelativeStopDeg = (
+                            Pointing.TrueToRelativeAzimuth(
+                                ScanStopDeg,
+                                NavigationAttitude.HeadingTrueDeg,
+                            )
+                            if SearchTask.Sector.Frame == AngleFrame.TRUE
+                            else ScanStopDeg
+                        )
                         print(
                             f"PointingManager sector scan start: "
-                            f"{ScanStartDeg:.2f} -> {ScanStopDeg:.2f}"
+                            f"{ScanStartDeg:.2f} -> {ScanStopDeg:.2f} "
+                            f"{SearchTask.Sector.Frame.value}; "
+                            f"heading="
+                            f"{NavigationAttitude.HeadingTrueDeg:.2f} deg, "
+                            f"X6-60={RelativeStartDeg:.2f} -> "
+                            f"{RelativeStopDeg:.2f} deg relative"
                         )
                     else:
                         print(

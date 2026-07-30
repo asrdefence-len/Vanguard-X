@@ -148,8 +148,18 @@ class CfarDetector:
             return []
 
         # Zero-padded integral image. Shape is one larger in both dimensions.
+        #
+        # Keep the input map as float32 for the normal embedded processing
+        # cost, but accumulate the integral image in float64. A float32
+        # integral loses enough precision on high-dynamic-range dwells for
+        # FullSum - GuardSum to become slightly negative. That creates a
+        # negative threshold, a MaxDetections false-alarm burst, and invalid
+        # log10 diagnostics.
         Integral = np.pad(PowerMap, ((1, 0), (1, 0)), mode="constant")
-        Integral = Integral.cumsum(axis=0).cumsum(axis=1)
+        Integral = Integral.cumsum(axis=0, dtype=np.float64).cumsum(
+            axis=1,
+            dtype=np.float64,
+        )
 
         D = DopplerIdx[:, None]
         R = RangeIdx[None, :]
@@ -172,7 +182,10 @@ class CfarDetector:
             R + self.GuardR + 1,
         )
 
-        NoiseEstimate = (FullSum - GuardSum) / np.float32(self.NumTrainingCells)
+        NoiseEstimate = np.maximum(
+            FullSum - GuardSum,
+            0.0,
+        ) / float(self.NumTrainingCells)
         Threshold = NoiseEstimate * self.ThresholdScale
 
         Cells = PowerMap[DopplerIdx[:, None], RangeIdx[None, :]]
