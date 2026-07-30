@@ -83,6 +83,12 @@ class RadarDisplay:
         self.ExitRequested = False
         self.UpdateCounter = 0
         self.RadarLinkStatus = str(Config.get("RadarLinkStatus", "LOCAL"))
+        self.DisplayTrackSourceRequested = str(
+            Config.get("DisplayTrackSource", "LEGACY")
+        ).upper()
+        self.DisplayTrackSourceApplied = self.DisplayTrackSourceRequested
+        self.DisplayTrackSourceFallback = False
+        self.DisplayTrackSourceReason = "INITIAL_CONFIG"
 
         self.DisplayMode = self.Config.get("InitialDisplayMode", "STOP")
         self.ScanEnabled = bool(self.Config.get("InitialScanEnabled", False))
@@ -378,6 +384,30 @@ class RadarDisplay:
 
         Diagnostics = getattr(Processed, "Diagnostics", {})
         self.BeamAngleDeg = float(Diagnostics.get("BoresightDeg", self.BeamAngleDeg))
+        self.DisplayTrackSourceRequested = str(
+            Diagnostics.get(
+                "DisplayTrackSourceRequested",
+                self.DisplayTrackSourceRequested,
+            )
+        ).upper()
+        self.DisplayTrackSourceApplied = str(
+            Diagnostics.get(
+                "DisplayTrackSourceApplied",
+                self.DisplayTrackSourceApplied,
+            )
+        ).upper()
+        self.DisplayTrackSourceFallback = bool(
+            Diagnostics.get(
+                "DisplayTrackSourceFallback",
+                self.DisplayTrackSourceFallback,
+            )
+        )
+        self.DisplayTrackSourceReason = str(
+            Diagnostics.get(
+                "DisplayTrackSourceReason",
+                self.DisplayTrackSourceReason,
+            )
+        )
 
         if self.ShowRawDetections:
             self.AppendPolarDetections(Detections)
@@ -1763,6 +1793,9 @@ class RadarDisplay:
         Status = str(getattr(Track, "Status", "UNKNOWN")).upper()
         IsConfirmed = bool(getattr(Track, "IsConfirmed", False)) or Status == "CONFIRMED"
         TrackType = str(getattr(Track, "TrackType", "SURFACE VESSEL"))
+        TrackSource = str(
+            getattr(Track, "TrackSource", self.DisplayTrackSourceApplied)
+        ).upper()
 
         RangeM = GetFloat("RangeM")
         AzimuthDeg = GetFloat("AzimuthDeg")
@@ -1777,6 +1810,7 @@ class RadarDisplay:
             "---------------\n"
             f"Track ID:   T{TrackId}\n"
             f"Status:     {'CONFIRMED' if IsConfirmed else Status}\n"
+            f"Source:     {TrackSource}\n"
             f"Type:       {TrackType}\n"
             f"Range:      {RangeM:8.1f} m\n"
             f"Azimuth:    {AzimuthDeg:8.2f} deg\n"
@@ -1811,6 +1845,7 @@ class RadarDisplay:
             f"Scan:   {self.ScanEnabled}",
             f"Tx:     {TransmitStatus}",
             f"Beam:   {self.BeamAngleDeg:.1f} deg",
+            f"Track src: {self.DisplayTrackSourceApplied}",
             f"Wave:   {self.AppliedWaveformId}",
             (
                 f"Timing: {self.AppliedPrfHz / 1000.0:.2f} kHz, "
@@ -1824,6 +1859,14 @@ class RadarDisplay:
             f"Tent:   {NumTentative}",
             f"Tracks: {NumConfirmed}",
         ]
+
+        if self.DisplayTrackSourceFallback:
+            Lines.append(
+                "Track fallback: "
+                f"{self.DisplayTrackSourceRequested} -> "
+                f"{self.DisplayTrackSourceApplied} "
+                f"({self.DisplayTrackSourceReason})"
+            )
 
         if self.LatestProcessed is not None:
             Diagnostics = getattr(self.LatestProcessed, "Diagnostics", {})

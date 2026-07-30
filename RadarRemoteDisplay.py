@@ -85,6 +85,7 @@ PUBLIC_CONFIG_KEYS = {
     "MapCoastColour", "MapLabelColour", "LogoPath", "LogoWidthPx",
     "RadarDwellIntervalSec", "MissionUsableBeamwidthDeg",
     "AntennaMaximumRotationRpm", "AntennaMaximumScanRateDegSec",
+    "DisplayTrackSource",
 }
 
 
@@ -206,8 +207,13 @@ def BuildDisplaySnapshot(config, processed, detections, tracks, plots):
         "AzimuthDeg", "RangeRateMps", "RangeRate", "VelocityMps",
         "AzimuthRateDps", "AngleRateDps", "BearingRateDps", "Hits",
         "HitCount", "Misses", "MissedCount", "Age", "ScanAge",
+        "TrackSource", "EarthEastM", "EarthNorthM",
+        "VelocityEastMps", "VelocityNorthMps",
     )
-    plot_fields = ("RangeM", "AzimuthDeg", "AmplitudeDb", "DopplerHz")
+    plot_fields = (
+        "RangeM", "AzimuthDeg", "AmplitudeDb", "DopplerHz",
+        "TrackSource", "EarthEastM", "EarthNorthM",
+    )
     return {
         "timestamp_unix_sec": time.time(),
         "processed": processed_fields,
