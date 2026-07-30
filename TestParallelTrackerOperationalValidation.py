@@ -126,7 +126,7 @@ class TestStage7AuthorityBoundary(unittest.TestCase):
         self.assertTrue(report.LegacyTrackerAuthoritative)
         self.assertFalse(report.EarthTrackerAuthoritative)
 
-    def test_scheduler_still_displays_only_legacy_tracks(self):
+    def test_scheduler_keeps_tasking_legacy_when_display_is_selectable(self):
         scheduler = (
             Path(__file__).resolve().parent / "VanguardxMain_scheduler.py"
         ).read_text(encoding="utf-8")
@@ -136,11 +136,19 @@ class TestStage7AuthorityBoundary(unittest.TestCase):
             scheduler,
         )
         self.assertIn(
-            "Display.Update(Processed, Detections, Tracks=Tracks",
+            "Tracks=DisplayTracks",
             scheduler,
         )
-        self.assertNotIn(
-            "Display.Update(Processed, Detections, Tracks=EarthTracks",
+        self.assertIn(
+            '"Tracks": Tracks',
+            scheduler,
+        )
+        self.assertIn(
+            'Processed.Diagnostics["TaskingTrackSource"] = "LEGACY"',
+            scheduler,
+        )
+        self.assertIn(
+            '"DisplayTrackSource": "LEGACY"',
             scheduler,
         )
 

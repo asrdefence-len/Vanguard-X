@@ -366,7 +366,7 @@ class TestParallelTrackerComparison(unittest.TestCase):
 
 
 class TestSchedulerStage6Boundary(unittest.TestCase):
-    def test_parallel_tracker_cannot_replace_legacy_display_tracks(self):
+    def test_parallel_tracker_cannot_replace_legacy_tasking_tracks(self):
         source = (
             Path(__file__).resolve().parent / "VanguardxMain_scheduler.py"
         ).read_text(encoding="utf-8")
@@ -377,18 +377,26 @@ class TestSchedulerStage6Boundary(unittest.TestCase):
         earth_update_index = source.index(
             "EarthTracker.Update("
         )
-        display_index = source.index(
-            "Display.Update(Processed, Detections, Tracks=Tracks"
+        selection_index = source.index(
+            "DisplayTrackSelection = SelectDisplayTrackProducts("
         )
 
         self.assertLess(legacy_update_index, earth_update_index)
-        self.assertLess(earth_update_index, display_index)
+        self.assertLess(earth_update_index, selection_index)
         self.assertIn(
             'Processed.Diagnostics["EarthTrackerAuthoritative"] = False',
             source,
         )
-        self.assertNotIn(
-            "Display.Update(Processed, Detections, Tracks=EarthTracks",
+        self.assertIn(
+            'Processed.Diagnostics["TaskingTrackSource"] = "LEGACY"',
+            source,
+        )
+        self.assertIn(
+            'Processed.Diagnostics["TrackUpdateSource"] = "LEGACY"',
+            source,
+        )
+        self.assertIn(
+            '"Tracks": Tracks',
             source,
         )
 

@@ -50,6 +50,10 @@ from EarthReferencedTracker import (
     BuildParallelTrackerComparison,
     EarthReferencedTracker,
 )
+from DisplayTrackSource import (
+    NormaliseDisplayTrackSource,
+    SelectDisplayTrackProducts,
+)
 from NavigationState import (
     CircularRouteNavigationSource,
     SimulatedNavigationSource,
@@ -124,6 +128,7 @@ def ParseUiArguments(CommandLineArguments=None):
         "DisplayTransport": "LOCAL_QT",
         "RadarLinkHost": "127.0.0.1",
         "RadarLinkPort": 5810,
+        "DisplayTrackSource": "LEGACY",
     }
     Filtered = []
     Index = 0
@@ -133,12 +138,20 @@ def ParseUiArguments(CommandLineArguments=None):
             Options["DisplayTransport"] = "TCP_SERVER"
             Index += 1
             continue
-        if Argument in ("--radar-link-host", "--radar-link-port"):
+        if Argument in (
+            "--radar-link-host",
+            "--radar-link-port",
+            "--display-track-source",
+        ):
             if Index + 1 >= len(Arguments):
                 raise ValueError(f"{Argument} requires a value")
             Value = Arguments[Index + 1]
             if Argument == "--radar-link-host":
                 Options["RadarLinkHost"] = str(Value)
+            elif Argument == "--display-track-source":
+                Options["DisplayTrackSource"] = (
+                    NormaliseDisplayTrackSource(Value)
+                )
             else:
                 Options["RadarLinkPort"] = int(Value)
             Index += 2
@@ -617,10 +630,9 @@ def ExecuteRadarDwell(
         Tracks, Plots = [], []
         TrackerDebug = {}
 
-    # Stage 6 validation boundary: run a second tracker in fixed mission ENU
-    # coordinates.  The legacy range/bearing tracker above remains the sole
-    # source of display and tasking tracks until this parallel stream passes
-    # moving-platform trials.
+    # Run the second tracker in fixed mission ENU coordinates. Stage 8 may
+    # project this stream onto the PPI, but the legacy range/bearing tracker
+    # above remains the sole source of tasking and track-update authority.
     EarthTracks = []
     EarthPlots = []
     EarthTrackerDebug = {}
@@ -689,10 +701,47 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["TrackerTentativeTracks"] = int(TrackerDebug.get("TentativeTracks", 0))
     Processed.Diagnostics["TrackerConfirmedTracks"] = int(TrackerDebug.get("ConfirmedTracks", 0))
 
+    # Stage 8 authority boundary: only the products handed to the display are
+    # selectable.  ``Tracks`` and ``Plots`` above remain the legacy tracker
+    # results returned to the scheduler and used by all tasking paths.
+    DisplayTrackSelection = SelectDisplayTrackProducts(
+        Config,
+        Tracks,
+        Plots,
+        EarthTracks,
+        EarthPlots,
+        NavigationAttitude,
+    )
+    DisplayTracks = DisplayTrackSelection.Tracks
+    DisplayPlots = DisplayTrackSelection.Plots
+    Processed.Diagnostics["DisplayTrackSourceRequested"] = (
+        DisplayTrackSelection.RequestedSource
+    )
+    Processed.Diagnostics["DisplayTrackSourceApplied"] = (
+        DisplayTrackSelection.AppliedSource
+    )
+    Processed.Diagnostics["DisplayTrackSourceFallback"] = bool(
+        DisplayTrackSelection.FallbackUsed
+    )
+    Processed.Diagnostics["DisplayTrackSourceReason"] = str(
+        DisplayTrackSelection.Reason
+    )
+    Processed.Diagnostics["DisplayTrackCount"] = len(DisplayTracks)
+    Processed.Diagnostics["EarthTrackerSelectedForDisplay"] = (
+        DisplayTrackSelection.AppliedSource == "EARTH"
+    )
+    Processed.Diagnostics["TaskingTrackSource"] = "LEGACY"
+    Processed.Diagnostics["TrackUpdateSource"] = "LEGACY"
+
     T3 = time.perf_counter()
     Logger.log_dwell(Processed, Detections)
     T4 = time.perf_counter()
-    Display.Update(Processed, Detections, Tracks=Tracks, Plots=Plots)
+    Display.Update(
+        Processed,
+        Detections,
+        Tracks=DisplayTracks,
+        Plots=DisplayPlots,
+    )
     T5 = time.perf_counter()
 
     return {
@@ -709,6 +758,9 @@ def ExecuteRadarDwell(
         "EarthPlots": EarthPlots,
         "EarthTrackerDebug": EarthTrackerDebug,
         "ParallelTrackerComparison": TrackerComparison,
+        "DisplayTrackSelection": DisplayTrackSelection,
+        "DisplayTracks": DisplayTracks,
+        "DisplayPlots": DisplayPlots,
         "Tracks": Tracks,
         "Plots": Plots,
         "TrackerDebug": TrackerDebug,
@@ -863,8 +915,9 @@ def Main(CommandLineArguments=None):
 
         # Tracker / plot extraction parameters
         "TrackerEnabled": True,
-        # Stage 6 parallel Earth-referenced tracker.  This tracker is
-        # diagnostic only; legacy range/bearing tracks remain authoritative.
+        # Parallel Earth-referenced tracker. Stage 8 permits display-only
+        # selection; legacy range/bearing tracks remain authoritative for
+        # mission tasking and track updates.
         "EarthTrackerEnabled": True,
         "EarthClusterDistanceM": 200.0,
         "EarthInitiationGateM": 300.0,
@@ -922,6 +975,10 @@ def Main(CommandLineArguments=None):
         "DisplayTransport": UiOptions["DisplayTransport"],
         "RadarLinkHost": UiOptions["RadarLinkHost"],
         "RadarLinkPort": UiOptions["RadarLinkPort"],
+        # Display authority is selectable independently of mission tasking.
+        # LEGACY is the safe default; EARTH projects fixed mission-ENU tracks
+        # back into the current radar-relative PPI coordinates.
+        "DisplayTrackSource": UiOptions["DisplayTrackSource"],
         # Prototype-safe policy: loss of the UI heartbeat stops scanning and
         # inhibits TX. This can later become a mission-level operating policy.
         "RadarLinkHeartbeatTimeoutSec": 2.0,
