@@ -51,6 +51,7 @@ class TestOperatorTransmitState(unittest.TestCase):
             "self.ScanEnabled = True\n        self.TransmitEnabled = True",
             start_method,
         )
+        self.assertIn("self.ManualControlCommandId += 1", start_method)
 
     def test_stop_disarms_transmit(self):
         stop_method = self.display_text.split(
@@ -76,6 +77,7 @@ class TestOperatorTransmitState(unittest.TestCase):
         self.assertIn("self.ScanEnabled = False", stare_method)
         self.assertIn("if self.TransmitAvailable:", stare_method)
         self.assertIn("self.TransmitEnabled = True", stare_method)
+        self.assertIn("self.ManualControlCommandId += 1", stare_method)
 
     def test_nudge_buttons_use_visible_step_and_arm_guarded_operation(self):
         left_method = self.display_text.split(
@@ -91,6 +93,7 @@ class TestOperatorTransmitState(unittest.TestCase):
             self.assertIn("if self.TransmitAvailable:", method)
             self.assertIn("self.TransmitEnabled = True", method)
             self.assertIn("self.ManualNudgeCommandId += 1", method)
+            self.assertIn("self.ManualControlCommandId += 1", method)
 
         self.assertIn("-abs(float(self.ScanStepDeg))", left_method)
         self.assertIn("abs(float(self.ScanStepDeg))", right_method)

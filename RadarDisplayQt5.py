@@ -109,7 +109,9 @@ class RadarDisplay:
         # measured X6-60 boresight for display.
         self.ManualNudgeCommandId = 0
         self.ManualNudgeDeltaDeg = 0.0
+        self.ManualControlCommandId = 0
         self.StopCommandId = 0
+        self.LastMissionRuntimeStatusRevision = -1
 
         self.ScanStartDeg = float(Config.get("ScanStartDeg", -60.0))
         self.ScanStopDeg = float(Config.get("ScanStopDeg", 60.0))
@@ -460,6 +462,7 @@ class RadarDisplay:
             "SaveDataEnabled": self.SaveDataEnabled,
             "ManualNudgeCommandId": self.ManualNudgeCommandId,
             "ManualNudgeDeltaDeg": self.ManualNudgeDeltaDeg,
+            "ManualControlCommandId": self.ManualControlCommandId,
             "StopCommandId": self.StopCommandId,
             "SelectedWaveformId": self.SelectedWaveformId,
             "SelectedPrfHz": self.SelectedPrfHz,
@@ -479,14 +482,22 @@ class RadarDisplay:
 
         status = dict(Status or {})
         state = str(status.get("State", "STOPPED")).upper()
+        status_revision = status.get("StatusRevision")
+        status_changed = (
+            status_revision is None
+            or int(status_revision)
+            != self.LastMissionRuntimeStatusRevision
+        )
+        if status_revision is not None:
+            self.LastMissionRuntimeStatusRevision = int(status_revision)
         if self.MissionPage is not None:
             self.MissionPage.SetRuntimeStatus(status)
-        if state in ("RUNNING_360", "RUNNING_SECTOR"):
+        if status_changed and state in ("RUNNING_360", "RUNNING_SECTOR"):
             self.DisplayMode = "SCAN"
             self.ScanEnabled = True
             if self.TransmitAvailable:
                 self.TransmitEnabled = True
-        elif state in (
+        elif status_changed and state in (
             "LOADED", "PAUSED", "COMPLETED", "ABORTED", "FAULTED",
         ):
             self.DisplayMode = "STOP"
@@ -1919,6 +1930,7 @@ class RadarDisplay:
         # independent of the initial startup setting.
         self.DisplayMode = "SCAN"
         self.ScanEnabled = True
+        self.ManualControlCommandId += 1
         if self.TransmitAvailable:
             self.TransmitEnabled = True
         self.ManualNudgeDeltaDeg = 0.0
@@ -1930,6 +1942,7 @@ class RadarDisplay:
         # source has declared transmit capability.
         self.DisplayMode = "STARE"
         self.ScanEnabled = False
+        self.ManualControlCommandId += 1
         if self.TransmitAvailable:
             self.TransmitEnabled = True
         self.ManualNudgeDeltaDeg = 0.0
@@ -1961,6 +1974,8 @@ class RadarDisplay:
         # Retained for compatibility with callers outside this display.
         self.DisplayMode = Label
         self.ScanEnabled = True if Label == "SCAN" else False
+        if Label in ("SCAN", "STARE"):
+            self.ManualControlCommandId += 1
         self.UpdateStatusPanel()
 
     def OnBeamLeft(self):
@@ -1971,6 +1986,7 @@ class RadarDisplay:
         # scan step setting.
         self.DisplayMode = "STARE"
         self.ScanEnabled = False
+        self.ManualControlCommandId += 1
         if self.TransmitAvailable:
             self.TransmitEnabled = True
         self.ManualNudgeDeltaDeg = -abs(float(self.ScanStepDeg))
@@ -1981,6 +1997,7 @@ class RadarDisplay:
         # One-shot manual nudge event.
         self.DisplayMode = "STARE"
         self.ScanEnabled = False
+        self.ManualControlCommandId += 1
         if self.TransmitAvailable:
             self.TransmitEnabled = True
         self.ManualNudgeDeltaDeg = abs(float(self.ScanStepDeg))

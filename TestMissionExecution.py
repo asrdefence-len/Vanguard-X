@@ -308,6 +308,59 @@ class MissionExecutionTests(unittest.TestCase):
         )
         self.assertFalse(restart.Applied)
 
+    def test_dashboard_start_reclaims_control_after_mission_abort(self):
+        runtime = self._LoadedRuntime()
+        runtime.ApplyControlState(
+            {
+                **_StoppedControl(2, "START"),
+                "ManualControlCommandId": 4,
+            },
+            system_mode="SIM",
+            now_sec=0.0,
+        )
+        runtime.ApplyControlState(
+            {
+                "MissionCommandRevision": 3,
+                "MissionCommand": "STOP",
+                "ManualControlCommandId": 4,
+            },
+            system_mode="SIM",
+            now_sec=0.5,
+        )
+
+        terminal_stop = runtime.BuildEffectiveControlState({
+            "DisplayMode": "SCAN",
+            "ScanEnabled": True,
+            "TransmitEnabled": True,
+            "ManualControlCommandId": 4,
+        })
+        self.assertEqual(terminal_stop["DisplayMode"], "STOP")
+        self.assertFalse(terminal_stop["ScanEnabled"])
+        self.assertFalse(terminal_stop["TransmitEnabled"])
+
+        dashboard_start = runtime.BuildEffectiveControlState({
+            "DisplayMode": "SCAN",
+            "ScanEnabled": True,
+            "TransmitEnabled": True,
+            "ManualControlCommandId": 5,
+        })
+        self.assertEqual(dashboard_start["DisplayMode"], "SCAN")
+        self.assertTrue(dashboard_start["ScanEnabled"])
+        self.assertTrue(dashboard_start["TransmitEnabled"])
+        self.assertEqual(runtime.State, "ABORTED")
+
+    def test_loaded_mission_cannot_be_bypassed_by_dashboard_start(self):
+        runtime = self._LoadedRuntime()
+        effective = runtime.BuildEffectiveControlState({
+            "DisplayMode": "SCAN",
+            "ScanEnabled": True,
+            "TransmitEnabled": True,
+            "ManualControlCommandId": 1,
+        })
+        self.assertEqual(effective["DisplayMode"], "STOP")
+        self.assertFalse(effective["ScanEnabled"])
+        self.assertFalse(effective["TransmitEnabled"])
+
     def test_loaded_snapshot_is_detached_from_command_payload(self):
         profile_dict = MissionProfileToDict(_ShortMission())
         runtime = MissionExecutionController(_Config())

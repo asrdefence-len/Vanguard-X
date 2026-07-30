@@ -63,6 +63,8 @@ class MissionExecutionController:
         self._suspended_task_index: Optional[int] = None
         self._suspended_task_elapsed_sec = 0.0
         self._pause_started_sec: Optional[float] = None
+        self._last_manual_control_command_id = 0
+        self._terminal_manual_control_command_id = 0
 
     @property
     def IsRunning(self) -> bool:
@@ -81,8 +83,18 @@ class MissionExecutionController:
         return time.monotonic() if now_sec is None else float(now_sec)
 
     def _SetStatus(self, state: str, message: str):
-        changed = self.State != str(state) or self.LastMessage != str(message)
-        self.State = str(state)
+        new_state = str(state)
+        state_changed = self.State != new_state
+        changed = state_changed or self.LastMessage != str(message)
+        if state_changed and new_state in TERMINAL_STATES:
+            # A terminal Mission transition owns one safe STOP.  A later,
+            # explicit Dashboard run/nudge command may then take control back
+            # without requiring the Mission state or status history to be
+            # discarded.
+            self._terminal_manual_control_command_id = (
+                self._last_manual_control_command_id
+            )
+        self.State = new_state
         self.LastMessage = str(message)
         if changed:
             self.StatusRevision += 1
@@ -356,6 +368,12 @@ class MissionExecutionController:
         now = self._Now(now_sec)
         self._last_boundary_sec = now
         control = dict(control_state or {})
+        self._last_manual_control_command_id = int(
+            control.get(
+                "ManualControlCommandId",
+                self._last_manual_control_command_id,
+            )
+        )
         command = str(control.get("MissionCommand", "")).upper().strip()
         revision = int(control.get("MissionCommandRevision", 0))
 
@@ -599,12 +617,21 @@ class MissionExecutionController:
                 result["MissionScanRateDegSec"] = float(task.ScanRateDegSec)
                 result["MissionScanDirection"] = str(task.InitialDirection)
                 result["MissionScanPattern"] = "SECTOR"
-        elif self.State in (
-            "LOADED", "PAUSED", "COMPLETED", "ABORTED", "FAULTED"
-        ):
+        elif self.State in ("LOADED", "PAUSED"):
             result["DisplayMode"] = "STOP"
             result["ScanEnabled"] = False
             result["TransmitEnabled"] = False
+        elif self.State in TERMINAL_STATES:
+            manual_control_command_id = int(
+                result.get("ManualControlCommandId", 0)
+            )
+            if (
+                manual_control_command_id
+                == self._terminal_manual_control_command_id
+            ):
+                result["DisplayMode"] = "STOP"
+                result["ScanEnabled"] = False
+                result["TransmitEnabled"] = False
         return result
 
     def GetStatus(self) -> Dict[str, Any]:
