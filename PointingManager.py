@@ -97,6 +97,11 @@ class PointingState:
     AntennaBearingPlatformDeg: Optional[float] = None
     AntennaRawAngleDeg: Optional[float] = None
     CommandedBearingPlatformDeg: Optional[float] = None
+    PointingPhase: str = "IDLE"
+    TrackUpdateComplete: bool = False
+    TrackUpdateCoverageValid: bool = False
+    TrackUpdatePass: int = 0
+    TrackUpdatePasses: int = 0
 
 
 class PointingManager:
@@ -114,6 +119,7 @@ class PointingManager:
         scan_braking_enabled: bool = False,
         scan_deceleration_deg_per_sec2: float = 60.0,
         scan_command_latency_sec: float = 0.05,
+        transition_slew_rate_deg_per_sec: float = 40.0,
         debug: bool = False,
     ):
         self.Positioner = x660
@@ -131,6 +137,9 @@ class PointingManager:
             scan_deceleration_deg_per_sec2
         )
         self.ScanCommandLatencySec = float(scan_command_latency_sec)
+        self.TransitionSlewRateDegPerSec = abs(
+            float(transition_slew_rate_deg_per_sec)
+        )
         self.Debug = bool(debug)
 
         if (
@@ -161,6 +170,13 @@ class PointingManager:
         self.LastSearchRelativeDeg: Optional[float] = None
 
         self._goto_ready_since_sec: Optional[float] = None
+        self.PointingPhase = "IDLE"
+        self.TrackUpdateComplete = False
+        self.TrackUpdateCoverageValid = False
+        self.TrackUpdatePass = 0
+        self.TrackUpdatePasses = 0
+        self._track_nod_previous_true_deg: Optional[float] = None
+        self._track_nod_direction = 1
 
     # ------------------------------------------------------------------
     # Coordinate conversion
@@ -241,8 +257,34 @@ class PointingManager:
         self.ActiveMode = PointingMode.CONTINUOUS_SCAN
         self.SearchInterrupted = False
         self._goto_ready_since_sec = None
+        self.TrackUpdateComplete = False
+        self.TrackUpdateCoverageValid = False
 
-        self._command_search_slew(task, navigation)
+        slew_to_start = bool(
+            task.Pointing.Metadata.pop("SlewToSectorStart", False)
+        )
+        if (
+            slew_to_start
+            and task.Sector.Pattern == SearchPattern.SECTOR
+        ):
+            task.Sector.ActiveEndpoint = "STOP"
+            task.Sector.Direction = 1
+            task.Sector.LastMeasuredAzimuthDeg = None
+            self.PointingPhase = "SLEW_TO_START"
+            self._command_position_true_or_platform(
+                task.Sector.StartDeg,
+                task.Sector.Frame,
+                navigation,
+                float(
+                    task.Pointing.Metadata.get(
+                        "TransitionSlewRateDegPerSec",
+                        self.TransitionSlewRateDegPerSec,
+                    )
+                ),
+            )
+        else:
+            self.PointingPhase = "SCANNING"
+            self._command_search_slew(task, navigation)
 
         if self.Debug:
             print(
@@ -271,8 +313,35 @@ class PointingManager:
         self.ActiveTask = task
         self.ActiveMode = PointingMode.GOTO_AND_HOLD
         self._goto_ready_since_sec = None
+        self.TrackUpdateComplete = False
+        self.TrackUpdateCoverageValid = False
+        self.TrackUpdatePass = 0
+        self.TrackUpdatePasses = 0
+        self._track_nod_previous_true_deg = None
 
         true_target = float(task.Pointing.TargetAzimuthDeg)
+        if bool(task.Metadata.get("TrackNoddyEnabled", False)):
+            gate_half_deg = abs(
+                float(task.Metadata.get("TrackGateHalfWidthDeg", 2.0))
+            )
+            self.TrackUpdatePasses = max(
+                1,
+                int(task.Metadata.get("TrackNodPasses", 3)),
+            )
+            self._track_nod_direction = 1
+            self.PointingPhase = "TRACK_SLEW_TO_GATE"
+            self._command_position_true_or_platform(
+                wrap360(true_target - gate_half_deg),
+                AngleFrame.TRUE,
+                navigation,
+                abs(float(task.Metadata.get(
+                    "TrackSlewRateDegSec",
+                    self.TransitionSlewRateDegPerSec,
+                ))),
+            )
+            return
+
+        self.PointingPhase = "TRACK_HOLD"
         relative_target = self.TrueToRelativeAzimuth(
             true_target,
             navigation.HeadingTrueDeg,
@@ -312,6 +381,9 @@ class PointingManager:
         self.ActiveMode = PointingMode.CONTINUOUS_SCAN
         self.SearchInterrupted = False
         self._goto_ready_since_sec = None
+        self.PointingPhase = "SCANNING"
+        self.TrackUpdateComplete = False
+        self.TrackUpdateCoverageValid = False
         self._command_search_slew(self.SearchTask, navigation)
 
         if self.Debug:
@@ -367,6 +439,9 @@ class PointingManager:
         self.ActiveTask = None
         self.ActiveMode = PointingMode.HOLD_CURRENT
         self._goto_ready_since_sec = None
+        self.PointingPhase = "IDLE"
+        self.TrackUpdateComplete = False
+        self.TrackUpdateCoverageValid = False
 
     # ------------------------------------------------------------------
     # Update
@@ -400,8 +475,20 @@ class PointingManager:
             and self.ActiveTask.TaskType == RadarTaskType.SEARCH
         ):
             search_task = self.ActiveTask
-            self._update_search_endpoint(search_task, navigation, beam_true)
-            ready = x660_valid
+            if self.PointingPhase == "SLEW_TO_START":
+                ready = self._update_search_start_slew(
+                    search_task,
+                    navigation,
+                    relative_az,
+                    rate,
+                )
+            else:
+                self._update_search_endpoint(
+                    search_task,
+                    navigation,
+                    beam_true,
+                )
+                ready = x660_valid
             reachable = True
 
         elif (
@@ -410,54 +497,23 @@ class PointingManager:
         ):
             track_task = self.ActiveTask
 
-            # Recalculate the relative target while the platform heading changes.
-            true_target = float(track_task.Pointing.TargetAzimuthDeg)
-            relative_target = self.TrueToRelativeAzimuth(
-                true_target,
-                navigation.HeadingTrueDeg,
-            )
-
-            reachable = self.IsRelativeAzimuthReachable(relative_target)
-            command_target = (
-                relative_target
-                if reachable
-                else self.ClampRelativeAzimuth(relative_target)
-            )
-
-            if (
-                self.LastCommandedRelativeDeg is None
-                or abs(
-                    signed_angle_delta_deg(
-                        command_target,
-                        self.LastCommandedRelativeDeg,
-                    )
-                ) > 0.05
-            ):
-                self.LastCommandedRelativeDeg = command_target
-                self.LastCommandedTrueDeg = true_target
-                self.Positioner.SetPanPositionNative(command_target)
-
-            error_deg = abs(
-                signed_angle_delta_deg(command_target, relative_az)
-            )
-            on_angle = error_deg <= float(
-                track_task.Pointing.PositionToleranceDeg
-                or self.PositionToleranceDeg
-            )
-            low_rate = abs(rate) <= self.SettleRateThresholdDegPerSec
-
-            if on_angle and low_rate and reachable:
-                if self._goto_ready_since_sec is None:
-                    self._goto_ready_since_sec = now
-
-                settle_time = max(
-                    0.0,
-                    float(track_task.Pointing.SettleTimeSec),
+            if bool(track_task.Metadata.get("TrackNoddyEnabled", False)):
+                ready, reachable = self._update_track_noddy(
+                    track_task,
+                    navigation,
+                    beam_true,
+                    relative_az,
+                    rate,
+                    now,
                 )
-                ready = (now - self._goto_ready_since_sec) >= settle_time
             else:
-                self._goto_ready_since_sec = None
-                ready = False
+                ready, reachable = self._update_track_hold(
+                    track_task,
+                    navigation,
+                    relative_az,
+                    rate,
+                    now,
+                )
 
         else:
             ready = x660_valid and abs(rate) <= self.SettleRateThresholdDegPerSec
@@ -514,7 +570,334 @@ class PointingManager:
             AntennaBearingPlatformDeg=relative_az,
             AntennaRawAngleDeg=getattr(x660_state, "RawAngleDeg", None),
             CommandedBearingPlatformDeg=self.LastCommandedRelativeDeg,
+            PointingPhase=str(self.PointingPhase),
+            TrackUpdateComplete=bool(self.TrackUpdateComplete),
+            TrackUpdateCoverageValid=bool(
+                self.TrackUpdateCoverageValid
+            ),
+            TrackUpdatePass=int(self.TrackUpdatePass),
+            TrackUpdatePasses=int(self.TrackUpdatePasses),
         )
+
+    # ------------------------------------------------------------------
+    # Transition and track-update control
+    # ------------------------------------------------------------------
+
+    def _command_position_true_or_platform(
+        self,
+        target_deg: float,
+        frame: AngleFrame,
+        navigation: NavigationInput,
+        rate_deg_per_sec: float,
+    ) -> None:
+        if frame == AngleFrame.TRUE:
+            target_true = wrap360(target_deg)
+            target_relative = self.TrueToRelativeAzimuth(
+                target_true,
+                navigation.HeadingTrueDeg,
+            )
+        else:
+            target_relative = wrap360(target_deg)
+            target_true = self.RelativeToTrueBearing(
+                target_relative,
+                navigation.HeadingTrueDeg,
+            )
+
+        target_relative = self.ClampRelativeAzimuth(target_relative)
+        self.LastCommandedRelativeDeg = target_relative
+        self.LastCommandedTrueDeg = target_true
+
+        command_at_rate = getattr(
+            self.Positioner,
+            "SetPanPositionNativeAtRate",
+            None,
+        )
+        if callable(command_at_rate):
+            command_at_rate(
+                target_relative,
+                max(0.01, abs(float(rate_deg_per_sec))),
+            )
+        else:
+            self.Positioner.SetPanPositionNative(target_relative)
+
+    def _update_search_start_slew(
+        self,
+        task: SearchTask,
+        navigation: NavigationInput,
+        relative_az_deg: float,
+        rate_deg_per_sec: float,
+    ) -> bool:
+        target_relative = (
+            self.TrueToRelativeAzimuth(
+                task.Sector.StartDeg,
+                navigation.HeadingTrueDeg,
+            )
+            if task.Sector.Frame == AngleFrame.TRUE
+            else wrap360(task.Sector.StartDeg)
+        )
+        error_deg = abs(
+            signed_angle_delta_deg(target_relative, relative_az_deg)
+        )
+        on_angle = error_deg <= max(
+            self.PositionToleranceDeg,
+            self.EndpointMarginDeg,
+        )
+        low_rate = (
+            abs(float(rate_deg_per_sec))
+            <= self.SettleRateThresholdDegPerSec
+        )
+        if not (on_angle and low_rate):
+            if (
+                self.LastCommandedRelativeDeg is None
+                or abs(
+                    signed_angle_delta_deg(
+                        target_relative,
+                        self.LastCommandedRelativeDeg,
+                    )
+                ) > 0.25
+            ):
+                self._command_position_true_or_platform(
+                    task.Sector.StartDeg,
+                    task.Sector.Frame,
+                    navigation,
+                    float(
+                        task.Pointing.Metadata.get(
+                            "TransitionSlewRateDegPerSec",
+                            self.TransitionSlewRateDegPerSec,
+                        )
+                    ),
+                )
+            return False
+
+        task.Sector.LastMeasuredAzimuthDeg = None
+        self.PointingPhase = "SCANNING"
+        self._command_search_slew(task, navigation)
+        return True
+
+    def _update_track_hold(
+        self,
+        track_task: TrackTask,
+        navigation: NavigationInput,
+        relative_az_deg: float,
+        rate_deg_per_sec: float,
+        now_sec: float,
+    ):
+        true_target = float(track_task.Pointing.TargetAzimuthDeg)
+        relative_target = self.TrueToRelativeAzimuth(
+            true_target,
+            navigation.HeadingTrueDeg,
+        )
+
+        reachable = self.IsRelativeAzimuthReachable(relative_target)
+        command_target = (
+            relative_target
+            if reachable
+            else self.ClampRelativeAzimuth(relative_target)
+        )
+
+        if (
+            self.LastCommandedRelativeDeg is None
+            or abs(
+                signed_angle_delta_deg(
+                    command_target,
+                    self.LastCommandedRelativeDeg,
+                )
+            ) > 0.05
+        ):
+            self.LastCommandedRelativeDeg = command_target
+            self.LastCommandedTrueDeg = true_target
+            self.Positioner.SetPanPositionNative(command_target)
+
+        error_deg = abs(
+            signed_angle_delta_deg(command_target, relative_az_deg)
+        )
+        on_angle = error_deg <= float(
+            track_task.Pointing.PositionToleranceDeg
+            or self.PositionToleranceDeg
+        )
+        low_rate = (
+            abs(float(rate_deg_per_sec))
+            <= self.SettleRateThresholdDegPerSec
+        )
+
+        if on_angle and low_rate and reachable:
+            if self._goto_ready_since_sec is None:
+                self._goto_ready_since_sec = now_sec
+
+            settle_time = max(
+                0.0,
+                float(track_task.Pointing.SettleTimeSec),
+            )
+            ready = (
+                now_sec - self._goto_ready_since_sec
+            ) >= settle_time
+        else:
+            self._goto_ready_since_sec = None
+            ready = False
+        return bool(ready), bool(reachable)
+
+    def _track_gate_true_deg(
+        self,
+        track_task: TrackTask,
+        direction: int,
+    ) -> float:
+        centre_deg = float(track_task.Pointing.TargetAzimuthDeg)
+        gate_half_deg = abs(
+            float(track_task.Metadata.get("TrackGateHalfWidthDeg", 2.0))
+        )
+        return wrap360(
+            centre_deg + (gate_half_deg if direction > 0 else -gate_half_deg)
+        )
+
+    def _command_track_nod_slew(
+        self,
+        track_task: TrackTask,
+        navigation: NavigationInput,
+    ) -> None:
+        requested_true_rate = (
+            (1.0 if self._track_nod_direction > 0 else -1.0)
+            * abs(float(track_task.Metadata.get("TrackNodRateDegSec", 5.0)))
+        )
+        platform_yaw_rate = float(
+            getattr(navigation, "YawRateDegPerSec", 0.0)
+        )
+        self.Positioner.CommandSlew(
+            requested_true_rate - platform_yaw_rate,
+            0.0,
+        )
+        self.LastCommandedTrueDeg = self._track_gate_true_deg(
+            track_task,
+            self._track_nod_direction,
+        )
+        self.LastCommandedRelativeDeg = self.TrueToRelativeAzimuth(
+            self.LastCommandedTrueDeg,
+            navigation.HeadingTrueDeg,
+        )
+
+    def _update_track_noddy(
+        self,
+        track_task: TrackTask,
+        navigation: NavigationInput,
+        beam_true_deg: float,
+        relative_az_deg: float,
+        rate_deg_per_sec: float,
+        now_sec: float,
+    ):
+        del now_sec
+        reachable = True
+
+        if self.PointingPhase == "TRACK_SLEW_TO_GATE":
+            start_true = self._track_gate_true_deg(track_task, -1)
+            start_relative = self.TrueToRelativeAzimuth(
+                start_true,
+                navigation.HeadingTrueDeg,
+            )
+            error_deg = abs(
+                signed_angle_delta_deg(start_relative, relative_az_deg)
+            )
+            tolerance_deg = max(
+                0.05,
+                float(
+                    track_task.Metadata.get(
+                        "TrackPointingToleranceDeg",
+                        track_task.Pointing.PositionToleranceDeg
+                        or self.PositionToleranceDeg,
+                    )
+                ),
+            )
+            low_rate = (
+                abs(float(rate_deg_per_sec))
+                <= self.SettleRateThresholdDegPerSec
+            )
+            if not (error_deg <= tolerance_deg and low_rate):
+                # The start gate is Earth-referenced, while the X6-60 accepts
+                # platform-relative position commands.  A single command
+                # becomes stale whenever platform heading changes during the
+                # rapid slew.  Refresh it when heading motion has displaced
+                # the required relative angle by a meaningful fraction of the
+                # pointing tolerance.  This is deliberately rate-limited by
+                # angular displacement rather than the 50 Hz control clock.
+                command_refresh_deg = max(0.05, 0.5 * tolerance_deg)
+                command_is_stale = (
+                    self.LastCommandedRelativeDeg is None
+                    or abs(
+                        signed_angle_delta_deg(
+                            start_relative,
+                            self.LastCommandedRelativeDeg,
+                        )
+                    ) >= command_refresh_deg
+                )
+                if command_is_stale:
+                    self._command_position_true_or_platform(
+                        start_true,
+                        AngleFrame.TRUE,
+                        navigation,
+                        abs(float(track_task.Metadata.get(
+                            "TrackSlewRateDegSec",
+                            self.TransitionSlewRateDegPerSec,
+                        ))),
+                    )
+                return False, reachable
+
+            self.TrackUpdatePass = 1
+            self._track_nod_direction = 1
+            self._track_nod_previous_true_deg = float(beam_true_deg)
+            self.PointingPhase = "TRACK_NOD_SCAN"
+            self._command_track_nod_slew(track_task, navigation)
+            return True, reachable
+
+        if self.PointingPhase == "TRACK_NOD_SCAN":
+            target_true = self._track_gate_true_deg(
+                track_task,
+                self._track_nod_direction,
+            )
+            error_deg = signed_angle_delta_deg(
+                target_true,
+                beam_true_deg,
+            )
+            reached = abs(error_deg) <= max(
+                0.05,
+                float(
+                    track_task.Metadata.get(
+                        "TrackPointingToleranceDeg",
+                        self.PositionToleranceDeg,
+                    )
+                ),
+            )
+            previous_true = self._track_nod_previous_true_deg
+            if not reached and previous_true is not None:
+                previous_error = signed_angle_delta_deg(
+                    target_true,
+                    previous_true,
+                )
+                motion = signed_angle_delta_deg(
+                    beam_true_deg,
+                    previous_true,
+                )
+                if self._track_nod_direction > 0 and motion > 0.01:
+                    reached = previous_error > 0.0 and error_deg <= 0.0
+                elif self._track_nod_direction < 0 and motion < -0.01:
+                    reached = previous_error < 0.0 and error_deg >= 0.0
+            self._track_nod_previous_true_deg = float(beam_true_deg)
+
+            if reached:
+                if self.TrackUpdatePass >= self.TrackUpdatePasses:
+                    self.Positioner.Stop()
+                    self.PointingPhase = "TRACK_COMPLETE"
+                    self.TrackUpdateComplete = True
+                    self.TrackUpdateCoverageValid = True
+                    return True, reachable
+
+                self.TrackUpdatePass += 1
+                self._track_nod_direction *= -1
+                self._command_track_nod_slew(track_task, navigation)
+
+            return True, reachable
+
+        if self.PointingPhase == "TRACK_COMPLETE":
+            return True, reachable
+
+        return False, reachable
 
     # ------------------------------------------------------------------
     # Search control

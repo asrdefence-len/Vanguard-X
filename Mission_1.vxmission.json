@@ -4,7 +4,7 @@
   "Description": "Draft example values only. Validate against the characterised antenna drive before mission execution.",
   "DurationBasis": "ACTIVE_TASK_TIME",
   "MissionId": "mission-e8af21c6",
-  "ModifiedUtc": "2026-07-23T21:52:27+00:00",
+  "ModifiedUtc": "2026-07-31T03:54:20+00:00",
   "Name": "Mission 1",
   "PrimaryTasks": [
     {
@@ -13,30 +13,30 @@
       "Enabled": true,
       "MaximumRangeM": 15000.0,
       "Name": "360 Scan",
-      "PrfHz": 2000.0,
-      "PulsesPerCpi": 32,
+      "PrfHz": 4000.0,
+      "PulsesPerCpi": 64,
       "RepeatIntervalSec": null,
-      "RotationRpm": 3.0,
+      "RotationRpm": 4.0,
       "TaskId": "scan360-bb0eaa58",
       "TaskType": "SCAN_360",
-      "WaveformId": "Frank10_20MHz"
+      "WaveformId": "Golay64_20MHz"
     },
     {
-      "DurationSec": 60.0,
+      "DurationSec": 12.0,
       "Enabled": true,
       "EndpointMarginDeg": 1.0,
       "InitialDirection": "CW",
       "MaximumRangeM": 15000.0,
       "Name": "Sector Scan",
-      "PrfHz": 2000.0,
-      "PulsesPerCpi": 32,
-      "RepeatIntervalSec": 300.0,
-      "ScanRateDegSec": 20.0,
-      "StartDeg": 40.0,
-      "StopDeg": 90.0,
+      "PrfHz": 4000.0,
+      "PulsesPerCpi": 64,
+      "RepeatIntervalSec": 24.0,
+      "ScanRateDegSec": 10.0,
+      "StartDeg": 340.0,
+      "StopDeg": 60.0,
       "TaskId": "sector-02615eca",
       "TaskType": "SECTOR_SCAN",
-      "WaveformId": "Frank10_20MHz"
+      "WaveformId": "Golay64_20MHz"
     }
   ],
   "Revision": 1,
@@ -57,10 +57,10 @@
     "PointingToleranceDeg": 0.25,
     "PrfHz": 2000.0,
     "PulsesPerCpi": 32,
-    "RevisitIntervalSec": 10.0,
+    "RevisitIntervalSec": 6.0,
     "SettleTimeSec": 0.25,
     "SlewRateDegSec": 20.0,
-    "WaveformId": "Frank10_20MHz"
+    "WaveformId": "Golay64_20MHz"
   },
   "ValidationSnapshot": null
 }

@@ -43,21 +43,28 @@ def MakePlan(NumPulses=8):
     )
 
 
-def MakeStationaryEcho(Library, Plan, EchoSample=80):
+def MakeDopplerEcho(Library, Plan, EchoSample=80, DopplerHz=0.0):
     IQ = np.zeros((Plan.NumPulses, Plan.NumSamples), dtype=np.complex64)
+    PulseTimesSec = np.arange(Plan.NumPulses) * Plan.PRI
     for pulse in Plan.PulsePlans:
         waveform = Library.Get(pulse.WaveformId)
         IQ[
             pulse.PulseIndex,
             EchoSample:EchoSample + len(waveform),
-        ] = waveform
+        ] = waveform * np.exp(
+            1j
+            * 2.0
+            * np.pi
+            * float(DopplerHz)
+            * PulseTimesSec[pulse.PulseIndex]
+        )
     return RawDwellData(
         DwellId=Plan.DwellId,
         IQ=IQ,
         SampleRate=Plan.SampleRate,
         PRI=Plan.PRI,
         TimeStamp=1.0,
-        PulseTimesSec=np.arange(Plan.NumPulses) * Plan.PRI,
+        PulseTimesSec=PulseTimesSec,
         PulsePriSec=np.full(Plan.NumPulses, Plan.PRI),
         PulseWaveformIds=[p.WaveformId for p in Plan.PulsePlans],
         PulseValid=np.ones(Plan.NumPulses, dtype=bool),
@@ -93,8 +100,8 @@ class TestGolayOperational(unittest.TestCase):
         Plan = MakePlan(64)
 
         self.assertEqual(Plan.Processing.Mode, "GOLAY_COMPLEMENTARY")
-        self.assertTrue(Plan.Processing.CombineGroupsBeforeDoppler)
-        self.assertFalse(Plan.Processing.DopplerCompensationEnabled)
+        self.assertFalse(Plan.Processing.CombineGroupsBeforeDoppler)
+        self.assertTrue(Plan.Processing.DopplerCompensationEnabled)
         self.assertEqual(Plan.NumPulses, 64)
         self.assertAlmostEqual(Plan.PRI, 250.0e-6, places=15)
         self.assertAlmostEqual(Plan.NumPulses * Plan.PRI, 16.0e-3, places=15)
@@ -163,10 +170,10 @@ class TestGolayOperational(unittest.TestCase):
         self.assertEqual(Plan.PulsePlans[0].WaveformId, "Golay64A_20MHz")
         self.assertEqual(Plan.PulsePlans[1].WaveformId, "Golay64B_20MHz")
 
-    def test_complementary_sum_precedes_pair_rate_doppler(self):
+    def test_stationary_pair_is_exact_on_pair_rate_doppler_axis(self):
         Library = MakeLibrary()
         Plan = MakePlan()
-        Raw = MakeStationaryEcho(Library, Plan)
+        Raw = MakeDopplerEcho(Library, Plan)
         Processor = RadarProcessor({
             "RfFrequency": 9.4e9,
             "GolayDiagnosticCaptureEnabled": True,
@@ -176,8 +183,13 @@ class TestGolayOperational(unittest.TestCase):
 
         self.assertEqual(Result.RangeCompressed.shape, (4, 512))
         self.assertEqual(Result.RangeDopplerMap.shape, (4, 512))
-        self.assertEqual(Result.Diagnostics["DopplerCompensationMode"], "NONE")
+        self.assertEqual(
+            Result.Diagnostics["DopplerCompensationMode"],
+            "DOPPLER_BIN_B_PHASE_ALIGN",
+        )
+        self.assertTrue(Result.Diagnostics["DopplerCompensationEnabled"])
         self.assertEqual(Result.Diagnostics["ComplementaryPairCount"], 4)
+        self.assertEqual(Result.Diagnostics["DopplerBinCount"], 4)
         self.assertAlmostEqual(Result.Diagnostics["PairPriSec"], 500.0e-6)
         self.assertEqual(Result.Diagnostics["PeakRangeBin"], 80)
         self.assertEqual(Result.Diagnostics["PeakDopplerHz"], 0.0)
@@ -198,10 +210,48 @@ class TestGolayOperational(unittest.TestCase):
         self.assertGreater(Peak, 127.9)
         self.assertLess(np.max(ChipAlignedSidelobes), 1.0e-3)
 
+    def test_doppler_compensation_preserves_complementary_sidelobes(self):
+        Library = MakeLibrary()
+        Plan = MakePlan(32)
+        TargetDopplerHz = 313.55
+        Raw = MakeDopplerEcho(
+            Library,
+            Plan,
+            DopplerHz=TargetDopplerHz,
+        )
+        Result = RadarProcessor(
+            {"RfFrequency": 9.4e9},
+            Library,
+        ).Process(Raw, Plan)
+
+        PeakDopplerBin, PeakRangeBin = np.unravel_index(
+            np.argmax(np.abs(Result.RangeDopplerMap)),
+            Result.RangeDopplerMap.shape,
+        )
+        Profile = np.abs(Result.RangeDopplerMap[PeakDopplerBin])
+        SidelobeMask = np.ones(Profile.size, dtype=bool)
+        SidelobeMask[
+            max(0, PeakRangeBin - 1):
+            min(Profile.size, PeakRangeBin + 2)
+        ] = False
+        PslrDb = 20.0 * np.log10(
+            np.max(Profile[SidelobeMask]) / Profile[PeakRangeBin]
+        )
+        DopplerBinSpacingHz = 1.0 / (Plan.NumPulses * Plan.PRI)
+
+        # A target may lie halfway between the finite-CPI Doppler bins.  Even
+        # there, bin-centre B phase alignment must retain useful cancellation.
+        self.assertLess(PslrDb, -35.0)
+        self.assertLessEqual(
+            abs(Result.DopplerAxisHz[PeakDopplerBin] - TargetDopplerHz),
+            DopplerBinSpacingHz / 2.0,
+        )
+        self.assertEqual(PeakRangeBin, 80)
+
     def test_missing_or_reordered_pair_is_rejected(self):
         Library = MakeLibrary()
         Plan = MakePlan()
-        Raw = MakeStationaryEcho(Library, Plan)
+        Raw = MakeDopplerEcho(Library, Plan)
         Processor = RadarProcessor({"RfFrequency": 9.4e9}, Library)
 
         Plan.PulsePlans[1] = replace(

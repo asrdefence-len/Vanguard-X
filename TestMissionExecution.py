@@ -469,6 +469,36 @@ class MissionExecutionTests(unittest.TestCase):
         runtime.Advance(101.0)
         self.assertEqual(runtime.ActiveTask.TaskId, "periodic-sector")
 
+    def test_track_resource_hold_defers_periodic_sector_and_task_time(self):
+        runtime = self._LoadedRuntime(_PeriodicMission())
+        runtime.ApplyControlState(
+            _StoppedControl(2, "START"),
+            system_mode="SIM",
+            now_sec=0.0,
+        )
+        runtime.Advance(4.9)
+        elapsed_before_hold = runtime.ActiveTaskElapsedSec
+        activation_before_hold = runtime.TaskActivationRevision
+
+        runtime.Advance(5.5, resource_available=False)
+        runtime.Advance(8.0, resource_available=False)
+        self.assertEqual(runtime.ActiveTask.TaskId, "baseline")
+        self.assertAlmostEqual(
+            runtime.ActiveTaskElapsedSec,
+            elapsed_before_hold,
+        )
+        self.assertEqual(
+            runtime.TaskActivationRevision,
+            activation_before_hold,
+        )
+        self.assertTrue(runtime.GetStatus()["RadarResourceHeld"])
+
+        runtime.Advance(8.0, resource_available=True)
+        self.assertEqual(runtime.ActiveTask.TaskId, "baseline")
+        self.assertFalse(runtime.GetStatus()["RadarResourceHeld"])
+        runtime.Advance(8.1, resource_available=True)
+        self.assertEqual(runtime.ActiveTask.TaskId, "periodic-sector")
+
 
 if __name__ == "__main__":
     unittest.main()

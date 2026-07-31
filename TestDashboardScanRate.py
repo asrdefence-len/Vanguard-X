@@ -30,6 +30,8 @@ class DashboardScanRateTests(unittest.TestCase):
         state = _InitialControlState({})
         self.assertEqual(state["ManualControlCommandId"], 0)
         self.assertIn("ManualControlCommandId", CONTROL_KEYS)
+        self.assertIn("TrackConfirmWasTentative", CONTROL_KEYS)
+        self.assertFalse(state["TrackConfirmWasTentative"])
 
     def test_dashboard_places_scan_rate_on_start_stop_pulses_row(self):
         source = (ROOT / "RadarDisplayQt5.py").read_text(encoding="utf-8")

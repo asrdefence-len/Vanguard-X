@@ -65,6 +65,7 @@ class MissionExecutionController:
         self._pause_started_sec: Optional[float] = None
         self._last_manual_control_command_id = 0
         self._terminal_manual_control_command_id = 0
+        self.ResourceHeld = False
 
     @property
     def IsRunning(self) -> bool:
@@ -163,6 +164,34 @@ class MissionExecutionController:
             return
         delta_sec = max(0.0, now_sec - self._last_accounting_sec)
         self.ActiveTaskElapsedSec += delta_sec
+        self._last_accounting_sec = now_sec
+        if self.MissionWallStartSec is not None:
+            self.MissionWallElapsedSec = max(
+                0.0, now_sec - self.MissionWallStartSec
+            )
+
+    def _HoldRunningTime(self, now_sec: float):
+        """Pause Mission active-time while another radar task owns the antenna.
+
+        A directed TRACK confirmation is an exclusive radar-resource
+        interrupt.  Its slew and nod time must not consume the interrupted
+        Mission task duration or make a periodic sector become due underneath
+        the active TRACK task.  Moving the periodic due times by the held
+        interval preserves their active-Mission-time semantics.
+        """
+
+        if not self.IsRunning:
+            self._last_accounting_sec = None
+            return
+        if self._last_accounting_sec is None:
+            self._last_accounting_sec = now_sec
+            return
+        delta_sec = max(0.0, now_sec - self._last_accounting_sec)
+        if delta_sec > 0.0:
+            self._periodic_next_due_sec = {
+                index: due_sec + delta_sec
+                for index, due_sec in self._periodic_next_due_sec.items()
+            }
         self._last_accounting_sec = now_sec
         if self.MissionWallStartSec is not None:
             self.MissionWallElapsedSec = max(
@@ -327,14 +356,29 @@ class MissionExecutionController:
         self._periodic_next_due_sec = {}
         self._suspended_task_index = None
         self._suspended_task_elapsed_sec = 0.0
+        self.ResourceHeld = False
         self._SetStatus("COMPLETED", "Mission completed")
 
-    def Advance(self, now_sec: Optional[float] = None) -> bool:
-        """Advance duration accounting at a safe scheduler boundary."""
+    def Advance(
+        self,
+        now_sec: Optional[float] = None,
+        *,
+        resource_available: bool = True,
+    ) -> bool:
+        """Advance duration accounting at a safe scheduler boundary.
+
+        ``resource_available=False`` holds the current Mission task without
+        changing task activation.  This is used while an exclusive directed
+        TRACK confirmation owns the X6-60 and radar dwell resource.
+        """
 
         now = self._Now(now_sec)
         self._last_boundary_sec = now
         previous_revision = self.StatusRevision
+        self.ResourceHeld = bool(self.IsRunning and not resource_available)
+        if not resource_available:
+            self._HoldRunningTime(now)
+            return self.StatusRevision != previous_revision
         self._AccountRunningTime(now)
         task = self.ActiveTask
         if self._UsesPeriodicInterrupts():
@@ -357,6 +401,7 @@ class MissionExecutionController:
         *,
         system_mode: str,
         now_sec: Optional[float] = None,
+        resource_available: bool = True,
     ) -> MissionCommandResult:
         """Apply at most one new operator command, then advance task time.
 
@@ -378,7 +423,10 @@ class MissionExecutionController:
         revision = int(control.get("MissionCommandRevision", 0))
 
         if not command or revision == self.LastCommandRevision:
-            changed = self.Advance(now)
+            changed = self.Advance(
+                now,
+                resource_available=resource_available,
+            )
             return MissionCommandResult(True, changed, self.LastMessage)
 
         self.LastCommandRevision = revision
@@ -430,6 +478,7 @@ class MissionExecutionController:
             return MissionCommandResult(False, True, message)
 
         self.LoadedProfile = CloneMission(profile)
+        self.ResourceHeld = False
         self.ActiveTaskIndex = None
         self.ActiveTaskElapsedSec = 0.0
         self.MissionWallStartSec = None
@@ -487,6 +536,7 @@ class MissionExecutionController:
 
         self.MissionWallStartSec = now_sec
         self.MissionWallElapsedSec = 0.0
+        self.ResourceHeld = False
         self._ActivateTask(first_index, now_sec, "Mission started")
         return MissionCommandResult(True, True, self.LastMessage)
 
@@ -500,6 +550,7 @@ class MissionExecutionController:
         task = self.ActiveTask
         self._last_accounting_sec = None
         self._pause_started_sec = now_sec
+        self.ResourceHeld = False
         self._SetStatus(
             "PAUSED",
             f"Paused: {task.Name if task is not None else 'mission'}",
@@ -529,6 +580,7 @@ class MissionExecutionController:
             }
         self._pause_started_sec = None
         self._last_accounting_sec = now_sec
+        self.ResourceHeld = False
         self.TaskActivationRevision += 1
         self._SetStatus(
             self._RunningStateForTask(task),
@@ -549,6 +601,7 @@ class MissionExecutionController:
         self._pause_started_sec = None
         self.LoadedProfile = None
         self.FaultReason = ""
+        self.ResourceHeld = False
         state = "ABORTED" if was_active else "STOPPED"
         message = "Mission aborted by operator" if was_active else "Mission stopped"
         self._SetStatus(state, message)
@@ -559,6 +612,7 @@ class MissionExecutionController:
         if self.IsRunning:
             self._AccountRunningTime(now)
         self.FaultReason = str(reason)
+        self.ResourceHeld = False
         self._last_accounting_sec = None
         self._pause_started_sec = None
         self._SetStatus("FAULTED", f"Mission fault: {self.FaultReason}")
@@ -712,6 +766,7 @@ class MissionExecutionController:
             ),
             "NextPeriodicDueInSec": next_periodic_due_in_sec,
             "MissionWallElapsedSec": float(self.MissionWallElapsedSec),
+            "RadarResourceHeld": bool(self.ResourceHeld),
             "TaskActivationRevision": int(self.TaskActivationRevision),
             "TaskTimingRevision": int(self.TaskTimingRevision),
             "SimulationOnly": True,

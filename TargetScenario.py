@@ -159,12 +159,18 @@ def make_extended_line_target_from_range_bearing(
 
 def create_default_scene():
     """
-    Create a simple starting scene.
+    Create the moving-platform operational simulation scene.
 
-    This gives:
-        - one target near 20 degrees
-        - one target near 50 degrees
-        - one large stationary reflector between them to test sidelobe behaviour
+    The simulated radar follows a 1 km-radius circle centred 5 km east of the
+    mission origin.  These target tracks are deliberately placed outside that
+    route so every scatterer remains at least 4 km from every possible platform
+    position for the first 20 minutes of the scenario.  This prevents minimum-
+    range blanking and very-near-target CFAR contamination from dominating the
+    normal moving-platform validation.
+
+    The moving vessels head generally away from the platform route.  The
+    stationary reflector remains between their initial bearings so the scene
+    still exercises strong-target and sidelobe behaviour.
 
     Returns
     -------
@@ -173,40 +179,37 @@ def create_default_scene():
     """
 
     scene_objects = [
-        # 200 m long container-vessel-like extended target.
-        #
-        # aspect_deg is the orientation of the ship long axis. For an extended
-        # RANGE profile, put the long axis close to the line of sight. Here the
-        # target is at bearing 50 deg and aspect 50 deg, so its length mostly
-        # spreads in range.
+        # A 200 m container-vessel-like target.  Its long axis remains close to
+        # the initial line of sight to retain the intended extended range
+        # profile without crossing the platform route.
         make_extended_line_target_from_range_bearing(
             name="Container_Vessel_200m",
-            range_m=8500.0,
-            bearing_deg=50.0,
-            speed_mps=10.0,
-            heading_deg=210.0,
+            range_m=7000.0,
+            bearing_deg=30.0,
+            speed_mps=5.0,
+            heading_deg=30.0,
             length_m=200.0,
-            aspect_deg=50.0,
+            aspect_deg=30.0,
             num_scatterers=25,
             total_rcs=40000.0,
             rcs_taper="cosine",
         ),
-       make_extended_line_target_from_range_bearing(
+        make_extended_line_target_from_range_bearing(
             name="Container_Vessel1_200m",
-            range_m=6000.0,
-            bearing_deg=80.0,
+            range_m=10000.0,
+            bearing_deg=110.0,
             speed_mps=5.0,
-            heading_deg=210.0,
+            heading_deg=110.0,
             length_m=150.0,
-            aspect_deg=70.0,
+            aspect_deg=110.0,
             num_scatterers=25,
             total_rcs=12000.0,
             rcs_taper="cosine",
         ),
         make_scene_object_from_range_bearing(
             name="Reflector_-35deg",
-            range_m=6000.0,
-            bearing_deg=50.0,
+            range_m=11000.0,
+            bearing_deg=70.0,
             speed_mps=0.0,
             heading_deg=0.0,
             rcs=800.0,

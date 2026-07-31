@@ -116,6 +116,13 @@ class RadarDisplay:
         self.ManualNudgeDeltaDeg = 0.0
         self.ManualControlCommandId = 0
         self.StopCommandId = 0
+        self.TrackConfirmCommandId = 0
+        self.TrackConfirmTrackId = 0
+        self.TrackConfirmRangeM = 0.0
+        self.TrackConfirmAzimuthDeg = 0.0
+        self.TrackConfirmSource = "LEGACY"
+        self.TrackConfirmWasTentative = False
+        self.TrackConfirmationMessage = "No confirmation requested"
         self.LastMissionRuntimeStatusRevision = -1
 
         self.ScanStartDeg = float(Config.get("ScanStartDeg", -60.0))
@@ -371,6 +378,10 @@ class RadarDisplay:
         self.NavigationEastM = None
         self.NavigationNorthM = None
         self.NavigationHeadingTrueDeg = None
+        # Operator-facing PPI/scan angles are true bearings.  Keep the
+        # X6-60 encoder angle separately because it is relative to the vessel
+        # and must never be drawn directly on the north-up PPI.
+        self.X660AzimuthRelativeDeg = None
 
         # Optional logo. Path is relative to the folder you run the script from,
         # or it may be an absolute path.
@@ -519,6 +530,12 @@ class RadarDisplay:
             "SystemMode": self.SystemMode,
             "RequestedSystemMode": self.RequestedSystemMode,
             "SystemModeRevision": self.SystemModeRevision,
+            "TrackConfirmCommandId": self.TrackConfirmCommandId,
+            "TrackConfirmTrackId": self.TrackConfirmTrackId,
+            "TrackConfirmRangeM": self.TrackConfirmRangeM,
+            "TrackConfirmAzimuthDeg": self.TrackConfirmAzimuthDeg,
+            "TrackConfirmSource": self.TrackConfirmSource,
+            "TrackConfirmWasTentative": self.TrackConfirmWasTentative,
         }
         if self.MissionPage is not None:
             state.update(self.MissionPage.GetMissionControlState())
@@ -566,14 +583,16 @@ class RadarDisplay:
         self.RadarLinkStatus = str(Message)
         self.UpdateStatusPanel()
 
-    def SetMeasuredBeamAngle(self, AzimuthDeg):
-        """Refresh the PPI beam from measured X6-60 encoder telemetry.
+    def SetMeasuredBeamAngle(self, BearingTrueDeg):
+        """Refresh the PPI beam from a measured true-bearing solution.
 
         This lightweight path is independent of radar dwell processing, so
-        the beam remains live while the operator display is in STOP.
+        the beam remains live while the operator display is in STOP.  The
+        caller must convert X6-60 vessel-relative encoder telemetry to true
+        bearing before invoking this display boundary.
         """
 
-        self.BeamAngleDeg = float(AzimuthDeg) % 360.0
+        self.BeamAngleDeg = float(BearingTrueDeg) % 360.0
         if self.BeamLine is not None:
             self.UpdateBeamLine()
         if self.StatusLabel is not None:
@@ -715,16 +734,31 @@ class RadarDisplay:
         self.StatusLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
         StatusTargetLayout.addWidget(self.StatusLabel, stretch=1)
 
+        TargetPanel = QtWidgets.QWidget()
+        TargetPanelLayout = QtWidgets.QVBoxLayout(TargetPanel)
+        TargetPanelLayout.setContentsMargins(0, 0, 0, 0)
+        TargetPanelLayout.setSpacing(4)
+
         self.TargetDetailsLabel = QtWidgets.QLabel()
         self.TargetDetailsLabel.setStyleSheet(
             "background-color: #050505; border: 1px solid #303030; "
             "font-family: Menlo, Consolas, monospace; font-size: 12px; padding: 8px;"
         )
-        self.TargetDetailsLabel.setMinimumHeight(220)
+        self.TargetDetailsLabel.setMinimumHeight(188)
         self.TargetDetailsLabel.setMinimumWidth(260)
         self.TargetDetailsLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
         self.TargetDetailsLabel.setText("SELECTED TARGET\nNone")
-        StatusTargetLayout.addWidget(self.TargetDetailsLabel, stretch=1)
+        TargetPanelLayout.addWidget(self.TargetDetailsLabel, stretch=1)
+
+        self.ConfirmTrackButton = QtWidgets.QPushButton(
+            "Confirm selected track"
+        )
+        self.ConfirmTrackButton.setEnabled(False)
+        self.ConfirmTrackButton.clicked.connect(
+            self.OnConfirmSelectedTrack
+        )
+        TargetPanelLayout.addWidget(self.ConfirmTrackButton, stretch=0)
+        StatusTargetLayout.addWidget(TargetPanel, stretch=1)
 
         RightLayout.addWidget(StatusTargetWidget)
 
@@ -844,7 +878,7 @@ class RadarDisplay:
             + ("#ff6666;" if self.TransmitEnabled else "#bfbfbf;")
         )
         self.OperatorHeaderAntennaLabel.setText(
-            f"AZ {self.BeamAngleDeg:06.2f} deg"
+            f"TRUE BRG {self.BeamAngleDeg:06.2f} deg T"
         )
         self.OperatorHeaderMissionLabel.setText(mission_text)
         if "LOST" in self.RadarLinkStatus.upper():
@@ -1053,8 +1087,8 @@ class RadarDisplay:
         self.ControlWidgets["DataLogFilename"].editingFinished.connect(self.OnDataLogFilenameChanged)
         self.ControlWidgets["SaveDataEnabled"].stateChanged.connect(self.OnSaveDataEnabledChanged)
 
-        StartLabel = QtWidgets.QLabel("Start")
-        StopLabel = QtWidgets.QLabel("Stop")
+        StartLabel = QtWidgets.QLabel("Start °T")
+        StopLabel = QtWidgets.QLabel("Stop °T")
         StepLabel = QtWidgets.QLabel("Step")
         MaxDbLabel = QtWidgets.QLabel("Max dB")
         FileLabel = QtWidgets.QLabel("File")
@@ -1318,6 +1352,15 @@ class RadarDisplay:
 
     def UpdateNavigationFromDiagnostics(self, diagnostics):
         """Apply the dwell-synchronous platform pose to map and trail."""
+
+        x660_azimuth_relative_deg = diagnostics.get("X660AzDeg")
+        if (
+            x660_azimuth_relative_deg is not None
+            and math.isfinite(float(x660_azimuth_relative_deg))
+        ):
+            self.X660AzimuthRelativeDeg = (
+                float(x660_azimuth_relative_deg) % 360.0
+            )
 
         if not bool(diagnostics.get("NavigationPositionValid", False)):
             return
@@ -1999,10 +2042,16 @@ class RadarDisplay:
             return
 
         if self.SelectedTrack is None:
+            if getattr(self, "ConfirmTrackButton", None) is not None:
+                self.ConfirmTrackButton.setEnabled(False)
+                self.ConfirmTrackButton.setText(
+                    "Confirm selected track"
+                )
             self.TargetDetailsLabel.setText(
                 "SELECTED TARGET\n"
                 "None\n\n"
-                "Left-click near a track on the PPI."
+                "Left-click near a track on the PPI.\n\n"
+                f"Confirm: {self.TrackConfirmationMessage}"
             )
             return
 
@@ -2029,6 +2078,13 @@ class RadarDisplay:
         TrackId = GetInt("TrackId", Default=-1)
         Status = str(getattr(Track, "Status", "UNKNOWN")).upper()
         IsConfirmed = bool(getattr(Track, "IsConfirmed", False)) or Status == "CONFIRMED"
+        if getattr(self, "ConfirmTrackButton", None) is not None:
+            self.ConfirmTrackButton.setEnabled(True)
+            self.ConfirmTrackButton.setText(
+                "Confirm selected track"
+                if IsConfirmed
+                else "Check initiating track"
+            )
         TrackType = str(getattr(Track, "TrackType", "SURFACE VESSEL"))
         TrackSource = str(
             getattr(Track, "TrackSource", self.DisplayTrackSourceApplied)
@@ -2055,9 +2111,50 @@ class RadarDisplay:
             f"Az-rate:    {AzimuthRateDps:8.3f} deg/s\n"
             f"Hits:       {Hits}\n"
             f"Misses:     {Misses}\n"
-            f"Age:        {Age}"
+            f"Age:        {Age}\n"
+            f"Confirm:    {self.TrackConfirmationMessage}"
         )
         self.TargetDetailsLabel.setText(Text)
+
+    def OnConfirmSelectedTrack(self):
+        if self.SelectedTrack is None:
+            self.TrackConfirmationMessage = "select a track"
+            self.UpdateTargetDetailsPanel()
+            return
+        status = str(
+            getattr(self.SelectedTrack, "Status", "")
+        ).upper()
+        is_confirmed = bool(
+            getattr(self.SelectedTrack, "IsConfirmed", False)
+        ) or status == "CONFIRMED"
+        self.TrackConfirmTrackId = int(
+            getattr(self.SelectedTrack, "TrackId", 0)
+        )
+        self.TrackConfirmRangeM = float(
+            getattr(self.SelectedTrack, "RangeM", 0.0)
+        )
+        self.TrackConfirmAzimuthDeg = float(
+            getattr(self.SelectedTrack, "AzimuthDeg", 0.0)
+        ) % 360.0
+        self.TrackConfirmSource = str(
+            getattr(
+                self.SelectedTrack,
+                "TrackSource",
+                self.DisplayTrackSourceApplied,
+            )
+        ).upper()
+        self.TrackConfirmWasTentative = not is_confirmed
+        self.TrackConfirmCommandId += 1
+        self.TrackConfirmationMessage = (
+            f"T{self.TrackConfirmTrackId} "
+            f"{'confirmation' if is_confirmed else 'initiation check'} "
+            "requested"
+        )
+        self.UpdateTargetDetailsPanel()
+
+    def SetTrackConfirmationResult(self, Applied, Message):
+        self.TrackConfirmationMessage = str(Message)
+        self.UpdateTargetDetailsPanel()
 
     def UpdateStatusPanel(self):
         NumDetections = len(self.LatestDetections)
@@ -2081,7 +2178,7 @@ class RadarDisplay:
             f"Mode:   {self.DisplayMode}",
             f"Scan:   {self.ScanEnabled}",
             f"Tx:     {TransmitStatus}",
-            f"Beam:   {self.BeamAngleDeg:.1f} deg",
+            f"True brg: {self.BeamAngleDeg:.1f} deg T",
             f"Track src: {self.DisplayTrackSourceApplied}",
             f"Wave:   {self.AppliedWaveformId}",
             (
@@ -2096,6 +2193,17 @@ class RadarDisplay:
             f"Tent:   {NumTentative}",
             f"Tracks: {NumConfirmed}",
         ]
+
+        if self.NavigationHeadingTrueDeg is not None:
+            Lines.insert(
+                7,
+                f"Ship hdg: {self.NavigationHeadingTrueDeg:.1f} deg T",
+            )
+        if self.X660AzimuthRelativeDeg is not None:
+            Lines.insert(
+                8,
+                f"X6-60:   {self.X660AzimuthRelativeDeg:.1f} deg rel",
+            )
 
         if self.DisplayTrackSourceFallback:
             Lines.append(

@@ -31,6 +31,26 @@ class TestWaveformLibrary(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Waveform not found"):
                 self.Library.Get(AmbiguousName)
 
+    def test_operator_catalogue_exposes_pair_not_internal_members(self):
+        self.assertEqual(
+            self.Library.ListOperationalWaveforms(),
+            [
+                "Barker13_10MHz",
+                "Barker13_20MHz",
+                "Frank10_10MHz",
+                "Frank10_20MHz",
+                "Golay64_20MHz",
+            ],
+        )
+        self.assertNotIn(
+            "Golay64A_20MHz",
+            self.Library.ListOperationalWaveforms(),
+        )
+        self.assertNotIn(
+            "Golay64B_20MHz",
+            self.Library.ListOperationalWaveforms(),
+        )
+
     def test_sample_counts_and_pulse_durations(self):
         Expected = {
             "Barker13_10MHz": (13, 10.0e6, 4, 52, 1.30e-6),

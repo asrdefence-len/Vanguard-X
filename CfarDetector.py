@@ -233,6 +233,11 @@ class CfarDetector:
 
             ThisDetection.NoiseEstimateDb = float(10.0 * np.log10(NoisePower + 1e-30))
             ThisDetection.ThresholdDb = float(10.0 * np.log10(ThresholdPower + 1e-30))
+            ThisDetection.SnrDb = float(
+                10.0 * np.log10(
+                    (CellPower + 1e-30) / (NoisePower + 1e-30)
+                )
+            )
 
             Detections.append(ThisDetection)
 

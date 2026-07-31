@@ -213,8 +213,8 @@ def make_golay_dwell_plan(
         Mode="GOLAY_COMPLEMENTARY",
         ProcessorId="GOLAY_COMPLEMENTARY_RANGE_DOPPLER",
         NominalPriSec=float(pri_sec),
-        CombineGroupsBeforeDoppler=True,
-        DopplerCompensationEnabled=False,
+        CombineGroupsBeforeDoppler=False,
+        DopplerCompensationEnabled=True,
     )
 
     return DwellPlan(

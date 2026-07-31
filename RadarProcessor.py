@@ -416,7 +416,7 @@ class RadarProcessor:
 
         RawA = Raw.IQ[0::2]
         RawB = Raw.IQ[1::2]
-        PreparedB, CompensationMode = (
+        PreparedB, PreCompressionCompensationMode = (
             self._ApplyGolayBPreCompressionCompensation(
                 RawB,
                 ThisDwell,
@@ -445,19 +445,39 @@ class RadarProcessor:
 
         NumPairs, NumSamples = RangeCompressed.shape
         PairPriSec = 2.0 * PhysicalPriSec
-        DopplerWindow = self._GetDopplerWindow(NumPairs)
-        Windowed = RangeCompressed * DopplerWindow[:, np.newaxis]
-        RangeDopplerMap = np.fft.fftshift(
-            np.fft.fft(Windowed, axis=0),
-            axes=0,
+        DopplerCompensationEnabled = bool(
+            getattr(
+                ThisDwell.Processing,
+                "DopplerCompensationEnabled",
+                False,
+            )
         )
+        if DopplerCompensationEnabled:
+            RangeDopplerMap = self._ProcessDopplerCompensatedGolay(
+                CompressedA,
+                CompressedB,
+                PhysicalPriSec,
+            )
+            AxisPulseCount = NumPairs
+            AxisPriSec = PairPriSec
+            CompensationMode = "DOPPLER_BIN_B_PHASE_ALIGN"
+        else:
+            DopplerWindow = self._GetDopplerWindow(NumPairs)
+            Windowed = RangeCompressed * DopplerWindow[:, np.newaxis]
+            RangeDopplerMap = np.fft.fftshift(
+                np.fft.fft(Windowed, axis=0),
+                axes=0,
+            )
+            AxisPulseCount = NumPairs
+            AxisPriSec = PairPriSec
+            CompensationMode = "NONE"
         MagnitudeDb = 20.0 * np.log10(np.abs(RangeDopplerMap) + 1e-12)
 
         RangeAxisM, DopplerAxisHz, VelocityAxisMps = self._GetAxes(
-            NumPairs,
+            AxisPulseCount,
             NumSamples,
             Raw.SampleRate,
-            PairPriSec,
+            AxisPriSec,
             RxStartDelaySec,
         )
         PeakDopplerBin, PeakRangeBin = np.unravel_index(
@@ -474,11 +494,15 @@ class RadarProcessor:
             "WaveformAId": WaveformAId,
             "WaveformBId": WaveformBId,
             "DopplerCompensationMode": CompensationMode,
-            "DopplerCompensationEnabled": False,
+            "DopplerCompensationEnabled": DopplerCompensationEnabled,
+            "GolayBPreCompressionCompensationMode": (
+                PreCompressionCompensationMode
+            ),
             "PhysicalPriSec": PhysicalPriSec,
             "PairPriSec": PairPriSec,
             "PhysicalPulseCount": int(Raw.IQ.shape[0]),
             "ComplementaryPairCount": int(NumPairs),
+            "DopplerBinCount": int(RangeDopplerMap.shape[0]),
             "RxStartDelaySec": RxStartDelaySec,
             "FirstRxSampleRangeOffsetM": float(RangeAxisM[0]),
             "CodeLength": ChipCount,
@@ -529,8 +553,66 @@ class RadarProcessor:
                 "PairPriSec": PairPriSec,
                 "SampleRateHz": float(Raw.SampleRate),
                 "SamplesPerChip": int(MetadataA["SamplesPerChip"]),
+                "DopplerCompensationMode": CompensationMode,
             }
         return Processed
+
+    def _ProcessDopplerCompensatedGolay(
+        self,
+        CompressedA,
+        CompressedB,
+        PhysicalPriSec,
+    ):
+        """Phase-align B in each unambiguous complementary-pair Doppler bin.
+
+        A and B are each sampled once per pair.  Doppler-process them
+        separately at that pair rate, then rotate B back by its one-physical-
+        PRI transmit-time offset before adding it to A.  The output deliberately
+        remains on the pair-rate Doppler axis.  Emitting both physical-PRF
+        aliases would also emit the unused A-B ambiguity response, whose range
+        sidelobes are unsuitable for operational detection.
+        """
+
+        if CompressedA.shape != CompressedB.shape:
+            raise ValueError("Golay A and B compressed arrays must match")
+        NumPairs, NumSamples = CompressedA.shape
+        if NumPairs <= 0 or PhysicalPriSec <= 0.0:
+            raise ValueError("Golay Doppler processing requires valid timing")
+
+        DopplerWindow = self._GetDopplerWindow(NumPairs)
+        SpectrumA = np.fft.fftshift(
+            np.fft.fft(
+                CompressedA * DopplerWindow[:, np.newaxis],
+                axis=0,
+            ),
+            axes=0,
+        )
+        SpectrumB = np.fft.fftshift(
+            np.fft.fft(
+                CompressedB * DopplerWindow[:, np.newaxis],
+                axis=0,
+            ),
+            axes=0,
+        )
+
+        PairPriSec = 2.0 * PhysicalPriSec
+        PairDopplerAxisHz = np.fft.fftshift(
+            np.fft.fftfreq(NumPairs, d=PairPriSec)
+        )
+        BPhaseAlignment = np.exp(
+            -1j
+            * 2.0
+            * np.pi
+            * PairDopplerAxisHz
+            * PhysicalPriSec
+        )
+        RangeDopplerMap = (
+            SpectrumA
+            + SpectrumB * BPhaseAlignment[:, np.newaxis]
+        )
+        if RangeDopplerMap.shape != (NumPairs, NumSamples):
+            raise RuntimeError("Golay Doppler map shape is inconsistent")
+        return RangeDopplerMap.astype(np.complex64, copy=False)
 
     def _ValidateGolayPlan(self, Raw, ThisDwell):
         """Reject incomplete, reordered or physically inconsistent pairs."""
@@ -540,11 +622,6 @@ class RadarProcessor:
             raise ValueError("Golay processing requires a positive even pulse count")
         if Raw.IQ.ndim != 2 or Raw.IQ.shape[0] != len(Pulses):
             raise ValueError("Raw Golay IQ dimensions do not match the dwell plan")
-        if bool(getattr(ThisDwell.Processing, "DopplerCompensationEnabled", False)):
-            raise ValueError(
-                "Golay Doppler compensation is reserved but not yet enabled"
-            )
-
         PriValues = np.asarray([pulse.PriSec for pulse in Pulses], dtype=np.float64)
         RxDelays = np.asarray(
             [pulse.RxStartDelaySec for pulse in Pulses],

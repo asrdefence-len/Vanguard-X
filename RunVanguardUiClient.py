@@ -67,6 +67,11 @@ def ApplyServerMessage(display, message):
         )
     elif message_type == "mission_status":
         display.SetMissionRuntimeStatus(payload)
+    elif message_type == "track_confirmation_result":
+        display.SetTrackConfirmationResult(
+            bool(payload.get("applied", False)),
+            str(payload.get("message", "")),
+        )
 
 
 def Main(arguments=None):

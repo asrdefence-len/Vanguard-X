@@ -354,3 +354,22 @@ class WaveformLibrary:
         """Return registered waveform identifiers in catalogue order."""
 
         return list(self.Definitions.keys())
+
+    def ListOperationalWaveforms(self):
+        """Return operator-selectable waveform families in catalogue order.
+
+        Individual members of a complementary pair are implementation details.
+        Operators select the logical pair id; RadarPlans expands that selection
+        into the required A/B pulse sequence.
+        """
+
+        OperationalIds = []
+        for Definition in self.Definitions.values():
+            WaveformId = (
+                Definition.PairId
+                if Definition.PairId is not None
+                else Definition.WaveformId
+            )
+            if WaveformId not in OperationalIds:
+                OperationalIds.append(WaveformId)
+        return OperationalIds

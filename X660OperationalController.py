@@ -344,7 +344,23 @@ class X660OperationalController:
         return Result
 
     def SetPanPositionNative(self, PanDeg: float):
+        return self.SetPanPositionNativeAtRate(
+            PanDeg,
+            self.PositionCommandSpeedDegPerSec,
+        )
+
+    def SetPanPositionNativeAtRate(
+        self,
+        PanDeg: float,
+        PanRateDegPerSec: float,
+    ):
         TargetBearing = Wrap360(PanDeg)
+        PositionRate = int(round(float(PanRateDegPerSec)))
+        if not 1 <= PositionRate <= int(self.MaxPanRateDegPerSec):
+            raise ValueError(
+                "PanRateDegPerSec must be between 1 and the configured "
+                "X6-60 operational maximum"
+            )
         State = self.Update()
         if State.RawAngleDeg is None:
             raise RuntimeError("X6-60 raw multi-turn angle is unavailable")
@@ -356,7 +372,7 @@ class X660OperationalController:
         Result = self._TransactMotion(
             MotionProtocol.BuildAbsolutePositionRequest(
                 TargetRawAngle,
-                self.PositionCommandSpeedDegPerSec,
+                PositionRate,
             ),
             "SetPanPositionNative",
         )

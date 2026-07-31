@@ -95,6 +95,9 @@ class RadarLinkRoundTripTests(unittest.TestCase):
             "TransmitEnabled": True,
             "MissionCommandRevision": 7,
             "MissionCommand": "START",
+            "TrackConfirmCommandId": 3,
+            "TrackConfirmTrackId": 41,
+            "TrackConfirmWasTentative": True,
         })
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -107,6 +110,9 @@ class RadarLinkRoundTripTests(unittest.TestCase):
         self.assertTrue(state["TransmitEnabled"])
         self.assertEqual(state["MissionCommandRevision"], 7)
         self.assertEqual(state["MissionCommand"], "START")
+        self.assertEqual(state["TrackConfirmCommandId"], 3)
+        self.assertEqual(state["TrackConfirmTrackId"], 41)
+        self.assertTrue(state["TrackConfirmWasTentative"])
         mission_revision_before_disconnect = state["MissionCommandRevision"]
 
         processed = SimpleNamespace(

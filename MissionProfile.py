@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import math
+import re
 from typing import Any, Dict, Optional, Tuple, Union
 from uuid import uuid4
 
@@ -21,7 +22,15 @@ MISSION_SCHEMA_VERSION = 1
 MISSION_DURATION_BASIS_ACTIVE_TASK_TIME = "ACTIVE_TASK_TIME"
 MISSION_COMPLETION_POLICIES = ("STOP", "REPEAT")
 SCAN_DIRECTIONS = ("CW", "CCW")
-TRACK_MISS_POLICIES = ("RETRY_WIDER_THEN_DEFER", "RETRY", "WIDEN", "DEFER")
+TRACK_MISS_POLICIES = (
+    "RETRY_WIDER_THEN_DELETE",
+    "RETRY_WIDER_THEN_DEFER",
+    "DELETE",
+    "COAST",
+    "RETRY",
+    "WIDEN",
+    "DEFER",
+)
 
 
 def UtcNowIso() -> str:
@@ -105,7 +114,7 @@ class TrackUpdatePolicy:
     PulsesPerCpi: int = 32
     MaximumRangeM: float = 15000.0
     GateMode: str = "FIXED"
-    GateHalfWidthDeg: float = 2.0
+    GateHalfWidthDeg: float = 5.0
     MinimumGateDeg: float = 1.0
     MaximumGateDeg: float = 8.0
     AngularStepDeg: float = 0.5
@@ -115,7 +124,7 @@ class TrackUpdatePolicy:
     PointingToleranceDeg: float = 0.25
     SettleTimeSec: float = 0.25
     MaximumUpdateDurationSec: float = 20.0
-    MissPolicy: str = "RETRY_WIDER_THEN_DEFER"
+    MissPolicy: str = "RETRY_WIDER_THEN_DELETE"
 
 
 @dataclass(frozen=True)
@@ -185,6 +194,15 @@ def ResolveAvailableWaveformId(
     requested = str(waveform_id)
     if requested in available:
         return requested
+
+    # Migrate mission files created when the UI accidentally exposed the
+    # internal A/B members instead of the logical complementary family.
+    GolayMember = re.fullmatch(r"(Golay\d+)[AB](_\d+MHz)", requested)
+    if GolayMember is not None:
+        PairId = f"{GolayMember.group(1)}{GolayMember.group(2)}"
+        if PairId in available:
+            return PairId
+
     if "Frank10_20MHz" in available:
         return "Frank10_20MHz"
     if available:

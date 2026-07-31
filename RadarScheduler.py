@@ -228,6 +228,33 @@ class RadarScheduler:
 
         return None
 
+    def HasReadyOrActiveTrackTask(
+        self,
+        current_time_sec: Optional[float] = None,
+    ) -> bool:
+        """Return whether TRACK work owns or is ready to own the radar.
+
+        Main uses this as the radar-resource interlock.  Mission task timing
+        and pointing transitions are held from the instant a confirmation is
+        queued until its finite TRACK task completes or fails.
+        """
+
+        if isinstance(self.ActiveTask, TrackTask):
+            return True
+        now = (
+            time.time()
+            if current_time_sec is None
+            else float(current_time_sec)
+        )
+        return any(
+            task.IsReady(now)
+            and task.Status in (TaskStatus.QUEUED, TaskStatus.PAUSED)
+            for task in self._queued_track_tasks
+        )
+
+    def IsTrackTaskActive(self) -> bool:
+        return isinstance(self.ActiveTask, TrackTask)
+
     def _select_best_ready_track_task(
         self,
         now: float,

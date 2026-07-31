@@ -84,6 +84,31 @@ class MissionProfileTests(unittest.TestCase):
             ).Validate(reconciled).IsValid
         )
 
+    def test_internal_golay_member_migrates_to_logical_pair(self):
+        profile = CreateDefaultMission()
+        profile = TouchMission(
+            profile,
+            PrimaryTasks=(
+                profile.PrimaryTasks[0],
+                replace(
+                    profile.PrimaryTasks[1],
+                    WaveformId="Golay64A_20MHz",
+                ),
+            ),
+        )
+
+        reconciled = ReconcileMissionWaveforms(profile, WAVEFORMS)
+
+        self.assertEqual(
+            reconciled.PrimaryTasks[1].WaveformId,
+            "Golay64_20MHz",
+        )
+        self.assertTrue(
+            MissionValidator(MissionLimits(WAVEFORMS))
+            .Validate(reconciled)
+            .IsValid
+        )
+
     def test_last_known_good_is_revalidated_and_reconciled_on_restore(self):
         profile = CreateDefaultMission()
         legacy_sector = replace(
@@ -259,6 +284,18 @@ class MissionUiBoundaryTests(unittest.TestCase):
             "TRMInterface",
         }
         self.assertTrue(forbidden.isdisjoint(imported))
+
+    def test_mission_file_dialogs_avoid_blocking_native_chooser(self):
+        source = (
+            Path(__file__)
+            .with_name("MissionPage.py")
+            .read_text(encoding="utf-8")
+        )
+        self.assertGreaterEqual(
+            source.count("QtWidgets.QFileDialog.DontUseNativeDialog"),
+            2,
+        )
+        self.assertIn('"Mission save failed"', source)
 
     def test_radar_page_is_wrapped_not_replaced(self):
         display_source = (

@@ -148,7 +148,16 @@ class RadarExecutor:
         """
         now = time.time() if current_time_sec is None else float(current_time_sec)
 
-        if self._active_task_id != int(task.TaskId):
+        pointing_task = getattr(self.PointingManager, "ActiveTask", None)
+        pointing_task_id = (
+            None
+            if pointing_task is None
+            else int(getattr(pointing_task, "TaskId", -1))
+        )
+        if (
+            self._active_task_id != int(task.TaskId)
+            or pointing_task_id != int(task.TaskId)
+        ):
             self.PointingManager.ActivateTask(task, navigation)
             self._active_task_id = int(task.TaskId)
 
@@ -167,14 +176,18 @@ class RadarExecutor:
                 Reason="Pointing state invalid",
             )
 
-        if task.TaskType == RadarTaskType.TRACK and not pointing.Ready:
+        if not pointing.Ready:
             return RadarExecutionResult(
                 Executed=False,
                 WaitingForPointing=True,
                 TaskId=int(task.TaskId),
                 TaskType=task.TaskType.value,
                 Pointing=pointing,
-                Reason="Track pointing not ready",
+                Reason=(
+                    "Track pointing not ready"
+                    if task.TaskType == RadarTaskType.TRACK
+                    else "Search transition slew not complete"
+                ),
             )
 
         profile = self._profile_for_task(task)
@@ -257,6 +270,15 @@ class RadarExecutor:
             ),
             "PointingReady": bool(pointing.Ready),
             "PointingReachable": bool(pointing.Reachable),
+            "PointingPhase": str(pointing.PointingPhase),
+            "TrackUpdateComplete": bool(
+                pointing.TrackUpdateComplete
+            ),
+            "TrackUpdateCoverageValid": bool(
+                pointing.TrackUpdateCoverageValid
+            ),
+            "TrackUpdatePass": int(pointing.TrackUpdatePass),
+            "TrackUpdatePasses": int(pointing.TrackUpdatePasses),
             "RadarTiming": profile.Timing.ToMetadata(),
         }
 
@@ -363,13 +385,17 @@ class RadarExecutor:
             )
 
         if task.TaskType == RadarTaskType.TRACK:
+            TaskMetadata = dict(getattr(task, "Metadata", {}) or {})
             return self._make_execution_profile(
                 Name="Track",
-                WaveformId=self.Config.get(
+                WaveformId=TaskMetadata.get(
                     "TrackWaveformId",
                     self.Config.get(
-                        "SearchWaveformId",
-                        "Barker13_20MHz",
+                        "TrackWaveformId",
+                        self.Config.get(
+                            "SearchWaveformId",
+                            "Barker13_20MHz",
+                        ),
                     ),
                 ),
                 RxAttenuationDb=float(self.Config.get(
@@ -384,6 +410,15 @@ class RadarExecutor:
                     "TrackSDRProfile",
                     self.Config.get("SearchSDRProfile", "Default"),
                 )),
+                TimingOverrides={
+                    "SelectedPrfHz": TaskMetadata.get("TrackPrfHz"),
+                    "PulsesPerCpi": TaskMetadata.get(
+                        "TrackPulsesPerCpi"
+                    ),
+                    "MaximumRangeM": TaskMetadata.get(
+                        "TrackMaximumRangeM"
+                    ),
+                },
             )
 
         raise ValueError(
@@ -397,6 +432,7 @@ class RadarExecutor:
         RxAttenuationDb: float,
         TxAttenuationDb: float,
         SDRProfile: str,
+        TimingOverrides: Optional[Dict] = None,
     ) -> ExecutionProfile:
         """Build a profile entirely from one validated timing solution."""
 
@@ -407,6 +443,11 @@ class RadarExecutor:
 
         Prefix = str(Name)
         IsSearch = Prefix.upper() == "SEARCH"
+        Overrides = {
+            key: value
+            for key, value in dict(TimingOverrides or {}).items()
+            if value is not None
+        }
         TimingWaveformId = (
             "Golay64A_20MHz"
             if str(WaveformId) == "Golay64_20MHz"
@@ -416,19 +457,28 @@ class RadarExecutor:
 
         Timing = CalculateRadarTiming(
             WaveformMetadata,
-            SelectedPrfHz=float(self.Config.get(
-                f"{Prefix}PrfHz",
-                self.Config.get("SelectedPrfHz", 2000.0),
-            )),
-            PulsesPerCpi=int(self.Config.get(
-                f"{Prefix}PulsesPerCpi",
-                self.Config.get("SelectedPulsesPerCpi", 32),
-            )),
-            MaximumRangeM=float(self.Config.get(
-                f"{Prefix}MaximumRangeM",
+            SelectedPrfHz=float(Overrides.get(
+                "SelectedPrfHz",
                 self.Config.get(
-                    "InstrumentedMaxRangeM",
-                    self.Config.get("MaxRangeM", 15000.0),
+                    f"{Prefix}PrfHz",
+                    self.Config.get("SelectedPrfHz", 2000.0),
+                ),
+            )),
+            PulsesPerCpi=int(Overrides.get(
+                "PulsesPerCpi",
+                self.Config.get(
+                    f"{Prefix}PulsesPerCpi",
+                    self.Config.get("SelectedPulsesPerCpi", 32),
+                ),
+            )),
+            MaximumRangeM=float(Overrides.get(
+                "MaximumRangeM",
+                self.Config.get(
+                    f"{Prefix}MaximumRangeM",
+                    self.Config.get(
+                        "InstrumentedMaxRangeM",
+                        self.Config.get("MaxRangeM", 15000.0),
+                    ),
                 ),
             )),
             ReceiverRecoveryTimeSec=float(self.Config.get(

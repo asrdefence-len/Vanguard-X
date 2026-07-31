@@ -229,7 +229,7 @@ class TestCircularPlatformEarthReference(unittest.TestCase):
 
 
 class TestSchedulerIntegrationBoundary(unittest.TestCase):
-    def test_annotation_occurs_before_legacy_tracker_update(self):
+    def test_annotation_occurs_before_angular_processing_and_tracker_update(self):
         source = (
             Path(__file__).resolve().parent / "VanguardxMain_scheduler.py"
         ).read_text(encoding="utf-8")
@@ -237,10 +237,15 @@ class TestSchedulerIntegrationBoundary(unittest.TestCase):
         annotation_index = source.index(
             "AnnotateDetectionsWithEarthReference("
         )
-        tracker_index = source.index(
-            "Tracker.Update(Detections, Processed, ThisDwell)"
+        angular_index = source.index("AngularProcessor.Update(")
+        tracker_index = source.index("Tracker.Update(")
+        self.assertLess(annotation_index, angular_index)
+        self.assertLess(angular_index, tracker_index)
+        self.assertIn(
+            "AnnotateDetectionsWithEarthReference(\n"
+            "            AngularPlots,",
+            source,
         )
-        self.assertLess(annotation_index, tracker_index)
         self.assertIn(
             '"EarthReferenceAuthoritative"] = False',
             source,

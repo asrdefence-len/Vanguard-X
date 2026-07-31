@@ -56,6 +56,12 @@ CONTROL_KEYS = {
     "MissionCommandRevision",
     "MissionCommand",
     "MissionProfile",
+    "TrackConfirmCommandId",
+    "TrackConfirmTrackId",
+    "TrackConfirmRangeM",
+    "TrackConfirmAzimuthDeg",
+    "TrackConfirmSource",
+    "TrackConfirmWasTentative",
 }
 
 
@@ -125,6 +131,12 @@ def _InitialControlState(config: Dict[str, Any]) -> Dict[str, Any]:
         "MissionCommandRevision": 0,
         "MissionCommand": "",
         "MissionProfile": None,
+        "TrackConfirmCommandId": 0,
+        "TrackConfirmTrackId": 0,
+        "TrackConfirmRangeM": 0.0,
+        "TrackConfirmAzimuthDeg": 0.0,
+        "TrackConfirmSource": "LEGACY",
+        "TrackConfirmWasTentative": False,
     }
 
 
@@ -216,7 +228,11 @@ def BuildDisplaySnapshot(config, processed, detections, tracks, plots):
         "VelocityEastMps", "VelocityNorthMps",
     )
     plot_fields = (
-        "RangeM", "AzimuthDeg", "AmplitudeDb", "DopplerHz",
+        "PlotId", "RangeM", "AzimuthDeg", "AmplitudeDb", "SnrDb",
+        "DopplerHz", "VelocityMps", "RangeMinimumM", "RangeMaximumM",
+        "RangeExtentM", "AngularResponseSpanDeg", "BearingUncertaintyDeg",
+        "PatternFitQuality", "PatternModel", "NumCells",
+        "NumAngularSamples", "NumCfarHitDwells",
         "TrackSource", "EarthEastM", "EarthNorthM",
     )
     return {
@@ -327,6 +343,15 @@ class RadarRemoteDisplay:
 
     def SetMissionRuntimeStatus(self, Status):
         self._QueueEvent("mission_status", dict(Status or {}))
+
+    def SetTrackConfirmationResult(self, Applied, Message):
+        self._QueueEvent(
+            "track_confirmation_result",
+            {
+                "applied": bool(Applied),
+                "message": str(Message),
+            },
+        )
 
     def Shutdown(self):
         self._stop_event.set()

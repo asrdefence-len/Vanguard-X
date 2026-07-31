@@ -475,7 +475,13 @@ class MissionPage(QtWidgets.QWidget):
         self.TrackTimeout = self._DoubleSpin(0.1, 600.0, 1.0, " s")
         self.TrackMiss = QtWidgets.QComboBox()
         self.TrackMiss.addItems([
-            "RETRY_WIDER_THEN_DEFER", "RETRY", "WIDEN", "DEFER",
+            "RETRY_WIDER_THEN_DELETE",
+            "RETRY_WIDER_THEN_DEFER",
+            "DELETE",
+            "COAST",
+            "RETRY",
+            "WIDEN",
+            "DEFER",
         ])
 
         layout.addWidget(self.TrackEnabled, 0, 0, 1, 4)
@@ -998,32 +1004,48 @@ class MissionPage(QtWidgets.QWidget):
         self._DraftChanged()
 
     def _SaveMission(self):
+        options = QtWidgets.QFileDialog.Options()
+        options |= QtWidgets.QFileDialog.DontUseNativeDialog
+
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save Vanguard X mission",
             f"{self.DraftProfile.Name.replace(' ', '_')}.vxmission.json",
             "Vanguard X mission (*.vxmission.json);;JSON (*.json)",
+            options=options,
         )
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as stream:
-            json.dump(
-                MissionProfileToDict(self.DraftProfile),
-                stream,
-                indent=2,
-                sort_keys=True,
-                allow_nan=False,
+        try:
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(
+                    MissionProfileToDict(self.DraftProfile),
+                    stream,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                stream.write("\n")
+        except OSError as error:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Mission save failed",
+                str(error),
             )
-            stream.write("\n")
+            return
         self.StateLabel.setText(f"Saved draft: {os.path.basename(path)}")
         self.StateLabel.setStyleSheet("font-weight: bold; color: #bfbfbf;")
 
     def _OpenMission(self):
+        options = QtWidgets.QFileDialog.Options()
+        options |= QtWidgets.QFileDialog.DontUseNativeDialog
+
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load Vanguard X mission draft",
             "",
             "Vanguard X mission (*.vxmission.json *.json);;All files (*)",
+            options=options,
         )
         if not path:
             return

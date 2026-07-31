@@ -70,11 +70,14 @@ from RadarTasks import (
 )
 from RadarTimingControls import ApplyTimingControlState
 from MissionExecutionController import MissionExecutionController
+from MissionProfile import TrackUpdatePolicy
+from TrackConfirmation import TrackConfirmationController
 
 from SimulatedSource import SimulatedSource
 from WaveformLibrary import WaveformLibrary
 from RadarProcessor import RadarProcessor
 from CfarDetector import CfarDetector
+from AngularDetectionProcessor import AngularDetectionProcessor
 from RadarTracker import RadarTracker
 from SimpleDisplay import SimpleDisplay
 from RadarRemoteDisplay import RadarRemoteDisplay
@@ -514,6 +517,8 @@ def ExecuteRadarDwell(
     X660AtTarget,
     X660RawAngleDeg,
     EarthTracker=None,
+    AngularProcessor=None,
+    TrackConfirmationControllerInstance=None,
 ):
     """Execute one scheduled dwell and preserve the processing chain.
 
@@ -601,6 +606,21 @@ def ExecuteRadarDwell(
     Processed.Diagnostics["ScheduledWaveformProfileId"] = str(
         getattr(ScheduledTask, "WaveformProfileId", "")
     )
+    Processed.Diagnostics["PointingPhase"] = str(
+        ExecutionResult.Pointing.PointingPhase
+    )
+    Processed.Diagnostics["TrackUpdateComplete"] = bool(
+        ExecutionResult.Pointing.TrackUpdateComplete
+    )
+    Processed.Diagnostics["TrackUpdateCoverageValid"] = bool(
+        ExecutionResult.Pointing.TrackUpdateCoverageValid
+    )
+    Processed.Diagnostics["TrackUpdatePass"] = int(
+        ExecutionResult.Pointing.TrackUpdatePass
+    )
+    Processed.Diagnostics["TrackUpdatePasses"] = int(
+        ExecutionResult.Pointing.TrackUpdatePasses
+    )
     if "SearchSectorFrame" in ThisDwell.Metadata:
         Processed.Diagnostics["SearchSectorFrame"] = str(
             ThisDwell.Metadata["SearchSectorFrame"]
@@ -616,6 +636,94 @@ def ExecuteRadarDwell(
     EarthReferencedMeasurements = AnnotateDetectionsWithEarthReference(
         Detections,
         NavigationAttitude,
+    )
+
+    # CFAR remains immediate and independent on every range-Doppler dwell.
+    # The angular processor consumes only the compact CFAR outputs, associates
+    # them through one true-bearing beam crossing, and emits one fitted plot.
+    # Raw CFAR cells remain available for logging and range-profile diagnostics.
+    if (
+        AngularProcessor is not None
+        and Config.get("AngularDetectionProcessingEnabled", True)
+    ):
+        AngularPlots = AngularProcessor.Update(
+            Detections,
+            Processed,
+            ThisDwell,
+        )
+        IsDirectedTrackUpdate = bool(
+            ScheduledTask.TaskType == RadarTaskType.TRACK
+            and getattr(
+                ScheduledTask,
+                "Metadata",
+                {},
+            ).get("TrackNoddyEnabled", False)
+        )
+        DirectedTrackComplete = bool(
+            IsDirectedTrackUpdate
+            and ExecutionResult.Pointing.TrackUpdateComplete
+        )
+        if DirectedTrackComplete:
+            AngularPlots.extend(
+                AngularProcessor.FinalizeCurrentContext()
+            )
+        DirectedEvidencePlots = list(AngularPlots)
+        if (
+            IsDirectedTrackUpdate
+            and TrackConfirmationControllerInstance is not None
+        ):
+            if DirectedTrackComplete:
+                DirectedEvidencePlots = (
+                    TrackConfirmationControllerInstance.FinalizeTaskPlots(
+                        ScheduledTask.TaskId,
+                        AngularPlots,
+                    )
+                )
+            else:
+                TrackConfirmationControllerInstance.AccumulateTaskPlots(
+                    ScheduledTask.TaskId,
+                    AngularPlots,
+                )
+        AngularPlotMeasurements = AnnotateDetectionsWithEarthReference(
+            AngularPlots,
+            NavigationAttitude,
+        )
+        TrackerMeasurements = AngularPlots
+        if IsDirectedTrackUpdate:
+            TrackerMeasurements = []
+        AngularDisplayPlots = AngularProcessor.GetDisplayPlots()
+        AngularDebug = AngularProcessor.GetDebugInfo()
+    else:
+        AngularPlots = []
+        AngularPlotMeasurements = []
+        TrackerMeasurements = Detections
+        AngularDisplayPlots = []
+        AngularDebug = {}
+        IsDirectedTrackUpdate = False
+        DirectedTrackComplete = False
+        DirectedEvidencePlots = []
+
+    Processed.Diagnostics["AngularDetectionProcessingEnabled"] = bool(
+        AngularProcessor is not None
+        and Config.get("AngularDetectionProcessingEnabled", True)
+    )
+    Processed.Diagnostics["AngularDwellComponents"] = int(
+        AngularDebug.get("DwellComponentsThisDwell", 0)
+    )
+    Processed.Diagnostics["AngularActiveCrossings"] = int(
+        AngularDebug.get("ActiveCrossings", 0)
+    )
+    Processed.Diagnostics["AngularCompletedPlotsThisDwell"] = int(
+        AngularDebug.get("CompletedPlotsThisDwell", 0)
+    )
+    Processed.Diagnostics["AngularDisplayedPlots"] = int(
+        AngularDebug.get("DisplayedAngularPlots", 0)
+    )
+    Processed.Diagnostics["AngularPatternModel"] = str(
+        AngularDebug.get("PatternModel", "")
+    )
+    Processed.Diagnostics["TrackUpdateEvidencePlots"] = len(
+        DirectedEvidencePlots
     )
 
     # Stage 5 validation boundary: detections now carry a parallel mission-ENU
@@ -684,8 +792,32 @@ def ExecuteRadarDwell(
         None,
     )
 
+    TrackUpdateOutcome = None
     if Config.get("TrackerEnabled", True):
-        Tracks, Plots = Tracker.Update(Detections, Processed, ThisDwell)
+        if IsDirectedTrackUpdate:
+            if DirectedTrackComplete:
+                TrackUpdateOutcome = Tracker.ApplyDirectedUpdate(
+                    ScheduledTask.TrackId,
+                    DirectedEvidencePlots,
+                    coverage_valid=bool(
+                        ExecutionResult.Pointing
+                        .TrackUpdateCoverageValid
+                    ),
+                    miss_policy=str(
+                        ScheduledTask.Metadata.get(
+                            "TrackMissPolicy",
+                            "RETRY_WIDER_THEN_DELETE",
+                        )
+                    ),
+                )
+            Tracks = Tracker.GetTracks()
+            Plots = []
+        else:
+            Tracks, Plots = Tracker.Update(
+                TrackerMeasurements,
+                Processed,
+                ThisDwell,
+            )
         TrackerDebug = Tracker.GetDebugInfo() if hasattr(Tracker, "GetDebugInfo") else {}
     else:
         Tracks, Plots = [], []
@@ -697,16 +829,61 @@ def ExecuteRadarDwell(
     EarthTracks = []
     EarthPlots = []
     EarthTrackerDebug = {}
+    EarthTrackUpdateOutcome = None
     TrackerComparison = None
     if (
         Config.get("EarthTrackerEnabled", True)
         and EarthTracker is not None
     ):
-        EarthTracks, EarthPlots = EarthTracker.Update(
-            Detections,
-            Processed,
-            ThisDwell,
-        )
+        if IsDirectedTrackUpdate:
+            if (
+                DirectedTrackComplete
+                and TrackUpdateOutcome is not None
+                and str(
+                    ScheduledTask.Metadata.get(
+                        "TrackSelectedSource",
+                        "LEGACY",
+                    )
+                ).upper() == "EARTH"
+            ):
+                EarthTrackUpdateOutcome = (
+                    EarthTracker.ApplyDirectedResult(
+                        int(ScheduledTask.Metadata.get(
+                            "TrackSelectedTrackId",
+                            0,
+                        )),
+                        DirectedEvidencePlots,
+                        coverage_valid=bool(
+                            TrackUpdateOutcome.get(
+                                "CoverageValid",
+                                False,
+                            )
+                        ),
+                        authoritative_hit=bool(
+                            TrackUpdateOutcome.get("Hit", False)
+                        ),
+                        authoritative_promoted=bool(
+                            TrackUpdateOutcome.get(
+                                "Promoted",
+                                False,
+                            )
+                        ),
+                        authoritative_deleted=bool(
+                            TrackUpdateOutcome.get(
+                                "Deleted",
+                                False,
+                            )
+                        ),
+                    )
+                )
+            EarthTracks = EarthTracker.GetTracks()
+            EarthPlots = []
+        else:
+            EarthTracks, EarthPlots = EarthTracker.Update(
+                TrackerMeasurements,
+                Processed,
+                ThisDwell,
+            )
         EarthTrackerDebug = EarthTracker.GetDebugInfo()
         EarthConfirmedTracks = EarthTracker.GetConfirmedTracks()
         LegacyConfirmedTracks = (
@@ -774,7 +951,11 @@ def ExecuteRadarDwell(
         NavigationAttitude,
     )
     DisplayTracks = DisplayTrackSelection.Tracks
-    DisplayPlots = DisplayTrackSelection.Plots
+    DisplayPlots = (
+        AngularDisplayPlots
+        if Processed.Diagnostics["AngularDetectionProcessingEnabled"]
+        else DisplayTrackSelection.Plots
+    )
     Processed.Diagnostics["DisplayTrackSourceRequested"] = (
         DisplayTrackSelection.RequestedSource
     )
@@ -788,11 +969,26 @@ def ExecuteRadarDwell(
         DisplayTrackSelection.Reason
     )
     Processed.Diagnostics["DisplayTrackCount"] = len(DisplayTracks)
+    Processed.Diagnostics["DisplayPlotSource"] = (
+        "ANGULAR_PATTERN"
+        if Processed.Diagnostics["AngularDetectionProcessingEnabled"]
+        else "TRACKER"
+    )
+    Processed.Diagnostics["DisplayPlotCount"] = len(DisplayPlots)
     Processed.Diagnostics["EarthTrackerSelectedForDisplay"] = (
         DisplayTrackSelection.AppliedSource == "EARTH"
     )
     Processed.Diagnostics["TaskingTrackSource"] = "LEGACY"
     Processed.Diagnostics["TrackUpdateSource"] = "LEGACY"
+    Processed.Diagnostics["EarthDirectedTrackUpdateApplied"] = bool(
+        EarthTrackUpdateOutcome is not None
+        and EarthTrackUpdateOutcome.get("Applied", False)
+    )
+    Processed.Diagnostics["EarthDirectedTrackUpdateOutcome"] = (
+        str(EarthTrackUpdateOutcome.get("Outcome", ""))
+        if EarthTrackUpdateOutcome is not None
+        else ""
+    )
 
     T3 = time.perf_counter()
     Logger.log_dwell(Processed, Detections)
@@ -815,9 +1011,13 @@ def ExecuteRadarDwell(
         "Processed": Processed,
         "Detections": Detections,
         "EarthReferencedMeasurements": EarthReferencedMeasurements,
+        "AngularPlots": AngularPlots,
+        "AngularPlotMeasurements": AngularPlotMeasurements,
+        "AngularDebug": AngularDebug,
         "EarthTracks": EarthTracks,
         "EarthPlots": EarthPlots,
         "EarthTrackerDebug": EarthTrackerDebug,
+        "EarthTrackUpdateOutcome": EarthTrackUpdateOutcome,
         "ParallelTrackerComparison": TrackerComparison,
         "DisplayTrackSelection": DisplayTrackSelection,
         "DisplayTracks": DisplayTracks,
@@ -825,6 +1025,9 @@ def ExecuteRadarDwell(
         "Tracks": Tracks,
         "Plots": Plots,
         "TrackerDebug": TrackerDebug,
+        "TrackUpdateOutcome": TrackUpdateOutcome,
+        "DirectedTrackUpdate": bool(IsDirectedTrackUpdate),
+        "DirectedTrackComplete": bool(DirectedTrackComplete),
         "T0": T0,
         "T1": T1,
         "T2": T2,
@@ -954,6 +1157,10 @@ def Main(CommandLineArguments=None):
         "ScanStartDeg": 120.0,
         "ScanStopDeg": 10.0,
         "ScanStepDeg": 1,
+        # Main-dashboard sector limits are geographic true bearings:
+        # 000=N, 090=E, 180=S, 270=W.  PointingManager continuously converts
+        # them to vessel-relative X6-60 commands using live ship heading.
+        "X660ScanFrame": "TRUE",
         "BoresightDeg": 0.0,
         "BeamwidthDeg": 5.0,
         "SidelobeFloorDb": -50.0,
@@ -974,6 +1181,33 @@ def Main(CommandLineArguments=None):
         "MinRangeM": 2000.0,
         "MaxRangeM": 15000.0,
 
+        # Scan-based angular detection consolidation. Range-Doppler CFAR still
+        # runs on every dwell. These settings associate CFAR components through
+        # one true-bearing antenna crossing and fit the simulator's exact
+        # two-way sinc^4 echo pattern. The first implementation estimates a
+        # centroid only; RangeExtentM is diagnostic, not a width classification.
+        "AngularDetectionProcessingEnabled": True,
+        "AngularPerDwellClusterRangeGapM": 100.0,
+        "AngularPerDwellClusterDopplerGapHz": 120.0,
+        "AngularAssociationRangeGateM": 250.0,
+        "AngularAssociationDopplerGateHz": 180.0,
+        "AngularMaximumSampleGapDeg": 4.0,
+        "AngularCloseAfterMissedDwells": 2,
+        # Do not split a target merely because CFAR misses two closely spaced
+        # dwells. Close only after the beam has moved one first-null beamwidth
+        # beyond the last CFAR hit. The dwell limit is a fail-safe for a stopped
+        # or staring antenna, where angular displacement may remain zero.
+        "AngularCloseAfterMissedAngleDeg": 5.0,
+        "AngularMaximumMissedDwells": 12,
+        "AngularMinimumFitSamples": 3,
+        "AngularHypothesisStepDeg": 0.1,
+        # 32 fast-time bins each side is about 120 m at 40 MS/s, enough to
+        # integrate the present 200 m extended-vessel response consistently.
+        "AngularPowerRangeHalfWidthBins": 32,
+        "AngularPowerDopplerHalfWidthBins": 1,
+        "AngularPlotPersistenceSec": 30.0,
+        "AngularMaximumDisplayPlots": 200,
+
         # Tracker / plot extraction parameters
         "TrackerEnabled": True,
         # Parallel Earth-referenced tracker. Stage 8 permits display-only
@@ -985,7 +1219,7 @@ def Main(CommandLineArguments=None):
         "EarthAssociationGateM": 300.0,
         "EarthInitiationWindow": 3,
         "EarthInitiationRequiredHits": 2,
-        "EarthDeleteConfirmedAfterMisses": 5,
+        "EarthDeleteConfirmedAfterMisses": 12,
         "EarthTrackAlpha": 0.65,
         "EarthTrackBeta": 0.20,
         "ReturnBlobsForDebug": True,
@@ -1007,7 +1241,20 @@ def Main(CommandLineArguments=None):
         "TrackConfirmHits": 2,
         "TrackConfirmWindow": 3,
         "DeleteAfterMissesTentative": 2,
-        "DeleteAfterMissesConfirmed": 5,
+        # RadarTracker reads this exact key. Established tracks coast through
+        # short Mission interruptions without changing the 2-of-3 tentative
+        # initiation rule.
+        "DeleteConfirmedAfterMisses": 12,
+        # Merge a close stale/tentative companion into the stronger track, but
+        # preserve two confirmed tracks independently updated in the same pass.
+        "DuplicateTrackSuppressionEnabled": True,
+        "DuplicateTrackRangeGateM": 200.0,
+        "DuplicateTrackAzimuthGateDeg": 5.0,
+        # A completed nod is stronger negative evidence than a search miss.
+        # The default policy retries once wider, then deletes on the second
+        # fully covered miss.
+        "TrackConfirmationGateHalfWidthDeg": 5.0,
+        "DirectedTrackDeleteAfterMisses": 2,
 
         # Debug controls
         "PrintSceneTruthTable": False,
@@ -1049,7 +1296,10 @@ def Main(CommandLineArguments=None):
         "ShowRangeProfile": True,
         "ShowRangeDopplerMap": False,
         "ShowPolarDetections": True,
-        "ShowRawDetections": True,
+        # Raw CFAR cells remain available in logs and range-profile diagnostics.
+        # The normal PPI shows antenna-pattern consolidated plots so a high-SNR
+        # target does not paint one point at every beam-bearing dwell.
+        "ShowRawDetections": False,
         "ShowTrackerPlots": True,
         "ShowRangeDetectionMarkers": True,
         "ShowTracks": True,
@@ -1109,6 +1359,9 @@ def Main(CommandLineArguments=None):
         "X660PositionToleranceDeg": 0.75,
         "X660ScanEndpointMarginDeg": 1.0,
         "X660ScanSlewRateDegPerSec": 20.0,
+        # Reposition to a new Mission sector start rapidly, then change to the
+        # task's surveillance scan rate only after that start is reached.
+        "X660MissionTransitionSlewRateDegPerSec": 40.0,
         # Reverse the speed command before the sector boundary so the X6-60
         # planner decelerates through zero at the requested physical endpoint.
         # The 60 deg/s^2 value is the verified output-shaft equivalent of the
@@ -1299,8 +1552,12 @@ def Main(CommandLineArguments=None):
 
     TheWaveformLibrary = WaveformLibrary(Config)
     TheWaveformLibrary.LoadDefaultWaveforms()
+    # Expose logical complementary families to the operator.  The individual
+    # Golay A/B members remain available internally for pulse planning and
+    # matched filtering, but selecting either member alone is not operational
+    # Golay processing.
     Config["AvailableWaveformIds"] = (
-        TheWaveformLibrary.ListWaveforms()
+        TheWaveformLibrary.ListOperationalWaveforms()
     )
 
     # -------------------------------------------------------------------------
@@ -1340,6 +1597,7 @@ def Main(CommandLineArguments=None):
     Processor = RadarProcessor(Config, TheWaveformLibrary)
 
     Detector = CfarDetector(Config)
+    AngularProcessor = AngularDetectionProcessor(Config)
     Tracker = RadarTracker(Config)
     EarthTracker = EarthReferencedTracker(Config)
     Display = SelectDisplay(Config)
@@ -1427,6 +1685,7 @@ def Main(CommandLineArguments=None):
     # can otherwise be consumed by the dwell-rate gate (especially after a
     # manual nudge leaves PointingManager in STARE mode).
     ScanStartPending = False
+    SlewToSectorStartPending = False
     LastRadarDwellTimeSec = 0.0
     LastPrintedBoresightDeg = None
 
@@ -1467,6 +1726,12 @@ def Main(CommandLineArguments=None):
         scan_command_latency_sec=float(
             Config.get("X660ScanCommandLatencySec", 0.05)
         ),
+        transition_slew_rate_deg_per_sec=float(
+            Config.get(
+                "X660MissionTransitionSlewRateDegPerSec",
+                40.0,
+            )
+        ),
     )
     PointingControl = X660PointingControlLoop(
         interval_sec=float(
@@ -1475,6 +1740,7 @@ def Main(CommandLineArguments=None):
         debug=bool(Config.get("X660PointingControlDebug", False)),
     )
     LastPointingControlError = None
+    LastTrackPointingPhase = None
 
     SearchTask = MakeSearchTask(
         TaskId=1,
@@ -1483,7 +1749,9 @@ def Main(CommandLineArguments=None):
         ScanRateDegPerSec=float(
             Config.get("X660ScanSlewRateDegPerSec", 14.0)
         ),
-        SectorFrame=AngleFrame.PLATFORM,
+        SectorFrame=AngleFrame(
+            str(Config.get("X660ScanFrame", "TRUE")).upper()
+        ),
         Pattern=SearchPattern(
             str(Config.get("X660ScanPattern", "SECTOR")).upper()
         ),
@@ -1493,8 +1761,14 @@ def Main(CommandLineArguments=None):
     # controller owns the immutable loaded snapshot and emits task intent; it
     # has no source, UHD, Qt, or motion dependency.
     MissionExecution = MissionExecutionController(Config)
+    TrackConfirmation = TrackConfirmationController(
+        minimum_operator_gate_half_width_deg=float(
+            Config.get("TrackConfirmationGateHalfWidthDeg", 5.0)
+        )
+    )
     LastMissionStatusRevision = -1
     LastMissionTaskActivationRevision = 0
+    LatestLegacyTracks = []
 
     Scheduler = RadarScheduler(
         search_task=SearchTask,
@@ -1615,10 +1889,19 @@ def Main(CommandLineArguments=None):
                 # completed and before any new timed work can be armed.
                 # -------------------------------------------------------------
 
+                TrackResourceBusy = bool(
+                    Scheduler.HasReadyOrActiveTrackTask(
+                        current_time_sec=time.time(),
+                    )
+                    or TrackConfirmation.HasPendingOperatorRequest(
+                        ControlState
+                    )
+                )
                 MissionResult = MissionExecution.ApplyControlState(
                     ControlState,
                     system_mode=SystemMode,
                     now_sec=time.monotonic(),
+                    resource_available=not TrackResourceBusy,
                 )
                 ControlState = MissionExecution.BuildEffectiveControlState(
                     ControlState
@@ -1639,8 +1922,45 @@ def Main(CommandLineArguments=None):
                         f"{MissionStatus['Message']}"
                     )
 
+                TrackPolicy = (
+                    MissionExecution.LoadedProfile.TrackUpdate
+                    if MissionExecution.LoadedProfile is not None
+                    else TrackUpdatePolicy()
+                )
+                TrackConfirmationRequest = (
+                    TrackConfirmation.ConsumeOperatorRequest(
+                        ControlState,
+                        LatestLegacyTracks,
+                        Scheduler,
+                        TrackPolicy,
+                        now_sec=time.time(),
+                    )
+                )
+                if TrackConfirmationRequest.get("Changed", False):
+                    TrackConfirmationMessage = str(
+                        TrackConfirmationRequest.get("Message", "")
+                    )
+                    if hasattr(Display, "SetTrackConfirmationResult"):
+                        Display.SetTrackConfirmationResult(
+                            TrackConfirmationRequest.get(
+                                "Applied",
+                                False,
+                            ),
+                            TrackConfirmationMessage,
+                        )
+                    print(
+                        "Track confirmation: "
+                        f"{TrackConfirmationMessage}"
+                    )
+                TrackResourceBusy = (
+                    Scheduler.HasReadyOrActiveTrackTask(
+                        current_time_sec=time.time(),
+                    )
+                )
+
                 if (
                     MissionExecution.IsRunning
+                    and not TrackResourceBusy
                     and MissionExecution.TaskActivationRevision
                     != LastMissionTaskActivationRevision
                 ):
@@ -1655,6 +1975,17 @@ def Main(CommandLineArguments=None):
                     except Exception:
                         pass
                     ScanStartPending = True
+                    ActiveMissionTask = MissionExecution.ActiveTask
+                    SlewToSectorStartPending = bool(
+                        ActiveMissionTask is not None
+                        and str(
+                            getattr(
+                                ActiveMissionTask,
+                                "TaskType",
+                                "",
+                            )
+                        ).upper() == "SECTOR_SCAN"
+                    )
 
                 TimingApplication = ApplyTimingControlState(
                     Config=Config,
@@ -1841,6 +2172,42 @@ def Main(CommandLineArguments=None):
                             CurrentScanBoresightDeg = float(
                                 FastPointingState.BeamBearingTrueDeg
                             ) % 360.0
+                            ActiveTrackId = getattr(
+                                FastPointingState,
+                                "ActiveTrackId",
+                                None,
+                            )
+                            TrackPointingPhase = str(
+                                getattr(
+                                    FastPointingState,
+                                    "PointingPhase",
+                                    "",
+                                )
+                            )
+                            if ActiveTrackId is not None:
+                                TrackPhaseKey = (
+                                    int(ActiveTrackId),
+                                    TrackPointingPhase,
+                                    int(getattr(
+                                        FastPointingState,
+                                        "TrackUpdatePass",
+                                        0,
+                                    )),
+                                )
+                                if TrackPhaseKey != LastTrackPointingPhase:
+                                    print(
+                                        "Track confirmation pointing: "
+                                        f"T{int(ActiveTrackId)} "
+                                        f"{TrackPointingPhase} "
+                                        f"pass "
+                                        f"{int(getattr(FastPointingState, 'TrackUpdatePass', 0))}/"
+                                        f"{int(getattr(FastPointingState, 'TrackUpdatePasses', 0))} "
+                                        f"beam="
+                                        f"{float(FastPointingState.BeamBearingTrueDeg):.2f} deg T"
+                                    )
+                                    LastTrackPointingPhase = TrackPhaseKey
+                            else:
+                                LastTrackPointingPhase = None
                             LastPointingControlError = None
                     except Exception as exc:
                         PointingControlError = str(exc)
@@ -2051,10 +2418,10 @@ def Main(CommandLineArguments=None):
                 RequestedScanFrame = str(
                     ControlState.get(
                         "MissionScanFrame",
-                        Config.get("X660ScanFrame", "PLATFORM"),
+                        Config.get("X660ScanFrame", "TRUE"),
                     )
                     if ControlState is not None
-                    else Config.get("X660ScanFrame", "PLATFORM")
+                    else Config.get("X660ScanFrame", "TRUE")
                 ).upper()
                 SearchTask.Sector.Frame = AngleFrame(RequestedScanFrame)
                 RequestedScanPattern = str(
@@ -2072,7 +2439,12 @@ def Main(CommandLineArguments=None):
                 # Pointing.Stop() clears the active task. Reissue the search
                 # command on every transition into active SCAN, including from
                 # STOP or STARE when ScanEnabled remained true.
-                if ScanStartPending:
+                if (
+                    ScanStartPending
+                    and not Scheduler.HasReadyOrActiveTrackTask(
+                        current_time_sec=NowDwellSec,
+                    )
+                ):
                     # A task change starts a fresh measured-crossing history.
                     # This prevents the final sector sample from being treated
                     # as a North crossing in a new continuous task.
@@ -2109,8 +2481,18 @@ def Main(CommandLineArguments=None):
                             f"{SearchTask.Sector.Pattern.value} at "
                             f"{SearchTask.Sector.ScanRateDegPerSec:.2f} deg/s"
                         )
+                    SearchTask.Pointing.Metadata[
+                        "SlewToSectorStart"
+                    ] = bool(SlewToSectorStartPending)
+                    SearchTask.Pointing.Metadata[
+                        "TransitionSlewRateDegPerSec"
+                    ] = float(Config.get(
+                        "X660MissionTransitionSlewRateDegPerSec",
+                        40.0,
+                    ))
                     Pointing.ActivateTask(SearchTask, NavigationAttitude)
                     ScanStartPending = False
+                    SlewToSectorStartPending = False
 
                 ScheduledTask = Scheduler.GetNextTask(
                     current_time_sec=NowDwellSec,
@@ -2120,6 +2502,29 @@ def Main(CommandLineArguments=None):
                     if hasattr(Display, "App"):
                         Display.App.processEvents()
                     time.sleep(0.002)
+                    continue
+                if (
+                    ScheduledTask.TaskType == RadarTaskType.TRACK
+                    and ScheduledTask.IsOverdue(NowDwellSec)
+                ):
+                    Scheduler.FailActiveTask(
+                        "Track confirmation exceeded its maximum duration"
+                    )
+                    Executor.ReleaseTask(ScheduledTask)
+                    TrackConfirmation.DiscardTaskPlots(
+                        ScheduledTask.TaskId
+                    )
+                    Pointing.ResumeSearch(NavigationAttitude)
+                    TimeoutMessage = (
+                        f"T{ScheduledTask.TrackId} confirmation timed out; "
+                        "coverage was incomplete, so the track is coasting"
+                    )
+                    if hasattr(Display, "SetTrackConfirmationResult"):
+                        Display.SetTrackConfirmationResult(
+                            False,
+                            TimeoutMessage,
+                        )
+                    print(f"Track confirmation: {TimeoutMessage}")
                     continue
 
                 # -------------------------------------------------------------
@@ -2151,6 +2556,8 @@ def Main(CommandLineArguments=None):
                     X660AtTarget=X660AtTarget,
                     X660RawAngleDeg=X660RawAngleDeg,
                     EarthTracker=EarthTracker,
+                    AngularProcessor=AngularProcessor,
+                    TrackConfirmationControllerInstance=TrackConfirmation,
                 )
 
                 if not DwellResult["Executed"]:
@@ -2166,6 +2573,19 @@ def Main(CommandLineArguments=None):
                 Tracks = DwellResult["Tracks"]
                 Plots = DwellResult["Plots"]
                 TrackerDebug = DwellResult["TrackerDebug"]
+                AngularDebug = DwellResult["AngularDebug"]
+                TrackUpdateOutcome = DwellResult.get(
+                    "TrackUpdateOutcome"
+                )
+                EarthTrackUpdateOutcome = DwellResult.get(
+                    "EarthTrackUpdateOutcome"
+                )
+                DirectedTrackUpdate = bool(
+                    DwellResult.get("DirectedTrackUpdate", False)
+                )
+                DirectedTrackComplete = bool(
+                    DwellResult.get("DirectedTrackComplete", False)
+                )
                 T0 = DwellResult["T0"]
                 T1 = DwellResult["T1"]
                 T2 = DwellResult["T2"]
@@ -2173,18 +2593,136 @@ def Main(CommandLineArguments=None):
                 T4 = DwellResult["T4"]
                 T5 = DwellResult["T5"]
 
-                # One scheduler task currently corresponds to one completed
-                # legacy dwell. SEARCH is persistent, so completing it simply
-                # returns it to the queued state for the next dwell.
-                Scheduler.CompleteActiveTask(
-                    current_time_sec=time.time(),
+                LatestLegacyTracks = list(Tracks)
+
+                if TrackUpdateOutcome is not None:
+                    TrackPolicy = (
+                        MissionExecution.LoadedProfile.TrackUpdate
+                        if MissionExecution.LoadedProfile is not None
+                        else TrackUpdatePolicy()
+                    )
+                    RetryResult = (
+                        TrackConfirmation.QueueRetryIfRequired(
+                            TrackUpdateOutcome,
+                            LatestLegacyTracks,
+                            Scheduler,
+                            TrackPolicy,
+                            now_sec=time.time(),
+                        )
+                    )
+                    OutcomeMessage = str(
+                        TrackUpdateOutcome.get("Outcome", "UNKNOWN")
+                    )
+                    if RetryResult is not None:
+                        OutcomeMessage = str(RetryResult["Message"])
+                    elif TrackUpdateOutcome.get("Promoted", False):
+                        OutcomeMessage = (
+                            f"T{TrackUpdateOutcome['TrackId']} initiation "
+                            "confirmed "
+                            f"({TrackUpdateOutcome['Hits']} hits in "
+                            f"{TrackUpdateOutcome['Attempts']} opportunities)"
+                        )
+                    elif (
+                        TrackUpdateOutcome.get(
+                            "TrackWasTentative",
+                            False,
+                        )
+                        and TrackUpdateOutcome.get("Deleted", False)
+                    ):
+                        OutcomeMessage = (
+                            f"T{TrackUpdateOutcome['TrackId']} initiating "
+                            "track deleted "
+                            f"({TrackUpdateOutcome['Hits']} hits in "
+                            f"{TrackUpdateOutcome['Attempts']} opportunities)"
+                        )
+                    elif TrackUpdateOutcome.get(
+                        "TrackWasTentative",
+                        False,
+                    ):
+                        OutcomeMessage = (
+                            f"T{TrackUpdateOutcome['TrackId']} initiation "
+                            f"{'reacquired' if TrackUpdateOutcome.get('Hit', False) else 'missed'} "
+                            f"({TrackUpdateOutcome['Hits']} hits, "
+                            f"{TrackUpdateOutcome['Attempts']}/"
+                            f"{TrackUpdateOutcome['InitiationWindow']} "
+                            "opportunities)"
+                        )
+                    elif TrackUpdateOutcome.get("Hit", False):
+                        OutcomeMessage = (
+                            f"T{TrackUpdateOutcome['TrackId']} confirmed "
+                            f"at {TrackUpdateOutcome['AzimuthDeg']:.2f} deg T"
+                        )
+                    elif TrackUpdateOutcome.get("Deleted", False):
+                        OutcomeMessage = (
+                            f"T{TrackUpdateOutcome['TrackId']} deleted "
+                            "after two complete nod misses"
+                        )
+                    else:
+                        OutcomeMessage = (
+                            f"T{TrackUpdateOutcome['TrackId']} missed; "
+                            "track coasting"
+                        )
+                    if (
+                        EarthTrackUpdateOutcome is not None
+                        and not EarthTrackUpdateOutcome.get(
+                            "Applied",
+                            False,
+                        )
+                    ):
+                        OutcomeMessage += (
+                            "; selected Earth display track was no longer "
+                            "available"
+                        )
+                    elif (
+                        TrackUpdateOutcome.get("Promoted", False)
+                        and EarthTrackUpdateOutcome is not None
+                        and not EarthTrackUpdateOutcome.get(
+                            "Promoted",
+                            False,
+                        )
+                    ):
+                        OutcomeMessage += (
+                            "; Earth display track did not mirror promotion"
+                        )
+                    if hasattr(Display, "SetTrackConfirmationResult"):
+                        Display.SetTrackConfirmationResult(
+                            bool(
+                                TrackUpdateOutcome.get("Hit", False)
+                                or TrackUpdateOutcome.get(
+                                    "Promoted",
+                                    False,
+                                )
+                            ),
+                            OutcomeMessage,
+                        )
+                    print(f"Track confirmation: {OutcomeMessage}")
+
+                # SEARCH remains one dwell per scheduler ownership interval.
+                # A directed TRACK task remains active across its rapid goto
+                # and all three nod passes, then releases search only after the
+                # finite angular fit has been closed and applied.
+                CompleteScheduledTask = bool(
+                    ScheduledTask.TaskType == RadarTaskType.SEARCH
+                    or not DirectedTrackUpdate
+                    or DirectedTrackComplete
                 )
+                if CompleteScheduledTask:
+                    Scheduler.CompleteActiveTask(
+                        current_time_sec=time.time(),
+                    )
+                    if ScheduledTask.TaskType == RadarTaskType.TRACK:
+                        Executor.ReleaseTask(ScheduledTask)
 
                 # Mission duration is active surveillance time.  Account it
                 # only after this complete CPI/dwell, then publish the latest
                 # task/remaining-time status.  Any task transition selected
                 # here is applied before the next dwell is armed.
-                MissionExecution.Advance(time.monotonic())
+                MissionExecution.Advance(
+                    time.monotonic(),
+                    resource_available=(
+                        ScheduledTask.TaskType != RadarTaskType.TRACK
+                    ),
+                )
                 if hasattr(Display, "SetMissionRuntimeStatus"):
                     Display.SetMissionRuntimeStatus(
                         MissionExecution.GetStatus()
@@ -2237,6 +2775,8 @@ def Main(CommandLineArguments=None):
                         f"X6-60 {X660AzDeg:7.2f} deg {X660Source} | "
                         f"Mode {DisplayMode} Scan {ScanEnabled} | "
                         f"Dets {len(Detections):3d} Plots {len(Plots):3d} Tracks {len(Tracks):3d} | "
+                        f"AngX {int(AngularDebug.get('ActiveCrossings', 0)):3d} "
+                        f"AngNew {int(AngularDebug.get('CompletedPlotsThisDwell', 0)):2d} | "
                         f"Pts {int(TrackerDebug.get('CurrentScanPoints', 0)):3d} "
                         f"Blobs {int(TrackerDebug.get('LastCompletedBlobs', 0)):3d} "
                         f"Tent {int(TrackerDebug.get('TentativeTracks', 0)):3d} "

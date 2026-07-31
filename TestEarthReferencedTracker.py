@@ -142,6 +142,95 @@ class TestEarthReferencedTrackerInitiation(unittest.TestCase):
 
         self.assertEqual(tracker.GetDebugInfo()["CurrentScanPoints"], 1)
 
+    def test_directed_nod_promotes_selected_earth_track_immediately(self):
+        tracker = EarthReferencedTracker(
+            {
+                "EarthInitiationWindow": 3,
+                "EarthInitiationRequiredHits": 2,
+            }
+        )
+        _update_scan(
+            tracker,
+            0,
+            [_earth_detection(1000.0, 2000.0, timestamp_sec=100.0)],
+        )
+        _update_scan(tracker, 1, [])
+        initiating = tracker.GetTentativeTracks()[0]
+        self.assertEqual((initiating.Hits, initiating.Attempts), (1, 1))
+
+        result = tracker.ApplyDirectedResult(
+            initiating.TrackId,
+            [
+                _earth_detection(
+                    1005.0,
+                    1995.0,
+                    timestamp_sec=101.0,
+                )
+            ],
+            coverage_valid=True,
+            authoritative_hit=True,
+            authoritative_promoted=True,
+        )
+
+        self.assertTrue(result["Applied"])
+        self.assertTrue(result["Hit"])
+        self.assertTrue(result["Promoted"])
+        self.assertEqual(result["Outcome"], "EARTH_TENTATIVE_PROMOTED")
+        confirmed = tracker.GetConfirmedTracks()
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(
+            (confirmed[0].Hits, confirmed[0].Attempts),
+            (2, 2),
+        )
+
+    def test_directed_nod_is_one_earth_initiation_opportunity(self):
+        tracker = EarthReferencedTracker()
+        _update_scan(
+            tracker,
+            0,
+            [_earth_detection(1000.0, 2000.0)],
+        )
+        _update_scan(tracker, 1, [])
+        initiating = tracker.GetTentativeTracks()[0]
+
+        result = tracker.ApplyDirectedResult(
+            initiating.TrackId,
+            [
+                _earth_detection(1001.0, 2001.0),
+                _earth_detection(1002.0, 2002.0),
+                _earth_detection(1003.0, 2003.0),
+            ],
+            coverage_valid=True,
+            authoritative_hit=True,
+            authoritative_promoted=True,
+        )
+
+        self.assertEqual(result["Hits"], 2)
+        self.assertEqual(result["Attempts"], 2)
+
+    def test_incomplete_directed_nod_does_not_age_earth_track(self):
+        tracker = EarthReferencedTracker()
+        _update_scan(
+            tracker,
+            0,
+            [_earth_detection(1000.0, 2000.0)],
+        )
+        _update_scan(tracker, 1, [])
+        initiating = tracker.GetTentativeTracks()[0]
+
+        result = tracker.ApplyDirectedResult(
+            initiating.TrackId,
+            [],
+            coverage_valid=False,
+            authoritative_hit=False,
+        )
+
+        self.assertEqual(result["Outcome"], "EARTH_INCOMPLETE_COVERAGE")
+        self.assertEqual(
+            (initiating.Hits, initiating.Attempts, initiating.Misses),
+            (1, 1, 0),
+        )
+
 
 class TestEarthReferencedTrackerGeometry(unittest.TestCase):
     def test_clustering_uses_cartesian_distance(self):
@@ -371,11 +460,12 @@ class TestSchedulerStage6Boundary(unittest.TestCase):
             Path(__file__).resolve().parent / "VanguardxMain_scheduler.py"
         ).read_text(encoding="utf-8")
 
-        legacy_update_index = source.index(
-            "Tracker.Update(Detections, Processed, ThisDwell)"
-        )
+        legacy_update_index = source.index("Tracker.Update(")
         earth_update_index = source.index(
             "EarthTracker.Update("
+        )
+        earth_directed_update_index = source.index(
+            "EarthTracker.ApplyDirectedResult("
         )
         selection_index = source.index(
             "DisplayTrackSelection = SelectDisplayTrackProducts("
@@ -383,6 +473,9 @@ class TestSchedulerStage6Boundary(unittest.TestCase):
 
         self.assertLess(legacy_update_index, earth_update_index)
         self.assertLess(earth_update_index, selection_index)
+        self.assertLess(earth_directed_update_index, selection_index)
+        self.assertIn("TrackerMeasurements = AngularPlots", source)
+        self.assertIn("TrackerMeasurements = Detections", source)
         self.assertIn(
             'Processed.Diagnostics["EarthTrackerAuthoritative"] = False',
             source,

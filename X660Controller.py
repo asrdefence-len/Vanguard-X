@@ -79,6 +79,7 @@ class SimulatedX660Controller:
         self.UnwrappedAzimuthDeg = float(InitialAzimuth)
         self.TargetUnwrappedAzimuthDeg = float(InitialAzimuth)
         self.CommandedRateDegPerSec = 0.0
+        self.GotoRateDegPerSec = self.MaxPanRateDegPerSec
         self.Mode = "stopped"
         self.LastUpdateSec = time.time()
 
@@ -122,9 +123,24 @@ class SimulatedX660Controller:
         self.Stop()
 
     def SetPanPositionNative(self, PanDeg: float):
+        return self.SetPanPositionNativeAtRate(
+            PanDeg,
+            self.MaxPanRateDegPerSec,
+        )
+
+    def SetPanPositionNativeAtRate(
+        self,
+        PanDeg: float,
+        PanRateDegPerSec: float,
+    ):
         TargetBearing = Wrap360(PanDeg)
         Delta = SignedAngleDeltaDeg(TargetBearing, self.State.AzimuthDeg)
         self.TargetUnwrappedAzimuthDeg = self.UnwrappedAzimuthDeg + Delta
+        self.GotoRateDegPerSec = Clamp(
+            abs(float(PanRateDegPerSec)),
+            0.01,
+            self.MaxPanRateDegPerSec,
+        )
         self.State.CommandedAzimuthDeg = TargetBearing
         self.State.AtTarget = False
         self.Mode = "goto"
@@ -199,12 +215,12 @@ class SimulatedX660Controller:
                 self.Stop()
             else:
                 Direction = 1.0 if Error > 0.0 else -1.0
-                Step = Direction * self.MaxPanRateDegPerSec * Dt
+                Step = Direction * self.GotoRateDegPerSec * Dt
                 if abs(Step) > abs(Error):
                     Step = Error
                 self.UnwrappedAzimuthDeg += Step
                 self.State.PanRateDegPerSec = (
-                    Direction * self.MaxPanRateDegPerSec
+                    Direction * self.GotoRateDegPerSec
                 )
                 self.State.Direction = "right" if Direction > 0.0 else "left"
 

@@ -20,7 +20,7 @@ import numpy as np
 from CoordinateFrames import detection_to_enu_position
 
 
-EARTH_TRACKER_VERSION = "earth-enu-2of3-alpha-beta-v1"
+EARTH_TRACKER_VERSION = "earth-enu-2of3-directed-update-v2"
 
 
 @dataclass
@@ -267,6 +267,184 @@ class EarthReferencedTracker:
 
     def GetDebugInfo(self):
         return dict(self.LastDebug)
+
+    def ApplyDirectedResult(
+        self,
+        track_id: int,
+        measurements,
+        *,
+        coverage_valid: bool,
+        authoritative_hit: bool,
+        authoritative_promoted: bool = False,
+        authoritative_deleted: bool = False,
+    ) -> Dict[str, Any]:
+        """Apply one completed nod result to the selected Earth track.
+
+        The legacy range/bearing tracker remains authoritative for tasking and
+        decides whether the gated nod was a hit.  When the operator selected an
+        Earth-displayed track, this method applies that same one-opportunity
+        result immediately to the exact Earth track ID.  Without this bridge,
+        the orange Earth track remains tentative until the next ordinary
+        search-pass boundary even though its legacy counterpart has already
+        promoted.
+        """
+
+        track_id = int(track_id)
+        track = next(
+            (
+                item for item in self.Tracks
+                if int(item.TrackId) == track_id
+            ),
+            None,
+        )
+        if track is None:
+            return {
+                "TrackId": track_id,
+                "Outcome": "EARTH_TRACK_NOT_FOUND",
+                "Applied": False,
+                "Hit": bool(authoritative_hit),
+                "Promoted": False,
+                "Deleted": False,
+                "CoverageValid": bool(coverage_valid),
+            }
+
+        was_tentative = not (
+            str(track.Status).upper() == "CONFIRMED"
+            or bool(track.IsConfirmed)
+        )
+        common = {
+            "TrackId": track_id,
+            "Applied": True,
+            "Hit": bool(authoritative_hit),
+            "CoverageValid": bool(coverage_valid),
+            "TrackWasTentative": bool(was_tentative),
+        }
+
+        if authoritative_deleted:
+            self.Tracks = [
+                item for item in self.Tracks
+                if int(item.TrackId) != track_id
+            ]
+            return {
+                **common,
+                "Outcome": "EARTH_TRACK_DELETED_WITH_AUTHORITY",
+                "Promoted": False,
+                "Deleted": True,
+            }
+
+        if not coverage_valid:
+            return {
+                **common,
+                "Outcome": "EARTH_INCOMPLETE_COVERAGE",
+                "Promoted": False,
+                "Deleted": False,
+                "Hits": int(track.Hits),
+                "Attempts": int(track.Attempts),
+            }
+
+        points = []
+        for measurement in list(measurements or []):
+            point = self._point_from_detection(measurement)
+            if point is not None:
+                points.append(point)
+        blobs = self._cluster_points(points)
+        gate_m = (
+            self.InitiationGateM
+            if was_tentative
+            else self.AssociationGateM
+        )
+        best = self._best_blob_in_gate(
+            track.EastM,
+            track.NorthM,
+            blobs,
+            set(),
+            gate_m,
+        )
+        scan_id = max(
+            int(track.LastUpdateScan) + 1,
+            int(self.CurrentScanId or 0),
+        )
+
+        if was_tentative:
+            # Three physical nod passes are one independent initiation
+            # opportunity, matching the authoritative tracker rule.
+            track.Attempts += 1
+            track.LastUpdateScan = scan_id
+            if authoritative_hit:
+                track.Hits += 1
+                track.LastHitScan = scan_id
+                track.Misses = 0
+                if best is not None:
+                    self._update_tentative(track, best, scan_id)
+            else:
+                track.Misses += 1
+
+            # Status authority remains with the legacy tasking tracker.  The
+            # Earth stream mirrors that decision instead of independently
+            # promoting or deleting on a possibly different historical count.
+            promoted = bool(authoritative_promoted)
+            deleted = False
+            if promoted:
+                track.Status = "CONFIRMED"
+                track.IsConfirmed = True
+                track.Misses = 0
+                self._estimate_velocity_from_history(track)
+            elif deleted:
+                self.Tracks = [
+                    item for item in self.Tracks
+                    if int(item.TrackId) != track_id
+                ]
+
+            return {
+                **common,
+                "Outcome": (
+                    "EARTH_TENTATIVE_PROMOTED"
+                    if promoted
+                    else (
+                        "EARTH_TENTATIVE_DELETED"
+                        if deleted
+                        else (
+                            "EARTH_TENTATIVE_REACQUIRED"
+                            if authoritative_hit
+                            else "EARTH_TENTATIVE_MISSED_RETAINED"
+                        )
+                    )
+                ),
+                "Promoted": promoted,
+                "Deleted": deleted,
+                "Hits": int(track.Hits),
+                "Attempts": int(track.Attempts),
+            }
+
+        if authoritative_hit:
+            if best is not None:
+                dt = self._track_dt(
+                    track,
+                    scan_id,
+                    best.TimestampSec,
+                )
+                self._alpha_beta_update(track, best, scan_id, dt)
+            else:
+                track.Hits += 1
+                track.LastUpdateScan = scan_id
+                track.LastHitScan = scan_id
+            track.Misses = 0
+        else:
+            track.Misses += 1
+            track.LastUpdateScan = scan_id
+
+        return {
+            **common,
+            "Outcome": (
+                "EARTH_CONFIRMED_UPDATED"
+                if authoritative_hit
+                else "EARTH_CONFIRMED_MISSED"
+            ),
+            "Promoted": False,
+            "Deleted": False,
+            "Hits": int(track.Hits),
+            "Attempts": int(track.Attempts),
+        }
 
     def _process_completed_scan(
         self,

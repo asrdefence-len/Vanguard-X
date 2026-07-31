@@ -63,7 +63,7 @@ import math
 import time
 import numpy as np
 
-TRACKER_VERSION = "blob-2of3-alpha-beta-scanpass-v18"
+TRACKER_VERSION = "blob-2of3-alpha-beta-scanpass-v20"
 
 
 @dataclass
@@ -129,6 +129,8 @@ class RadarTrack:
     AmplitudeDb: float = -120.0
     NumCells: int = 1
     History: List[Tuple[int, float, float]] = field(default_factory=list)
+    DirectedUpdateMisses: int = 0
+    LastDirectedUpdateHit: Optional[bool] = None
 
     # Display compatibility aliases
     @property
@@ -195,6 +197,18 @@ class RadarTracker:
         self.InitiationWindow = int(self.Config.get("InitiationWindow", 3))
         self.InitiationRequiredHits = int(self.Config.get("InitiationRequiredHits", 2))
         self.DeleteConfirmedAfterMisses = int(self.Config.get("DeleteConfirmedAfterMisses", 5))
+        self.DuplicateSuppressionEnabled = bool(
+            self.Config.get("DuplicateTrackSuppressionEnabled", True)
+        )
+        self.DuplicateRangeGateM = float(
+            self.Config.get("DuplicateTrackRangeGateM", 200.0)
+        )
+        self.DuplicateAzimuthGateDeg = float(
+            self.Config.get("DuplicateTrackAzimuthGateDeg", 5.0)
+        )
+        self.DirectedDeleteAfterMisses = int(
+            self.Config.get("DirectedTrackDeleteAfterMisses", 2)
+        )
 
         # Confirmed track filter.  This is scan-to-scan alpha-beta tracking.
         # TrackDtSec is the assumed time between completed scan passes.  If the
@@ -220,6 +234,7 @@ class RadarTracker:
         self._last_dir: Optional[int] = None
 
         self.LastDebug: Dict[str, Any] = {"TrackerVersion": TRACKER_VERSION}
+        self.LastDuplicateTracksMerged = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -258,6 +273,7 @@ class RadarTracker:
             "TrackAlpha": self.TrackAlpha,
             "TrackBeta": self.TrackBeta,
             "TrackDtSec": self.TrackDtSec,
+            "DuplicateTracksMerged": self.LastDuplicateTracksMerged,
         }
 
         return self.GetTracks(), (self.LastCompletedBlobs if self.ReturnBlobsForDebug else [])
@@ -279,6 +295,255 @@ class RadarTracker:
 
     def GetDebugInfo(self):
         return dict(self.LastDebug)
+
+    def DeleteTrack(self, track_id: int) -> bool:
+        track_id = int(track_id)
+        previous_count = len(self.Tracks)
+        self.Tracks = [
+            track for track in self.Tracks
+            if int(track.TrackId) != track_id
+        ]
+        return len(self.Tracks) != previous_count
+
+    def ApplyDirectedUpdate(
+        self,
+        track_id: int,
+        measurements,
+        *,
+        coverage_valid: bool,
+        miss_policy: str = "RETRY_WIDER_THEN_DELETE",
+    ) -> Dict[str, Any]:
+        """Apply one completed nod scan directly to its nominated track.
+
+        Track confirmation is a finite, target-directed opportunity rather
+        than a completed search pass.  Feeding it through the scan accumulator
+        would delay the result and could seed a second track, so the nominated
+        track is updated explicitly here.
+        """
+
+        track = next(
+            (
+                item for item in self.Tracks
+                if int(item.TrackId) == int(track_id)
+            ),
+            None,
+        )
+        if track is None:
+            return {
+                "TrackId": int(track_id),
+                "Outcome": "TRACK_NOT_FOUND",
+                "Hit": False,
+                "Deleted": False,
+                "CoverageValid": bool(coverage_valid),
+            }
+
+        was_tentative = not (
+            str(track.Status).upper() == "CONFIRMED"
+            or bool(track.IsConfirmed)
+        )
+
+        blobs = []
+        for measurement in list(measurements or []):
+            point = self._point_from_detection(measurement)
+            blobs.append(RadarBlob(
+                BlobId=self.NextBlobId,
+                RangeM=point.RangeM,
+                AzimuthDeg=point.AzimuthDeg,
+                NumCells=int(self._field(
+                    measurement,
+                    ["NumCells"],
+                    1,
+                )),
+                AmplitudeDb=point.AmplitudeDb,
+                SnrDb=point.SnrDb,
+                DopplerHz=point.DopplerHz,
+                RangeBin=point.RangeBin,
+            ))
+            self.NextBlobId += 1
+
+        range_gate_m = (
+            self.InitiationRangeGateM
+            if was_tentative
+            else self.AssociationRangeGateM
+        )
+        azimuth_gate_deg = (
+            self.InitiationAzimuthGateDeg
+            if was_tentative
+            else self.AssociationAzimuthGateDeg
+        )
+        best = self._best_blob_in_gate(
+            track.RangeM,
+            track.AzimuthDeg,
+            blobs,
+            set(),
+            range_gate_m,
+            azimuth_gate_deg,
+        )
+        if was_tentative:
+            return self._apply_directed_tentative_update(
+                track,
+                best,
+                coverage_valid=coverage_valid,
+            )
+
+        if best is not None:
+            update_scan = max(
+                int(track.LastUpdateScan) + 1,
+                int(self.CurrentScanId or 0),
+            )
+            self._alpha_beta_update_from_blob(
+                track,
+                best,
+                update_scan,
+                self.TrackDtSec,
+            )
+            track.Misses = 0
+            track.DirectedUpdateMisses = 0
+            track.LastDirectedUpdateHit = True
+            merged = self._merge_duplicates_around_track(track)
+            self.LastDuplicateTracksMerged += merged
+            return {
+                "TrackId": int(track_id),
+                "Outcome": "CONFIRMED",
+                "Hit": True,
+                "Deleted": False,
+                "CoverageValid": bool(coverage_valid),
+                "RangeM": float(track.RangeM),
+                "AzimuthDeg": float(track.AzimuthDeg),
+                "DuplicatesMerged": int(merged),
+            }
+
+        if not coverage_valid:
+            track.LastDirectedUpdateHit = None
+            return {
+                "TrackId": int(track_id),
+                "Outcome": "INCOMPLETE_COVERAGE_COAST",
+                "Hit": False,
+                "Deleted": False,
+                "CoverageValid": False,
+            }
+
+        track.LastDirectedUpdateHit = False
+        track.DirectedUpdateMisses += 1
+        track.Misses += 1
+        policy = str(miss_policy).upper()
+        delete_requested = policy in (
+            "DELETE",
+            "RETRY_WIDER_THEN_DELETE",
+        )
+        deleted = bool(
+            delete_requested
+            and (
+                policy == "DELETE"
+                or track.DirectedUpdateMisses
+                >= self.DirectedDeleteAfterMisses
+            )
+        )
+        if deleted:
+            self.DeleteTrack(track.TrackId)
+        return {
+            "TrackId": int(track_id),
+            "Outcome": (
+                "DELETED_AFTER_CONFIRMED_MISSES"
+                if deleted
+                else "MISSED_COASTING"
+            ),
+            "Hit": False,
+            "Deleted": deleted,
+            "CoverageValid": True,
+            "DirectedUpdateMisses": int(track.DirectedUpdateMisses),
+        }
+
+    def _apply_directed_tentative_update(
+        self,
+        track: RadarTrack,
+        best: Optional[RadarBlob],
+        *,
+        coverage_valid: bool,
+    ) -> Dict[str, Any]:
+        """Apply one complete three-pass nod as one initiation opportunity."""
+
+        common = {
+            "TrackId": int(track.TrackId),
+            "TrackWasTentative": True,
+            "CoverageValid": bool(coverage_valid),
+        }
+        if not coverage_valid:
+            track.LastDirectedUpdateHit = None
+            return {
+                **common,
+                "Outcome": "TENTATIVE_INCOMPLETE_COVERAGE",
+                "Hit": False,
+                "Promoted": False,
+                "Deleted": False,
+                "Hits": int(track.Hits),
+                "Attempts": int(track.Attempts),
+                "InitiationWindow": int(self.InitiationWindow),
+            }
+
+        # Regardless of the three physical gate crossings, this finite task is
+        # one tracker opportunity.
+        update_scan = max(
+            int(track.LastUpdateScan) + 1,
+            int(self.CurrentScanId or 0),
+        )
+        track.Attempts += 1
+        track.LastUpdateScan = update_scan
+        track.LastDirectedUpdateHit = best is not None
+
+        if best is not None:
+            track.Hits += 1
+            track.LastHitScan = update_scan
+            track.Misses = 0
+            self._update_tentative_from_blob(
+                track,
+                best,
+                update_scan,
+            )
+        else:
+            track.Misses += 1
+
+        promoted = bool(
+            track.Hits >= self.InitiationRequiredHits
+        )
+        deleted = bool(
+            not promoted
+            and track.Attempts >= self.InitiationWindow
+        )
+        merged = 0
+        if promoted:
+            track.Status = "CONFIRMED"
+            track.IsConfirmed = True
+            track.Misses = 0
+            track.DirectedUpdateMisses = 0
+            self._estimate_velocity_from_history(track)
+            merged = self._merge_duplicates_around_track(track)
+            self.LastDuplicateTracksMerged += merged
+        elif deleted:
+            self.DeleteTrack(track.TrackId)
+
+        if promoted:
+            outcome = "TENTATIVE_PROMOTED"
+        elif deleted:
+            outcome = "TENTATIVE_DELETED"
+        elif best is not None:
+            outcome = "TENTATIVE_REACQUIRED"
+        else:
+            outcome = "TENTATIVE_MISSED_RETAINED"
+
+        return {
+            **common,
+            "Outcome": outcome,
+            "Hit": best is not None,
+            "Promoted": promoted,
+            "Deleted": deleted,
+            "Hits": int(track.Hits),
+            "Attempts": int(track.Attempts),
+            "InitiationWindow": int(self.InitiationWindow),
+            "RangeM": float(track.RangeM),
+            "AzimuthDeg": float(track.AzimuthDeg),
+            "DuplicatesMerged": int(merged),
+        }
 
     # ------------------------------------------------------------------
     # Scan-level tracking
@@ -370,6 +635,120 @@ class RadarTracker:
             if self._is_near_existing_track(b):
                 continue
             self._create_tentative(b, scan_id)
+
+        self.LastDuplicateTracksMerged = self._merge_duplicate_tracks(scan_id)
+
+    def _merge_duplicate_tracks(self, scan_id: int) -> int:
+        if not self.DuplicateSuppressionEnabled:
+            return 0
+        merged = 0
+        changed = True
+        while changed:
+            changed = False
+            for left_index, left in enumerate(self.Tracks):
+                for right in self.Tracks[left_index + 1:]:
+                    if not self._tracks_are_duplicates(
+                        left,
+                        right,
+                        scan_id,
+                    ):
+                        continue
+                    keep, discard = self._preferred_duplicate_track(
+                        left,
+                        right,
+                    )
+                    self._merge_track_state(keep, discard)
+                    self.Tracks = [
+                        item for item in self.Tracks if item is not discard
+                    ]
+                    merged += 1
+                    changed = True
+                    break
+                if changed:
+                    break
+        return merged
+
+    def _merge_duplicates_around_track(self, nominated: RadarTrack) -> int:
+        merged = 0
+        for other in list(self.Tracks):
+            if other is nominated:
+                continue
+            if (
+                abs(other.RangeM - nominated.RangeM)
+                > self.DuplicateRangeGateM
+                or self._az_diff(
+                    other.AzimuthDeg,
+                    nominated.AzimuthDeg,
+                ) > self.DuplicateAzimuthGateDeg
+            ):
+                continue
+            self._merge_track_state(nominated, other)
+            self.Tracks = [
+                item for item in self.Tracks if item is not other
+            ]
+            merged += 1
+        return merged
+
+    def _tracks_are_duplicates(
+        self,
+        left: RadarTrack,
+        right: RadarTrack,
+        scan_id: int,
+    ) -> bool:
+        if (
+            abs(left.RangeM - right.RangeM) > self.DuplicateRangeGateM
+            or self._az_diff(
+                left.AzimuthDeg,
+                right.AzimuthDeg,
+            ) > self.DuplicateAzimuthGateDeg
+        ):
+            return False
+        # Two confirmed tracks independently updated by distinct plots in the
+        # same pass may be two genuinely close vessels.  Preserve that case.
+        if (
+            left.Status == "CONFIRMED"
+            and right.Status == "CONFIRMED"
+            and left.LastHitScan == scan_id
+            and right.LastHitScan == scan_id
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _preferred_duplicate_track(left, right):
+        def score(track):
+            return (
+                1 if track.Status == "CONFIRMED" else 0,
+                int(track.Hits),
+                -int(track.Misses),
+                -int(track.TrackId),
+            )
+        return (left, right) if score(left) >= score(right) else (right, left)
+
+    def _merge_track_state(self, keep: RadarTrack, discard: RadarTrack):
+        total_hits = max(1, int(keep.Hits) + int(discard.Hits))
+        discard_weight = int(discard.Hits) / float(total_hits)
+        keep.RangeM = (
+            (1.0 - discard_weight) * keep.RangeM
+            + discard_weight * discard.RangeM
+        )
+        keep.AzimuthDeg = self._az_blend(
+            keep.AzimuthDeg,
+            discard.AzimuthDeg,
+            discard_weight,
+        )
+        keep.Hits = max(int(keep.Hits), int(discard.Hits))
+        keep.Attempts = max(int(keep.Attempts), int(discard.Attempts))
+        keep.Misses = min(int(keep.Misses), int(discard.Misses))
+        keep.SnrDb = max(float(keep.SnrDb), float(discard.SnrDb))
+        keep.AmplitudeDb = max(
+            float(keep.AmplitudeDb),
+            float(discard.AmplitudeDb),
+        )
+        keep.NumCells = max(int(keep.NumCells), int(discard.NumCells))
+        keep.History = (
+            keep.History + discard.History
+        )[-self.MaxTrackHistory:]
 
     def _create_tentative(self, blob: RadarBlob, scan_id: int):
         trk = RadarTrack(
