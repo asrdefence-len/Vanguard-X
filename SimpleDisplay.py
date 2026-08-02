@@ -303,9 +303,10 @@ class SimpleDisplay:
 
         self._UpdatePolarBeam(BoresightDeg)
 
+        TacticalGreen = self.Config.get("TacticalGreenColour", "#00d060")
         self.PolarAxes.set_title(
             f"Accumulated Scan Detections - Dwell {Processed.DwellId}, Az {BoresightDeg:.1f} deg",
-            color="white",
+            color=TacticalGreen,
         )
 
         self.PolarFigure.canvas.draw_idle()
@@ -325,9 +326,11 @@ class SimpleDisplay:
         self.PolarAxes.set_thetamax(float(self.Config.get("ScanStopDeg", 90.0)))
         self.PolarAxes.set_rlim(0, float(self.Config.get("PolarMaxRangeM", 15000.0)))
 
-        self.PolarAxes.grid(True, color="white", alpha=0.25, linewidth=0.8)
-        self.PolarAxes.tick_params(colors="white")
-        self.PolarAxes.spines["polar"].set_color("white")
+        TacticalGreen = self.Config.get("TacticalGreenColour", "#00d060")
+        TacticalGrid = self.Config.get("TacticalGridColour", "#176b3a")
+        self.PolarAxes.grid(True, color=TacticalGrid, alpha=0.55, linewidth=0.8)
+        self.PolarAxes.tick_params(colors=TacticalGreen)
+        self.PolarAxes.spines["polar"].set_color(TacticalGreen)
 
         self.PolarScatter = self.PolarAxes.scatter(
             [],

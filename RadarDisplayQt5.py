@@ -48,7 +48,7 @@ from RadarMapOverlay import (
 )
 from MissionPage import MissionPage
 
-DISPLAY_VERSION = "tracks-white-surface-symbol-v10-radar-link"
+DISPLAY_VERSION = "tactical-green-framework-v11-radar-link"
 
 # Force pyqtgraph to use the conda PyQt5 binding.
 # This avoids macOS/Anaconda failures when a pip PyQt6 install is also present.
@@ -300,9 +300,21 @@ class RadarDisplay:
         # ------------------------------------------------------------------
         self.BackgroundColour = "#000000"
         self.PanelColour = "#050505"
-        self.GridColour = "#303030"
-        self.TextColour = "#ffffff"
-        self.MutedTextColour = "#bfbfbf"
+
+        # Tactical display framework.  These greens are deliberately less
+        # intense than the live range trace so that axes and reference
+        # linework remain visible without competing with radar products.
+        # Track colours below are unchanged: confirmed tracks remain white
+        # and initiating tracks remain amber.
+        self.TacticalGreenColour = Config.get("TacticalGreenColour", "#00d060")
+        self.TacticalMutedGreenColour = Config.get(
+            "TacticalMutedGreenColour",
+            "#65b883",
+        )
+        self.TacticalGridColour = Config.get("TacticalGridColour", "#176b3a")
+        self.GridColour = self.TacticalGridColour
+        self.TextColour = self.TacticalGreenColour
+        self.MutedTextColour = self.TacticalMutedGreenColour
         self.TraceColour = "#00ff66"
         self.DetectionColour = "#00ffff"
         self.PlotColour = "#ffcc00"
@@ -326,8 +338,8 @@ class RadarDisplay:
         self.TentativeTrackColour = self.TentativeTrackPenColour
         self.ConfirmedTrackColour = self.ConfirmedTrackPenColour
         self.BeamColour = "#ffff00"
-        self.BoundaryColour = "#808080"
-        self.RingColour = Config.get("RangeRingColour", "#505050")
+        self.BoundaryColour = Config.get("SectorBoundaryColour", "#00a85a")
+        self.RingColour = Config.get("RangeRingColour", self.TacticalGridColour)
 
         # Offline, North-up, radar-centred map. Live GPS can later call
         # SetRadarPosition() without changing the display architecture.
@@ -683,11 +695,22 @@ class RadarDisplay:
         self.PpiPlot.setBackground(self.PanelColour)
         self.PpiPlot.setAspectLocked(True)
         self.PpiPlot.showGrid(x=True, y=True, alpha=0.25)
-        self.PpiPlot.setLabel("bottom", "East / range", units="m")
-        self.PpiPlot.setLabel("left", "North / range", units="m")
+        self.PpiPlot.setLabel(
+            "bottom",
+            "East / range",
+            units="m",
+            color=self.TextColour,
+        )
+        self.PpiPlot.setLabel(
+            "left",
+            "North / range",
+            units="m",
+            color=self.TextColour,
+        )
         self.PpiPlot.setXRange(-self.PolarMaxRangeM, self.PolarMaxRangeM, padding=0.02)
         self.PpiPlot.setYRange(-self.PolarMaxRangeM, self.PolarMaxRangeM, padding=0.02)
-        self.PpiPlot.setTitle("VANGUARD X Sector Scan")
+        self.PpiPlot.setTitle("VANGUARD X Sector Scan", color=self.TextColour)
+        self.ApplyTacticalPlotTheme(self.PpiPlot)
         self.PpiPlot.scene().sigMouseClicked.connect(self.OnPpiMouseClicked)
 
         MainLayout.addWidget(self.PpiPlot, stretch=3)
@@ -765,14 +788,26 @@ class RadarDisplay:
         self.RangePlot = pg.PlotWidget()
         self.RangePlot.setBackground(self.PanelColour)
         self.RangePlot.showGrid(x=True, y=True, alpha=0.25)
-        self.RangePlot.setLabel("bottom", "Range", units="m")
-        self.RangePlot.setLabel("left", "Magnitude", units="dB")
+        self.RangePlot.setLabel(
+            "bottom",
+            "Range",
+            units="m",
+            color=self.TextColour,
+        )
+        self.RangePlot.setLabel(
+            "left",
+            "Magnitude",
+            units="dB",
+            color=self.TextColour,
+        )
         self.RangePlot.setXRange(0, self.MaxDisplayRangeM, padding=0.0)
         self.RangePlot.setTitle(
             "Range Profile (0 Hz Doppler)"
             if self.RangeProfileDopplerMode == "ZERO_DOPPLER"
-            else "Range Profile (Max Doppler Envelope)"
+            else "Range Profile (Max Doppler Envelope)",
+            color=self.TextColour,
         )
+        self.ApplyTacticalPlotTheme(self.RangePlot)
         self.ApplyRangeProfileScale()
         RightLayout.addWidget(self.RangePlot, stretch=1)
 
@@ -811,6 +846,16 @@ class RadarDisplay:
 
         self.Window.show()
         self.App.processEvents()
+
+    def ApplyTacticalPlotTheme(self, PlotWidget):
+        """Apply green tactical axes, ticks and grid references to a plot."""
+
+        AxisPen = pg.mkPen(self.TacticalGreenColour, width=1)
+        TextPen = pg.mkPen(self.TextColour)
+        for AxisName in ("left", "bottom"):
+            Axis = PlotWidget.getAxis(AxisName)
+            Axis.setPen(AxisPen)
+            Axis.setTextPen(TextPen)
 
     def CreatePersistentOperatorHeader(self):
         """Create the compact status and STOP strip visible from both tabs."""
@@ -2188,10 +2233,13 @@ class RadarDisplay:
                 f"R{self.AppliedMaximumRangeM / 1000.0:.1f}k"
             ),
             f"Dwell:  {self.UpdateCounter}",
-            f"Dets:   {NumDetections} ({'shown' if self.ShowRawDetections else 'hidden'})",
-            f"Plots:  {NumPlots} ({'shown' if self.ShowTrackerPlots else 'hidden'})",
-            f"Tent:   {NumTentative}",
-            f"Tracks: {NumConfirmed}",
+            (
+                f"Dets: {NumDetections} "
+                f"({'shown' if self.ShowRawDetections else 'hidden'}), "
+                f"Plots: {NumPlots} "
+                f"({'shown' if self.ShowTrackerPlots else 'hidden'})"
+            ),
+            f"Tracks: {NumConfirmed}, Tent: {NumTentative}",
         ]
 
         if self.NavigationHeadingTrueDeg is not None:
@@ -2199,12 +2247,6 @@ class RadarDisplay:
                 7,
                 f"Ship hdg: {self.NavigationHeadingTrueDeg:.1f} deg T",
             )
-        if self.X660AzimuthRelativeDeg is not None:
-            Lines.insert(
-                8,
-                f"X6-60:   {self.X660AzimuthRelativeDeg:.1f} deg rel",
-            )
-
         if self.DisplayTrackSourceFallback:
             Lines.append(
                 "Track fallback: "
@@ -2215,15 +2257,13 @@ class RadarDisplay:
 
         if self.LatestProcessed is not None:
             Diagnostics = getattr(self.LatestProcessed, "Diagnostics", {})
-            Lines.append(f"Peak R: {Diagnostics.get('PeakRangeM', 0.0):.1f} m")
-            Lines.append(f"Peak V: {Diagnostics.get('PeakVelocityMps', 0.0):.1f} m/s")
+            Lines.append(
+                f"Peak R: {Diagnostics.get('PeakRangeM', 0.0):.1f} m, "
+                f"Peak V: {Diagnostics.get('PeakVelocityMps', 0.0):.1f} m/s"
+            )
 
         if self.EstimatedNoiseFloorDb is not None:
             Lines.append(f"Noise:  {self.EstimatedNoiseFloorDb:.1f} dB")
-            Lines.append(
-                f"Y-axis: {self.RangeProfileDisplayMinDb:.1f} to "
-                f"{self.RangeProfileDisplayMaxDb:.1f} dB"
-            )
 
         self.StatusLabel.setText("\n".join(Lines))
         self.UpdatePersistentOperatorHeader()

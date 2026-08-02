@@ -22,7 +22,7 @@ class DashboardEarthReferencedScanTests(unittest.TestCase):
             source,
         )
 
-    def test_dashboard_labels_distinguish_true_and_relative_frames(self):
+    def test_dashboard_labels_use_true_bearings_and_keep_relative_telemetry_separate(self):
         source = (ROOT / "RadarDisplayQt5.py").read_text(
             encoding="utf-8"
         )
@@ -31,9 +31,14 @@ class DashboardEarthReferencedScanTests(unittest.TestCase):
             'QLabel("Stop °T")',
             "TRUE BRG",
             "Ship hdg:",
-            "deg rel",
         ):
             self.assertIn(expected, source)
+        self.assertIn("self.X660AzimuthRelativeDeg = None", source)
+        self.assertIn("self.X660AzimuthRelativeDeg = (", source)
+        self.assertNotIn(
+            'f"X6-60:   {self.X660AzimuthRelativeDeg:.1f} deg rel"',
+            source,
+        )
 
     def test_ppi_beam_boundary_requires_true_bearing(self):
         source = (ROOT / "RadarDisplayQt5.py").read_text(
