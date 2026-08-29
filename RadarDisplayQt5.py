@@ -1043,7 +1043,7 @@ class RadarDisplay:
         self.ControlWidgets["SaveDataEnabled"].setMaximumWidth(70)
 
         self.ControlWidgets["SystemMode"] = QtWidgets.QComboBox()
-        self.ControlWidgets["SystemMode"].addItems(["SIM", "HARD", "RF LOOPBACK"])
+        self.ControlWidgets["SystemMode"].addItems(["SIM", "SDR", "HARD", "RF LOOPBACK"])
         self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
         self.ControlWidgets["SystemMode"].setMinimumWidth(72)
         self.ControlWidgets["SystemMode"].setMaximumWidth(125)
@@ -2458,6 +2458,22 @@ class RadarDisplay:
             self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
             self.ControlWidgets["SystemMode"].blockSignals(False)
             return
+
+        if Requested == "SDR":
+            Answer = QtWidgets.QMessageBox.question(
+                None,
+                "Enable SDR bench mode",
+                "SDR BENCH MODE will restart the application with the real Ettus, timed TX/RX and ATR enabled.\n\n"
+                "The X6-60 remains disabled. The TRM may remain disconnected for CRO testing.\n\n"
+                "Continue?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if Answer != QtWidgets.QMessageBox.Yes:
+                self.ControlWidgets["SystemMode"].blockSignals(True)
+                self.ControlWidgets["SystemMode"].setCurrentText(self.SystemMode)
+                self.ControlWidgets["SystemMode"].blockSignals(False)
+                return
 
         if Requested == "HARD":
             Answer = QtWidgets.QMessageBox.question(

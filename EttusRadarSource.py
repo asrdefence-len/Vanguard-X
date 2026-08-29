@@ -115,6 +115,9 @@ class EttusRadarSource:
         self.RfOutputAcknowledged = bool(
             Config.get("EttusRfOutputAcknowledged", False)
         )
+        self.SdrBenchMode = bool(
+            Config.get("EttusSdrBenchMode", False)
+        )
         self.LoopbackConfirmed = bool(
             Config.get("EttusLoopbackConfirmed", False)
         )
@@ -129,20 +132,26 @@ class EttusRadarSource:
                 raise RuntimeError(
                     "Timed TX/RX requires explicit RF-output acknowledgement"
                 )
-            if not self.LoopbackConfirmed:
-                raise RuntimeError(
-                    "Stage 3E1 timed TX/RX requires confirmation of the "
-                    "TX/RX-to-attenuator-to-RX2 loopback"
-                )
-            if (
-                self.ExternalAttenuationDb
-                < self.MinimumLoopbackAttenuationDb
-            ):
-                raise RuntimeError(
-                    "Stage 3E1 timed TX/RX requires at least "
-                    f"{self.MinimumLoopbackAttenuationDb:.1f} dB "
-                    "external attenuation"
-                )
+
+            # Bench mode intentionally exercises the real Ettus and ATR with
+            # the TRM/PA disconnected. It must not pretend an attenuated RF
+            # loopback exists. The ATR-specific physical-disconnect and CRO
+            # acknowledgements are enforced separately below.
+            if not self.SdrBenchMode:
+                if not self.LoopbackConfirmed:
+                    raise RuntimeError(
+                        "Timed TX/RX loopback mode requires confirmation of the "
+                        "TX/RX-to-attenuator-to-RX2 loopback"
+                    )
+                if (
+                    self.ExternalAttenuationDb
+                    < self.MinimumLoopbackAttenuationDb
+                ):
+                    raise RuntimeError(
+                        "Timed TX/RX loopback mode requires at least "
+                        f"{self.MinimumLoopbackAttenuationDb:.1f} dB "
+                        "external attenuation"
+                    )
 
         self.Usrp = None
         self.RxStreamer = None
@@ -321,7 +330,7 @@ class EttusRadarSource:
                 )
             if not self.TrmPaDisconnectedConfirmed:
                 raise RuntimeError(
-                    "Stage 3H ATR loopback requires TRM and PA disconnected"
+                    "ATR-enabled timed TX/RX requires TRM and PA disconnected"
                 )
             if (
                 self.GpioBank != "FP0"
@@ -854,6 +863,7 @@ class EttusRadarSource:
             "CommandLeadTimeAppliedOncePerDwell": True,
             "TimedTransmitEnabled": bool(self.TimedTransmitEnabled),
             "RfOutputAcknowledged": bool(self.RfOutputAcknowledged),
+            "SdrBenchMode": bool(self.SdrBenchMode),
             "LoopbackConfirmed": bool(self.LoopbackConfirmed),
             "ExternalAttenuationDb": float(self.ExternalAttenuationDb),
             "RfTargetEmulatorEnabled": bool(

@@ -164,16 +164,17 @@ def ParseUiArguments(CommandLineArguments=None):
     return Options, Filtered
 
 def ParseSystemModeArguments(CommandLineArguments=None):
-    """Remove the top-level SIM/HARD/RF LOOPBACK selection."""
+    """Remove the top-level SIM/SDR/HARD/RF LOOPBACK selection."""
 
     Arguments = list(
         sys.argv[1:] if CommandLineArguments is None else CommandLineArguments
     )
     SimSelected = "--system-sim" in Arguments
+    SdrSelected = "--system-sdr" in Arguments
     HardSelected = "--system-hard" in Arguments
     LoopbackSelected = "--system-rf-loopback" in Arguments
     LoopbackSafetyConfirmed = "--i-confirm-rf-loopback-safety" in Arguments
-    if sum((SimSelected, HardSelected, LoopbackSelected)) > 1:
+    if sum((SimSelected, SdrSelected, HardSelected, LoopbackSelected)) > 1:
         raise ValueError("Select only one system mode")
     if LoopbackSelected and not LoopbackSafetyConfirmed:
         raise ValueError(
@@ -182,12 +183,15 @@ def ParseSystemModeArguments(CommandLineArguments=None):
     Filtered = [
         Argument for Argument in Arguments
         if Argument not in (
-            "--system-sim", "--system-hard", "--system-rf-loopback",
+            "--system-sim", "--system-sdr", "--system-hard",
+            "--system-rf-loopback",
             "--i-confirm-rf-loopback-safety",
         )
     ]
     if LoopbackSelected:
         return "RF LOOPBACK", Filtered
+    if SdrSelected:
+        return "SDR", Filtered
     return ("HARD" if HardSelected else "SIM"), Filtered
 
 def BuildRadarParamsForScenario(Config, NavigationPose=None):
@@ -1423,9 +1427,10 @@ def Main(CommandLineArguments=None):
         OperatingArguments,
     )
 
-    # The top-bar selector owns the complete adapter pairing.  HARD is
-    # deliberately receive-only: it may move the X6-60, but never enables RF
-    # transmission.  SIM never opens Ettus or SocketCAN.
+    # The top-bar selector owns the complete adapter pairing. SDR is the
+    # real-Ettus bench mode with timed TX/RX and ATR, but no operational
+    # X6-60 motion. HARD remains receive-only RF with operational X6-60.
+    # SIM never opens Ettus or SocketCAN.
     if SystemMode == "RF LOOPBACK":
         Config.update({
             "RadarSource": "ETTUS",
@@ -1459,11 +1464,34 @@ def Main(CommandLineArguments=None):
             "X660MotionEnabled": False,
         })
         OperatingProfile = "GUI_ATR_ISOLATED_LOOPBACK"
+    elif SystemMode == "SDR":
+        # Bench mode: real Ettus and normal timed TX/RX/ATR behaviour,
+        # with no operational X6-60 motion and no RF loopback requirement.
+        Config["RadarSource"] = "ETTUS"
+        Config["EttusOperatingMode"] = "TIMED_TX_RX"
+        Config["EttusTimedTransmitEnabled"] = True
+        Config["EttusSdrBenchMode"] = True
+        Config["EttusRfOutputAcknowledged"] = True
+        Config["EttusAtrGpioEnabled"] = True
+        Config["EttusAtrCroVerifiedAcknowledged"] = True
+        Config["EttusTrmPaDisconnectedConfirmed"] = True
+        Config["EttusAtrIsolationRequired"] = False
+        Config["EttusLoopbackConfirmed"] = False
+        Config["EttusExternalAttenuationDb"] = 0.0
+        Config["InitialTransmitEnabled"] = False
+        Config["X660Mode"] = "x660-sim"
+        Config["X660MotionEnabled"] = False
+        print("SDR BENCH MODE SELECTED")
+        print("  Ettus:        ENABLED")
+        print("  Timed TX/RX:  ENABLED")
+        print("  ATR GPIO:     ENABLED")
+        print("  X6-60:        DISABLED (simulated adapter)")
+        print("  TRM / PA:     MAY REMAIN DISCONNECTED FOR CRO TESTING")
     elif SystemMode == "HARD":
         Config["RadarSource"] = "ETTUS"
         Config["EttusOperatingMode"] = "RECEIVE_ONLY"
         Config["EttusTimedTransmitEnabled"] = False
-        Config["EttusAtrGpioEnabled"] = False
+        Config["EttusAtrGpioEnabled"] = True
         Config["EttusAtrIsolationRequired"] = False
         Config["InitialTransmitEnabled"] = False
         Config["X660Mode"] = "x660-operational"
@@ -1861,7 +1889,7 @@ def Main(CommandLineArguments=None):
                             str(ControlState.get("DisplayMode", "STOP")) == "STOP"
                             and not ControlState.get("ScanEnabled", False)
                         )
-                        if RequestedMode not in ("SIM", "HARD", "RF LOOPBACK"):
+                        if RequestedMode not in ("SIM", "SDR", "HARD", "RF LOOPBACK"):
                             if hasattr(Display, "SetSystemModeApplicationResult"):
                                 Display.SetSystemModeApplicationResult(
                                     False, "Invalid mode"
@@ -2841,6 +2869,8 @@ def Main(CommandLineArguments=None):
 
     if RestartSystemMode is not None:
         ModeArgument = {
+            "SIM": "--system-sim",
+            "SDR": "--system-sdr",
             "HARD": "--system-hard",
             "RF LOOPBACK": "--system-rf-loopback",
         }.get(RestartSystemMode, "--system-sim")
