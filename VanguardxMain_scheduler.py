@@ -83,6 +83,11 @@ from SimpleDisplay import SimpleDisplay
 from RadarRemoteDisplay import RadarRemoteDisplay
 from DataLogger import DataLogger
 from EttusRadarSource import EttusRadarSource
+
+try:
+    from TRMInterface import TRMInterface
+except Exception:
+    TRMInterface = None
 from EttusOperatingProfiles import (
     ApplyOperatingProfile,
     ApplyX660OperatingProfile,
@@ -91,6 +96,7 @@ from EttusOperatingProfiles import (
 import os
 import sys
 import time
+import numpy as np
 
 try:
     from ReadIMU import IMUReader
@@ -496,6 +502,79 @@ def InitialiseX660AtCurrentPose(X660, Config, Display=None):
 
 
 
+def AddAdcUtilisationDiagnostics(
+    Raw,
+    Diagnostics,
+    clip_threshold=0.98,
+    spectrum_enabled=True,
+    spectrum_points=512,
+    spectrum_maximum_input_samples=65536,
+    sample_rate_hz=40.0e6,
+):
+    """Add dBFS/headroom/clipping metrics from the actual returned IQ.
+
+    Ettus fc32/sc16 samples are delivered to the application as normalized
+    complex values.  Full scale is therefore represented by a component
+    magnitude of 1.0.  The clipping count intentionally tests I and Q
+    components separately because ADC clipping occurs on those converters,
+    not on complex vector magnitude.
+    """
+    try:
+        iq = np.asarray(Raw.IQ)
+        if iq.size == 0:
+            return
+        i = np.asarray(np.real(iq), dtype=np.float64)
+        q = np.asarray(np.imag(iq), dtype=np.float64)
+        finite = np.isfinite(i) & np.isfinite(q)
+        if not np.any(finite):
+            return
+        i = i[finite]
+        q = q[finite]
+        peak = float(max(np.max(np.abs(i)), np.max(np.abs(q))))
+        rms = float(np.sqrt(np.mean((i * i + q * q) / 2.0)))
+        tiny = 1.0e-15
+        peak_dbfs = 20.0 * np.log10(max(peak, tiny))
+        rms_dbfs = 20.0 * np.log10(max(rms, tiny))
+        clipped = (np.abs(i) >= float(clip_threshold)) | (
+            np.abs(q) >= float(clip_threshold)
+        )
+        clipped_count = int(np.count_nonzero(clipped))
+        Diagnostics["AdcPeakDbfs"] = float(peak_dbfs)
+        Diagnostics["AdcRmsDbfs"] = float(rms_dbfs)
+        Diagnostics["AdcHeadroomDb"] = float(max(0.0, -peak_dbfs))
+        Diagnostics["AdcClippedSamples"] = clipped_count
+        Diagnostics["AdcClipFraction"] = float(clipped_count / clipped.size)
+        Diagnostics["AdcMeanI"] = float(np.mean(i))
+        Diagnostics["AdcMeanQ"] = float(np.mean(q))
+        Diagnostics["AdcClipThreshold"] = float(clip_threshold)
+        Diagnostics["AdcSampleCount"] = int(i.size)
+
+        # Bounded engineering spectrum for the RF tab. This is diagnostic
+        # only and is deliberately decimated to a small fixed-size vector so
+        # it cannot reshape the radar processing or remote-display contract.
+        if spectrum_enabled:
+            flat_iq = np.asarray(iq).reshape(-1)
+            flat_iq = flat_iq[np.isfinite(np.real(flat_iq)) & np.isfinite(np.imag(flat_iq))]
+            maximum_samples = max(64, int(spectrum_maximum_input_samples))
+            if flat_iq.size > maximum_samples:
+                flat_iq = flat_iq[:maximum_samples]
+            if flat_iq.size >= 64:
+                nfft = 1
+                target = min(flat_iq.size, max(64, int(spectrum_points)))
+                while nfft * 2 <= target:
+                    nfft *= 2
+                block = flat_iq[:nfft].astype(np.complex128, copy=False)
+                window = np.hanning(nfft)
+                coherent_gain = max(np.mean(window), 1.0e-12)
+                spectrum = np.fft.fftshift(np.fft.fft(block * window)) / (nfft * coherent_gain)
+                spectrum_dbfs = 20.0 * np.log10(np.maximum(np.abs(spectrum), 1.0e-15))
+                frequency_mhz = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / float(sample_rate_hz))) / 1.0e6
+                Diagnostics["RfSpectrumFrequencyMHz"] = frequency_mhz.tolist()
+                Diagnostics["RfSpectrumDbfs"] = spectrum_dbfs.tolist()
+    except Exception as exc:
+        Diagnostics["AdcDiagnosticsError"] = str(exc)
+
+
 def ExecuteRadarDwell(
     Config,
     ScheduledTask,
@@ -578,6 +657,26 @@ def ExecuteRadarDwell(
     ThisDwell.Metadata["PointingControlOwner"] = "PointingManager"
 
     Processed = Processor.Process(Raw, ThisDwell)
+    AddAdcUtilisationDiagnostics(
+        Raw,
+        Processed.Diagnostics,
+        clip_threshold=float(Config.get("AdcClipThreshold", 0.98)),
+        spectrum_enabled=bool(Config.get("RfSpectrumEnabled", True)),
+        spectrum_points=int(Config.get("RfSpectrumPoints", 512)),
+        spectrum_maximum_input_samples=int(
+            Config.get("RfSpectrumMaximumInputSamples", 65536)
+        ),
+        sample_rate_hz=float(Config.get("EttusSampleRateHz", 40.0e6)),
+    )
+    # Temperature is populated by the STM32/TRM telemetry path when available.
+    # Do not infer or synthesize a temperature from ADC IQ data.
+    if Config.get("TrmTemperatureC") is not None:
+        Processed.Diagnostics["TrmTemperatureC"] = float(
+            Config["TrmTemperatureC"]
+        )
+        Processed.Diagnostics["TrmTemperatureSource"] = str(
+            Config.get("TrmTemperatureSource", "STM32 A1")
+        )
     T2 = time.perf_counter()
 
     # Use the same timestamped true-bearing snapshot that RadarExecutor used
@@ -1130,6 +1229,27 @@ def Main(CommandLineArguments=None):
 
         # Receiver / simulation noise
         "NoisePowerW": 1e-13,
+        # RF engineering-tab defaults.  Stage 1 monitors returned ADC/IQ
+        # utilisation; TRM attenuation writes are connected in the next stage.
+        "RfTestMode": "RADAR_TX_RX",
+        "RfTxAttenuationDb": 31.5,
+        "RfRxAttenuationDb": 0.0,
+        "AdcClipThreshold": 0.98,
+        "RfSpectrumEnabled": True,
+        "RfSpectrumPoints": 512,
+        "RfSpectrumMaximumInputSamples": 65536,
+        "RfHistorySeconds": 20.0,
+        # Temperature is measured on the STM32 A1 input. Main publishes
+        # TrmTemperatureC when the STM32/TRM interface reports a calibrated
+        # value; until then the RF tab displays N/A rather than inventing one.
+        "TrmTemperatureMonitoringEnabled": True,
+        # Slow-control STM32/TRM serial link. RF-tab programming is allowed
+        # only in stopped SDR commissioning mode and is verified by STATUS
+        # readback before the setting is reported as applied.
+        "TrmControlPort": "/dev/ttyACM0",
+        "TrmControlBaudrate": 115200,
+        "TrmControlTimeoutSec": 0.25,
+        "TrmControlDebug": False,
 
         # Detection
         "ThresholdDb": -80.0,
@@ -1813,6 +1933,8 @@ def Main(CommandLineArguments=None):
 
     LastAppliedTimingRevision = -1
     LastSystemModeRevision = 0
+    LastRfControlRevision = 0
+    TrmControl = None
     RestartSystemMode = None
     InitialControlState = (
         Display.GetControlState()
@@ -1877,6 +1999,113 @@ def Main(CommandLineArguments=None):
                 )
 
                 if ControlState is not None:
+                    RequestedRfRevision = int(
+                        ControlState.get("RfControlRevision", 0)
+                    )
+                    if RequestedRfRevision != LastRfControlRevision:
+                        LastRfControlRevision = RequestedRfRevision
+                        Config["RfTestMode"] = str(
+                            ControlState.get("RfTestMode", "RADAR_TX_RX")
+                        ).upper()
+                        RequestedTxAttDb = float(
+                            ControlState.get("RfTxAttenuationDb", 31.5)
+                        )
+                        RequestedRxAttDb = float(
+                            ControlState.get("RfRxAttenuationDb", 0.0)
+                        )
+                        IsStoppedForTrm = bool(
+                            str(ControlState.get("DisplayMode", "STOP")).upper() == "STOP"
+                            and not bool(ControlState.get("ScanEnabled", False))
+                            and not bool(ControlState.get("TransmitEnabled", False))
+                        )
+
+                        Applied = False
+                        ReadbackWord = None
+                        if SystemMode != "SDR":
+                            Message = (
+                                "TRM programming is enabled only in SDR commissioning mode"
+                            )
+                        elif not IsStoppedForTrm:
+                            Message = (
+                                "Stop radar and ensure TX is off before programming TRM"
+                            )
+                        elif TRMInterface is None:
+                            Message = "TRMInterface.py could not be imported"
+                        else:
+                            try:
+                                if TrmControl is None:
+                                    TrmControl = TRMInterface(
+                                        port=str(Config.get(
+                                            "TrmControlPort", "/dev/ttyACM0"
+                                        )),
+                                        baudrate=int(Config.get(
+                                            "TrmControlBaudrate", 115200
+                                        )),
+                                        timeout_s=float(Config.get(
+                                            "TrmControlTimeoutSec", 0.25
+                                        )),
+                                        debug=bool(Config.get(
+                                            "TrmControlDebug", False
+                                        )),
+                                    )
+                                    TrmControl.open()
+                                    TrmControl.ping()
+
+                                ExpectedWord = TRMInterface.build_word(
+                                    rx_att_db=RequestedRxAttDb,
+                                    tx_att_db=RequestedTxAttDb,
+                                    rx_path_enabled=True,
+                                    tx_path_enabled=True,
+                                )
+                                TrmControl.configure(
+                                    rx_att_db=RequestedRxAttDb,
+                                    tx_att_db=RequestedTxAttDb,
+                                    force=False,
+                                )
+                                Status = TrmControl.get_status()
+                                ReadbackWord = int(Status.word)
+                                if ReadbackWord != ExpectedWord:
+                                    raise RuntimeError(
+                                        "TRM readback mismatch: "
+                                        f"expected 0x{ExpectedWord:07X}, "
+                                        f"received 0x{ReadbackWord:07X}"
+                                    )
+
+                                Config["RfTxAttenuationDb"] = RequestedTxAttDb
+                                Config["RfRxAttenuationDb"] = RequestedRxAttDb
+                                Config["TrmControlWord"] = ReadbackWord
+                                Applied = True
+                                Message = (
+                                    f"TRM verified: TX {RequestedTxAttDb:.1f} dB, "
+                                    f"RX {RequestedRxAttDb:.1f} dB, "
+                                    f"WORD 0x{ReadbackWord:07X}"
+                                )
+                                if Config["RfTestMode"] != "RADAR_TX_RX":
+                                    Message += "; selected RF test mode remains staged"
+                            except Exception as exc:
+                                Message = f"TRM programming failed: {exc}"
+                                try:
+                                    if TrmControl is not None:
+                                        TrmControl.close()
+                                except Exception:
+                                    pass
+                                TrmControl = None
+
+                        print(
+                            "RF engineering request: "
+                            f"mode={Config['RfTestMode']}, "
+                            f"TXatt={RequestedTxAttDb:.1f} dB, "
+                            f"RXatt={RequestedRxAttDb:.1f} dB -> {Message}"
+                        )
+                        if hasattr(Display, "SetRfApplicationResult"):
+                            Display.SetRfApplicationResult(Applied, Message)
+                        if hasattr(Display, "SetTrmHardwareStatus"):
+                            Display.SetTrmHardwareStatus(
+                                Applied,
+                                ReadbackWord,
+                                "verified" if Applied else Message,
+                            )
+
                     RequestedModeRevision = int(
                         ControlState.get("SystemModeRevision", 0)
                     )
@@ -2849,6 +3078,12 @@ def Main(CommandLineArguments=None):
 
         try:
             Logger.close()
+        except Exception:
+            pass
+
+        try:
+            if TrmControl is not None:
+                TrmControl.close()
         except Exception:
             pass
 

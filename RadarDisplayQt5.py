@@ -105,6 +105,35 @@ class RadarDisplay:
         self.RequestedSystemMode = self.SystemMode
         self.SystemModeRevision = 0
 
+        # RF engineering/commissioning controls.  Stage 1 provides the GUI
+        # contract and live ADC utilisation diagnostics.  The attenuation
+        # requests are intentionally not written to the TRM until the existing
+        # STM32/TRM controller is connected to this control-state boundary.
+        self.RfTestMode = str(Config.get("RfTestMode", "RADAR_TX_RX")).upper()
+        self.RfTxAttenuationDb = float(Config.get("RfTxAttenuationDb", 31.5))
+        self.RfRxAttenuationDb = float(Config.get("RfRxAttenuationDb", 0.0))
+        self.RfControlRevision = 0
+        self.RfApplicationMessage = "Monitor ready"
+        self.RfAdcPeakDbfs = None
+        self.RfAdcRmsDbfs = None
+        self.RfAdcHeadroomDb = None
+        self.RfAdcClippedSamples = 0
+        self.RfAdcClipFraction = 0.0
+        self.RfAdcMeanI = 0.0
+        self.RfAdcMeanQ = 0.0
+        self.RfTrmTemperatureC = None
+        self.RfTemperatureSource = "STM32 A1 / not reported"
+        self.RfTrmConnected = False
+        self.RfTrmReadbackWord = None
+        self.RfTrmHardwareMessage = "Not connected"
+        self.RfHistorySeconds = float(Config.get("RfHistorySeconds", 20.0))
+        self.RfHistoryTimes = []
+        self.RfHistoryPeakDbfs = []
+        self.RfHistoryRmsDbfs = []
+        self.RfLastHistoryTimeSec = None
+        self.RfSpectrumFrequencyMHz = np.asarray([], dtype=float)
+        self.RfSpectrumDbfs = np.asarray([], dtype=float)
+
         self.BeamAngleDeg = float(Config.get("InitialBeamAngleDeg", 0.0))
         self.ManualBeamStepDeg = float(Config.get("ManualBeamStepDeg", 2.0))
 
@@ -427,6 +456,18 @@ class RadarDisplay:
         self.TimingFeedbackLabel = None
         self.TimingSummaryLabel = None
         self.MissionPage = None
+        self.RfPage = None
+        self.RfStatusLabel = None
+        self.RfAdcLevelBar = None
+        self.RfDynamicRangeLabel = None
+        self.RfTemperatureLabel = None
+        self.RfHistoryPlot = None
+        self.RfHistoryPeakCurve = None
+        self.RfHistoryRmsCurve = None
+        self.RfSpectrumPlot = None
+        self.RfSpectrumCurve = None
+        self.RfFeedbackLabel = None
+        self.RfControlWidgets = {}
         self.OperatorHeaderModeLabel = None
         self.OperatorHeaderTxLabel = None
         self.OperatorHeaderAntennaLabel = None
@@ -480,6 +521,7 @@ class RadarDisplay:
         )
         self.UpdateNavigationFromDiagnostics(Diagnostics)
         self.UpdateDisplayedSectorFromDiagnostics(Diagnostics)
+        self.UpdateRfDiagnostics(Diagnostics)
 
         if self.ShowRawDetections:
             self.AppendPolarDetections(Detections)
@@ -548,6 +590,10 @@ class RadarDisplay:
             "TrackConfirmAzimuthDeg": self.TrackConfirmAzimuthDeg,
             "TrackConfirmSource": self.TrackConfirmSource,
             "TrackConfirmWasTentative": self.TrackConfirmWasTentative,
+            "RfTestMode": self.RfTestMode,
+            "RfTxAttenuationDb": self.RfTxAttenuationDb,
+            "RfRxAttenuationDb": self.RfRxAttenuationDb,
+            "RfControlRevision": self.RfControlRevision,
         }
         if self.MissionPage is not None:
             state.update(self.MissionPage.GetMissionControlState())
@@ -827,6 +873,8 @@ class RadarDisplay:
         self.MissionPage = MissionPage(self.Config)
         self.MissionPage.statusChanged.connect(self.UpdatePersistentOperatorHeader)
         self.OperatorTabs.addTab(self.MissionPage, "Mission")
+        self.RfPage = self.CreateRfPage()
+        self.OperatorTabs.addTab(self.RfPage, "RF")
         RootLayout.addWidget(self.OperatorTabs, stretch=1)
         self.Window.setCentralWidget(RootWidget)
 
@@ -1182,6 +1230,362 @@ class RadarDisplay:
         self.UpdateTimingSummary()
 
         return Box
+
+    def CreateRfPage(self):
+        """Create the RF engineering/commissioning page.
+
+        Stage 2 keeps hardware-changing requests explicit while adding live
+        receiver dynamic-range history, a bounded baseband spectrum display,
+        estimated TRM gain/power readouts, and a temperature field for the
+        STM32 A1 monitor path. Temperature remains N/A until Main publishes a
+        calibrated ``TrmTemperatureC`` diagnostic.
+        """
+        Page = QtWidgets.QWidget()
+        Layout = QtWidgets.QVBoxLayout(Page)
+        Layout.setContentsMargins(12, 12, 12, 12)
+        Layout.setSpacing(10)
+
+        Controls = QtWidgets.QGroupBox("RF engineering controls")
+        Grid = QtWidgets.QGridLayout(Controls)
+
+        Grid.addWidget(QtWidgets.QLabel("Test mode"), 0, 0)
+        Mode = QtWidgets.QComboBox()
+        Mode.addItem("Radar timed TX/RX", "RADAR_TX_RX")
+        Mode.addItem("Receive only", "RX_ONLY")
+        Mode.addItem("Transmit only", "TX_ONLY")
+        Mode.addItem("Continuous RX noise monitor", "CONTINUOUS_RX")
+        index = max(0, Mode.findData(self.RfTestMode))
+        Mode.setCurrentIndex(index)
+        Grid.addWidget(Mode, 0, 1, 1, 2)
+        self.RfControlWidgets["Mode"] = Mode
+
+        Grid.addWidget(QtWidgets.QLabel("TRM TX attenuation"), 1, 0)
+        TxAtt = QtWidgets.QDoubleSpinBox()
+        TxAtt.setRange(0.0, 31.5)
+        TxAtt.setDecimals(1)
+        TxAtt.setSingleStep(0.5)
+        TxAtt.setSuffix(" dB")
+        TxAtt.setValue(self.RfTxAttenuationDb)
+        Grid.addWidget(TxAtt, 1, 1)
+        self.RfControlWidgets["TxAttenuationDb"] = TxAtt
+        self.RfTxEstimateLabel = QtWidgets.QLabel()
+        Grid.addWidget(self.RfTxEstimateLabel, 1, 2)
+
+        Grid.addWidget(QtWidgets.QLabel("TRM RX attenuation"), 2, 0)
+        RxAtt = QtWidgets.QDoubleSpinBox()
+        RxAtt.setRange(0.0, 31.5)
+        RxAtt.setDecimals(1)
+        RxAtt.setSingleStep(0.5)
+        RxAtt.setSuffix(" dB")
+        RxAtt.setValue(self.RfRxAttenuationDb)
+        Grid.addWidget(RxAtt, 2, 1)
+        self.RfControlWidgets["RxAttenuationDb"] = RxAtt
+        self.RfRxEstimateLabel = QtWidgets.QLabel()
+        Grid.addWidget(self.RfRxEstimateLabel, 2, 2)
+
+        TxAtt.valueChanged.connect(self.UpdateRfEngineeringEstimates)
+        RxAtt.valueChanged.connect(self.UpdateRfEngineeringEstimates)
+
+        ApplyButton = QtWidgets.QPushButton("Apply TRM settings")
+        ApplyButton.clicked.connect(self.OnRfApply)
+        Grid.addWidget(ApplyButton, 3, 0, 1, 2)
+        self.RfFeedbackLabel = QtWidgets.QLabel(self.RfApplicationMessage)
+        self.RfFeedbackLabel.setStyleSheet("color: #bfbfbf;")
+        Grid.addWidget(self.RfFeedbackLabel, 3, 2, 1, 2)
+
+        Grid.addWidget(QtWidgets.QLabel("TRM hardware"), 4, 0)
+        self.RfTrmHardwareLabel = QtWidgets.QLabel("Not connected")
+        self.RfTrmHardwareLabel.setStyleSheet(
+            "color: #bfbfbf; font-family: Menlo, Consolas, monospace;"
+        )
+        Grid.addWidget(self.RfTrmHardwareLabel, 4, 1, 1, 3)
+
+        Note = QtWidgets.QLabel(
+            "ADC monitoring, history and spectrum are live. In SDR commissioning "
+            "mode, Apply TRM settings programs and reads back the STM32/TRM "
+            "28-bit control word. Special RF test-mode execution remains staged; "
+            "temperature is shown when STM32 A1 telemetry is published by Main."
+        )
+        Note.setWordWrap(True)
+        Note.setStyleSheet("color: #bfbfbf;")
+        Grid.addWidget(Note, 5, 0, 1, 4)
+        Layout.addWidget(Controls)
+
+        Summary = QtWidgets.QWidget()
+        SummaryLayout = QtWidgets.QHBoxLayout(Summary)
+        SummaryLayout.setContentsMargins(0, 0, 0, 0)
+        SummaryLayout.setSpacing(10)
+
+        AdcBox = QtWidgets.QGroupBox("Receiver dynamic range")
+        AdcLayout = QtWidgets.QVBoxLayout(AdcBox)
+        self.RfStatusLabel = QtWidgets.QLabel()
+        self.RfStatusLabel.setStyleSheet(
+            "background-color: #050505; border: 1px solid #303030; "
+            "font-family: Menlo, Consolas, monospace; font-size: 13px; padding: 9px;"
+        )
+        self.RfStatusLabel.setMinimumHeight(170)
+        self.RfStatusLabel.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop
+        )
+        AdcLayout.addWidget(self.RfStatusLabel)
+
+        self.RfAdcLevelBar = QtWidgets.QProgressBar()
+        self.RfAdcLevelBar.setRange(0, 1000)
+        self.RfAdcLevelBar.setFormat("Peak ADC amplitude %p% of full scale")
+        self.RfAdcLevelBar.setValue(0)
+        AdcLayout.addWidget(self.RfAdcLevelBar)
+
+        self.RfDynamicRangeLabel = QtWidgets.QLabel()
+        self.RfDynamicRangeLabel.setWordWrap(True)
+        self.RfDynamicRangeLabel.setStyleSheet("color: #bfbfbf;")
+        AdcLayout.addWidget(self.RfDynamicRangeLabel)
+        SummaryLayout.addWidget(AdcBox, stretch=2)
+
+        TempBox = QtWidgets.QGroupBox("TRM temperature")
+        TempLayout = QtWidgets.QVBoxLayout(TempBox)
+        self.RfTemperatureLabel = QtWidgets.QLabel()
+        self.RfTemperatureLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.RfTemperatureLabel.setMinimumHeight(120)
+        self.RfTemperatureLabel.setStyleSheet(
+            "background-color: #050505; border: 1px solid #303030; "
+            "font-family: Menlo, Consolas, monospace; font-size: 16px; padding: 12px;"
+        )
+        TempLayout.addWidget(self.RfTemperatureLabel)
+        TempNote = QtWidgets.QLabel(
+            "Source: TRM temperature monitor -> STM32 A1. "
+            "The TRM specification references TMP36 temperature reporting. "
+            "+65 C is the specified maximum housing operating temperature; "
+            "+80 C is the PA baseplate shutoff reference."
+        )
+        TempNote.setWordWrap(True)
+        TempNote.setStyleSheet("color: #bfbfbf;")
+        TempLayout.addWidget(TempNote)
+        SummaryLayout.addWidget(TempBox, stretch=1)
+        Layout.addWidget(Summary)
+
+        PlotRow = QtWidgets.QWidget()
+        PlotLayout = QtWidgets.QHBoxLayout(PlotRow)
+        PlotLayout.setContentsMargins(0, 0, 0, 0)
+        PlotLayout.setSpacing(10)
+
+        self.RfHistoryPlot = pg.PlotWidget()
+        self.RfHistoryPlot.setBackground(self.PanelColour)
+        self.RfHistoryPlot.showGrid(x=True, y=True, alpha=0.25)
+        self.RfHistoryPlot.setLabel("bottom", "History", units="s", color=self.TextColour)
+        self.RfHistoryPlot.setLabel("left", "Level", units="dBFS", color=self.TextColour)
+        self.RfHistoryPlot.setYRange(-100.0, 0.0, padding=0.0)
+        self.RfHistoryPlot.setXRange(-self.RfHistorySeconds, 0.0, padding=0.0)
+        self.RfHistoryPlot.setTitle("ADC peak / RMS history", color=self.TextColour)
+        self.ApplyTacticalPlotTheme(self.RfHistoryPlot)
+        self.RfHistoryPeakCurve = self.RfHistoryPlot.plot([], [], pen=pg.mkPen("w", width=2), name="Peak")
+        self.RfHistoryRmsCurve = self.RfHistoryPlot.plot([], [], pen=pg.mkPen(self.TraceColour, width=1), name="RMS")
+        PlotLayout.addWidget(self.RfHistoryPlot, stretch=1)
+
+        self.RfSpectrumPlot = pg.PlotWidget()
+        self.RfSpectrumPlot.setBackground(self.PanelColour)
+        self.RfSpectrumPlot.showGrid(x=True, y=True, alpha=0.25)
+        self.RfSpectrumPlot.setLabel("bottom", "Baseband frequency", units="MHz", color=self.TextColour)
+        self.RfSpectrumPlot.setLabel("left", "Relative level", units="dBFS", color=self.TextColour)
+        self.RfSpectrumPlot.setYRange(-140.0, 5.0, padding=0.0)
+        self.RfSpectrumPlot.setTitle("Live receive spectrum", color=self.TextColour)
+        self.ApplyTacticalPlotTheme(self.RfSpectrumPlot)
+        self.RfSpectrumCurve = self.RfSpectrumPlot.plot([], [], pen=pg.mkPen(self.TraceColour, width=1))
+        PlotLayout.addWidget(self.RfSpectrumPlot, stretch=1)
+        Layout.addWidget(PlotRow, stretch=1)
+
+        self.UpdateRfEngineeringEstimates()
+        self.UpdateRfDiagnostics({})
+        return Page
+
+    def UpdateRfEngineeringEstimates(self, *_args):
+        """Update derived values from the Shinewave nominal specification."""
+        tx_att = float(self.RfControlWidgets.get("TxAttenuationDb").value()) if self.RfControlWidgets.get("TxAttenuationDb") else self.RfTxAttenuationDb
+        rx_att = float(self.RfControlWidgets.get("RxAttenuationDb").value()) if self.RfControlWidgets.get("RxAttenuationDb") else self.RfRxAttenuationDb
+        # TRM nominal peak output is 47 dBm at 0 dB TX attenuation.
+        tx_dbm = 47.0 - tx_att
+        tx_w = 10.0 ** ((tx_dbm - 30.0) / 10.0)
+        # TRM nominal receive gain is 50 dB before programmable attenuation.
+        rx_gain_db = 50.0 - rx_att
+        if getattr(self, "RfTxEstimateLabel", None) is not None:
+            self.RfTxEstimateLabel.setText(
+                f"Nominal peak: {tx_dbm:.1f} dBm / {tx_w:.2f} W"
+            )
+        if getattr(self, "RfRxEstimateLabel", None) is not None:
+            self.RfRxEstimateLabel.setText(
+                f"Nominal TRM gain: {rx_gain_db:.1f} dB"
+            )
+
+    def OnRfApply(self):
+        """Publish an RF engineering request for Main to consume safely."""
+        self.RfTestMode = str(
+            self.RfControlWidgets["Mode"].currentData()
+        ).upper()
+        self.RfTxAttenuationDb = float(
+            self.RfControlWidgets["TxAttenuationDb"].value()
+        )
+        self.RfRxAttenuationDb = float(
+            self.RfControlWidgets["RxAttenuationDb"].value()
+        )
+        self.RfControlRevision += 1
+        self.RfApplicationMessage = "TRM programming request pending"
+        if self.RfFeedbackLabel is not None:
+            self.RfFeedbackLabel.setStyleSheet("color: #ffcc00;")
+            self.RfFeedbackLabel.setText(self.RfApplicationMessage)
+
+    def SetRfApplicationResult(self, Applied, Message):
+        self.RfApplicationMessage = str(Message)
+        if self.RfFeedbackLabel is not None:
+            self.RfFeedbackLabel.setStyleSheet(
+                "color: #00ff66;" if Applied else "color: #ff6666;"
+            )
+            self.RfFeedbackLabel.setText(self.RfApplicationMessage)
+
+    def SetTrmHardwareStatus(self, Connected, Word=None, Message=""):
+        """Show STM32/TRM programming/readback state on the RF page."""
+        self.RfTrmConnected = bool(Connected)
+        self.RfTrmReadbackWord = None if Word is None else int(Word)
+        self.RfTrmHardwareMessage = str(Message)
+        if getattr(self, "RfTrmHardwareLabel", None) is None:
+            return
+        if self.RfTrmConnected:
+            word_text = (
+                "---" if self.RfTrmReadbackWord is None
+                else f"0x{self.RfTrmReadbackWord:07X}"
+            )
+            self.RfTrmHardwareLabel.setStyleSheet(
+                "color: #00ff66; font-family: Menlo, Consolas, monospace;"
+            )
+            self.RfTrmHardwareLabel.setText(
+                f"CONNECTED | WORD {word_text} | {self.RfTrmHardwareMessage}"
+            )
+        else:
+            self.RfTrmHardwareLabel.setStyleSheet(
+                "color: #ff6666; font-family: Menlo, Consolas, monospace;"
+            )
+            self.RfTrmHardwareLabel.setText(
+                f"NOT CONNECTED | {self.RfTrmHardwareMessage}"
+            )
+
+    def UpdateRfDiagnostics(self, Diagnostics):
+        """Update RF engineering displays from dwell-synchronous diagnostics."""
+        if Diagnostics:
+            self.RfAdcPeakDbfs = Diagnostics.get("AdcPeakDbfs", self.RfAdcPeakDbfs)
+            self.RfAdcRmsDbfs = Diagnostics.get("AdcRmsDbfs", self.RfAdcRmsDbfs)
+            self.RfAdcHeadroomDb = Diagnostics.get("AdcHeadroomDb", self.RfAdcHeadroomDb)
+            self.RfAdcClippedSamples = int(Diagnostics.get("AdcClippedSamples", self.RfAdcClippedSamples))
+            self.RfAdcClipFraction = float(Diagnostics.get("AdcClipFraction", self.RfAdcClipFraction))
+            self.RfAdcMeanI = float(Diagnostics.get("AdcMeanI", self.RfAdcMeanI))
+            self.RfAdcMeanQ = float(Diagnostics.get("AdcMeanQ", self.RfAdcMeanQ))
+            if Diagnostics.get("TrmTemperatureC") is not None:
+                self.RfTrmTemperatureC = float(Diagnostics["TrmTemperatureC"])
+                self.RfTemperatureSource = str(Diagnostics.get("TrmTemperatureSource", "STM32 A1"))
+            freq = Diagnostics.get("RfSpectrumFrequencyMHz")
+            level = Diagnostics.get("RfSpectrumDbfs")
+            if freq is not None and level is not None:
+                try:
+                    self.RfSpectrumFrequencyMHz = np.asarray(freq, dtype=float)
+                    self.RfSpectrumDbfs = np.asarray(level, dtype=float)
+                except Exception:
+                    pass
+
+        now = float(self.UpdateCounter) * float(self.Config.get("RadarDwellIntervalSec", 0.10))
+        if self.RfAdcPeakDbfs is not None and self.RfAdcRmsDbfs is not None:
+            self.RfHistoryTimes.append(now)
+            self.RfHistoryPeakDbfs.append(float(self.RfAdcPeakDbfs))
+            self.RfHistoryRmsDbfs.append(float(self.RfAdcRmsDbfs))
+            cutoff = now - self.RfHistorySeconds
+            while self.RfHistoryTimes and self.RfHistoryTimes[0] < cutoff:
+                self.RfHistoryTimes.pop(0)
+                self.RfHistoryPeakDbfs.pop(0)
+                self.RfHistoryRmsDbfs.pop(0)
+
+        if self.RfStatusLabel is None:
+            return
+
+        def fmt(value, suffix=""):
+            return "---" if value is None else f"{float(value):.2f}{suffix}"
+
+        clipping = self.RfAdcClippedSamples > 0
+        headroom = None if self.RfAdcHeadroomDb is None else float(self.RfAdcHeadroomDb)
+        if clipping or (headroom is not None and headroom < 1.0):
+            status = "CLIPPING"
+            guidance = "Increase RX attenuation immediately."
+        elif headroom is not None and headroom < 6.0:
+            status = "LOW HEADROOM"
+            guidance = "Increase RX attenuation; target at least ~6 dB peak headroom."
+        elif headroom is not None and headroom > 30.0:
+            status = "UNDER-RANGE"
+            guidance = "Large ADC headroom. Receiver gain may be increased after confirming noise/clutter conditions."
+        else:
+            status = "GOOD"
+            guidance = "Useful headroom with no clipping detected."
+
+        self.RfStatusLabel.setText(
+            "ADC RECEIVE LEVEL\n"
+            "-----------------\n"
+            f"Peak:       {fmt(self.RfAdcPeakDbfs, ' dBFS')}\n"
+            f"RMS:        {fmt(self.RfAdcRmsDbfs, ' dBFS')}\n"
+            f"Headroom:   {fmt(self.RfAdcHeadroomDb, ' dB')}\n"
+            f"Mean I:     {self.RfAdcMeanI:+.5f}\n"
+            f"Mean Q:     {self.RfAdcMeanQ:+.5f}\n"
+            f"Clipped:    {self.RfAdcClippedSamples}\n"
+            f"Clip frac:  {100.0 * self.RfAdcClipFraction:.5f} %\n"
+            f"Status:     {status}"
+        )
+        self.RfStatusLabel.setStyleSheet(
+            "background-color: #050505; border: 1px solid #303030; "
+            "font-family: Menlo, Consolas, monospace; font-size: 13px; padding: 9px; "
+            + ("color: #ff6666;" if clipping else "color: #00ff66;")
+        )
+        if self.RfDynamicRangeLabel is not None:
+            self.RfDynamicRangeLabel.setText("Receiver dynamic range: " + status + " — " + guidance)
+
+        if self.RfAdcLevelBar is not None:
+            if self.RfAdcPeakDbfs is None:
+                utilisation = 0.0
+            else:
+                utilisation = min(1.0, max(0.0, 10.0 ** (float(self.RfAdcPeakDbfs) / 20.0)))
+            self.RfAdcLevelBar.setValue(int(round(1000.0 * utilisation)))
+
+        if self.RfTemperatureLabel is not None:
+            if self.RfTrmTemperatureC is None:
+                self.RfTemperatureLabel.setText("--.- C\n\nWaiting for STM32 A1 telemetry")
+                self.RfTemperatureLabel.setStyleSheet(
+                    "background-color: #050505; border: 1px solid #303030; "
+                    "font-family: Menlo, Consolas, monospace; font-size: 16px; padding: 12px; color: #bfbfbf;"
+                )
+            else:
+                temp = float(self.RfTrmTemperatureC)
+                if temp >= 80.0:
+                    temp_state = "SHUTOFF REGION"
+                    colour = "#ff3333"
+                elif temp >= 65.0:
+                    temp_state = "ABOVE OPERATING LIMIT"
+                    colour = "#ff6666"
+                elif temp >= 55.0:
+                    temp_state = "WARM"
+                    colour = "#ffcc00"
+                else:
+                    temp_state = "NORMAL"
+                    colour = "#00ff66"
+                self.RfTemperatureLabel.setText(
+                    f"{temp:.1f} C\n{temp_state}\n\n{self.RfTemperatureSource}"
+                )
+                self.RfTemperatureLabel.setStyleSheet(
+                    "background-color: #050505; border: 1px solid #303030; "
+                    "font-family: Menlo, Consolas, monospace; font-size: 16px; padding: 12px; "
+                    f"color: {colour};"
+                )
+
+        if self.RfHistoryPlot is not None and self.RfHistoryTimes:
+            latest = self.RfHistoryTimes[-1]
+            x = np.asarray(self.RfHistoryTimes, dtype=float) - latest
+            self.RfHistoryPeakCurve.setData(x, np.asarray(self.RfHistoryPeakDbfs, dtype=float))
+            self.RfHistoryRmsCurve.setData(x, np.asarray(self.RfHistoryRmsDbfs, dtype=float))
+            self.RfHistoryPlot.setXRange(-self.RfHistorySeconds, 0.0, padding=0.0)
+
+        if self.RfSpectrumCurve is not None and self.RfSpectrumFrequencyMHz.size:
+            self.RfSpectrumCurve.setData(self.RfSpectrumFrequencyMHz, self.RfSpectrumDbfs)
 
     def CreateStaticPpiItems(self):
         self.CreateMapOverlay()

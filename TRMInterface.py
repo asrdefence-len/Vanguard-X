@@ -43,7 +43,10 @@ class TRMStatus:
 class TRMInterface:
     def __init__(
         self,
-        port: str = "/dev/ttyACM0",
+        port: str = (
+            "/dev/serial/by-id/"
+            "usb-STMicroelectronics_STM32_STLink_0671FF564953856767104019-if02"
+        ),
         baudrate: int = 115200,
         timeout_s: float = 1.0,
         startup_wait_s: float = 0.5,
