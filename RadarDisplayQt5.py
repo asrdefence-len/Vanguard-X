@@ -112,6 +112,8 @@ class RadarDisplay:
         self.RfTestMode = str(Config.get("RfTestMode", "RADAR_TX_RX")).upper()
         self.RfTxAttenuationDb = float(Config.get("RfTxAttenuationDb", 31.5))
         self.RfRxAttenuationDb = float(Config.get("RfRxAttenuationDb", 0.0))
+        self.RfEttusTxGainDb = float(Config.get("EttusTxGainDb", 0.0))
+        self.RfEttusRxGainDb = float(Config.get("EttusRxGainDb", 10.0))
         self.RfControlRevision = 0
         self.RfApplicationMessage = "Monitor ready"
         self.RfAdcPeakDbfs = None
@@ -467,6 +469,7 @@ class RadarDisplay:
         self.RfSpectrumPlot = None
         self.RfSpectrumCurve = None
         self.RfFeedbackLabel = None
+        self.RfApplyButton = None
         self.RfControlWidgets = {}
         self.OperatorHeaderModeLabel = None
         self.OperatorHeaderTxLabel = None
@@ -593,6 +596,8 @@ class RadarDisplay:
             "RfTestMode": self.RfTestMode,
             "RfTxAttenuationDb": self.RfTxAttenuationDb,
             "RfRxAttenuationDb": self.RfRxAttenuationDb,
+            "RfEttusTxGainDb": self.RfEttusTxGainDb,
+            "RfEttusRxGainDb": self.RfEttusRxGainDb,
             "RfControlRevision": self.RfControlRevision,
         }
         if self.MissionPage is not None:
@@ -954,10 +959,20 @@ class RadarDisplay:
 
         if self.OperatorHeaderModeLabel is None:
             return
-        tx_text = (
-            "RX ONLY" if not self.TransmitAvailable
-            else ("TX ENABLED" if self.TransmitEnabled else "TX OFF")
-        )
+        if self.SystemMode == "SDR":
+            if self.RfTestMode == "TX_ONLY":
+                tx_text = "TX ONLY" if self.TransmitEnabled else "TX ONLY / STOPPED"
+            elif self.RfTestMode == "RX_ONLY":
+                tx_text = "RX ONLY"
+            elif self.RfTestMode == "CONTINUOUS_RX":
+                tx_text = "CONTINUOUS RX"
+            else:
+                tx_text = "RADAR TX/RX" if self.TransmitEnabled else "TX OFF"
+        else:
+            tx_text = (
+                "RX ONLY" if not self.TransmitAvailable
+                else ("TX ENABLED" if self.TransmitEnabled else "TX OFF")
+            )
         mission_text = (
             self.MissionPage.MissionStatusText()
             if self.MissionPage is not None else "MISSION: unavailable"
@@ -1250,65 +1265,120 @@ class RadarDisplay:
 
         Grid.addWidget(QtWidgets.QLabel("Test mode"), 0, 0)
         Mode = QtWidgets.QComboBox()
-        Mode.addItem("Radar timed TX/RX", "RADAR_TX_RX")
-        Mode.addItem("Receive only", "RX_ONLY")
-        Mode.addItem("Transmit only", "TX_ONLY")
-        Mode.addItem("Continuous RX noise monitor", "CONTINUOUS_RX")
+        Mode.addItem("Radar (TX/RX)", "RADAR_TX_RX")
+        Mode.addItem("TX Only", "TX_ONLY")
+        Mode.addItem("RX Only", "RX_ONLY")
+        Mode.addItem("Continuous RX Monitor", "CONTINUOUS_RX")
         index = max(0, Mode.findData(self.RfTestMode))
         Mode.setCurrentIndex(index)
         Grid.addWidget(Mode, 0, 1, 1, 2)
         self.RfControlWidgets["Mode"] = Mode
 
-        Grid.addWidget(QtWidgets.QLabel("TRM TX attenuation"), 1, 0)
+        ControlWidthPx = 180
+        LimitLabelStyle = "color: #bfbfbf;"
+
+        Grid.addWidget(QtWidgets.QLabel("Ettus TX gain"), 1, 0)
+        EttusTxGain = QtWidgets.QDoubleSpinBox()
+        EttusTxGainMaximumDb = float(
+            self.Config.get("EttusMaximumStage3E1TxGainDb", 50.0)
+        )
+        EttusTxGain.setRange(0.0, EttusTxGainMaximumDb)
+        EttusTxGain.setDecimals(1)
+        EttusTxGain.setSingleStep(1.0)
+        EttusTxGain.setSuffix(" dB")
+        EttusTxGain.setValue(self.RfEttusTxGainDb)
+        EttusTxGain.setFixedWidth(ControlWidthPx)
+        Grid.addWidget(EttusTxGain, 1, 1)
+        self.RfControlWidgets["EttusTxGainDb"] = EttusTxGain
+        EttusTxMaxLabel = QtWidgets.QLabel(
+            f"Max: {EttusTxGainMaximumDb:.1f} dB"
+        )
+        EttusTxMaxLabel.setStyleSheet(LimitLabelStyle)
+        Grid.addWidget(EttusTxMaxLabel, 1, 2)
+
+        Grid.addWidget(QtWidgets.QLabel("TRM TX attenuation"), 2, 0)
         TxAtt = QtWidgets.QDoubleSpinBox()
         TxAtt.setRange(0.0, 31.5)
         TxAtt.setDecimals(1)
         TxAtt.setSingleStep(0.5)
         TxAtt.setSuffix(" dB")
         TxAtt.setValue(self.RfTxAttenuationDb)
-        Grid.addWidget(TxAtt, 1, 1)
+        TxAtt.setFixedWidth(ControlWidthPx)
+        Grid.addWidget(TxAtt, 2, 1)
         self.RfControlWidgets["TxAttenuationDb"] = TxAtt
+        TxAttMaxLabel = QtWidgets.QLabel("Max: 31.5 dB")
+        TxAttMaxLabel.setStyleSheet(LimitLabelStyle)
+        Grid.addWidget(TxAttMaxLabel, 2, 2)
         self.RfTxEstimateLabel = QtWidgets.QLabel()
-        Grid.addWidget(self.RfTxEstimateLabel, 1, 2)
+        Grid.addWidget(self.RfTxEstimateLabel, 2, 3)
 
-        Grid.addWidget(QtWidgets.QLabel("TRM RX attenuation"), 2, 0)
+        Grid.addWidget(QtWidgets.QLabel("TRM RX attenuation"), 3, 0)
         RxAtt = QtWidgets.QDoubleSpinBox()
         RxAtt.setRange(0.0, 31.5)
         RxAtt.setDecimals(1)
         RxAtt.setSingleStep(0.5)
         RxAtt.setSuffix(" dB")
         RxAtt.setValue(self.RfRxAttenuationDb)
-        Grid.addWidget(RxAtt, 2, 1)
+        RxAtt.setFixedWidth(ControlWidthPx)
+        Grid.addWidget(RxAtt, 3, 1)
         self.RfControlWidgets["RxAttenuationDb"] = RxAtt
+        RxAttMaxLabel = QtWidgets.QLabel("Max: 31.5 dB")
+        RxAttMaxLabel.setStyleSheet(LimitLabelStyle)
+        Grid.addWidget(RxAttMaxLabel, 3, 2)
         self.RfRxEstimateLabel = QtWidgets.QLabel()
-        Grid.addWidget(self.RfRxEstimateLabel, 2, 2)
+        Grid.addWidget(self.RfRxEstimateLabel, 3, 3)
+
+        Grid.addWidget(QtWidgets.QLabel("Ettus RX gain"), 4, 0)
+        EttusRxGain = QtWidgets.QDoubleSpinBox()
+        EttusRxGainMinimumDb = float(
+            self.Config.get("EttusMinimumRxGainDb", 0.0)
+        )
+        EttusRxGainMaximumDb = float(
+            self.Config.get("EttusMaximumRxGainDb", 76.0)
+        )
+        EttusRxGain.setRange(
+            EttusRxGainMinimumDb, EttusRxGainMaximumDb
+        )
+        EttusRxGain.setDecimals(1)
+        EttusRxGain.setSingleStep(1.0)
+        EttusRxGain.setSuffix(" dB")
+        EttusRxGain.setValue(self.RfEttusRxGainDb)
+        EttusRxGain.setFixedWidth(ControlWidthPx)
+        Grid.addWidget(EttusRxGain, 4, 1)
+        self.RfControlWidgets["EttusRxGainDb"] = EttusRxGain
+        EttusRxMaxLabel = QtWidgets.QLabel(
+            f"Max: {EttusRxGainMaximumDb:.1f} dB"
+        )
+        EttusRxMaxLabel.setStyleSheet(LimitLabelStyle)
+        Grid.addWidget(EttusRxMaxLabel, 4, 2)
 
         TxAtt.valueChanged.connect(self.UpdateRfEngineeringEstimates)
         RxAtt.valueChanged.connect(self.UpdateRfEngineeringEstimates)
 
-        ApplyButton = QtWidgets.QPushButton("Apply TRM settings")
+        ApplyButton = QtWidgets.QPushButton("Apply RF settings")
         ApplyButton.clicked.connect(self.OnRfApply)
-        Grid.addWidget(ApplyButton, 3, 0, 1, 2)
+        Grid.addWidget(ApplyButton, 5, 0, 1, 2)
+        self.RfApplyButton = ApplyButton
         self.RfFeedbackLabel = QtWidgets.QLabel(self.RfApplicationMessage)
         self.RfFeedbackLabel.setStyleSheet("color: #bfbfbf;")
-        Grid.addWidget(self.RfFeedbackLabel, 3, 2, 1, 2)
+        Grid.addWidget(self.RfFeedbackLabel, 5, 2, 1, 3)
 
-        Grid.addWidget(QtWidgets.QLabel("TRM hardware"), 4, 0)
+        Grid.addWidget(QtWidgets.QLabel("TRM hardware"), 6, 0)
         self.RfTrmHardwareLabel = QtWidgets.QLabel("Not connected")
         self.RfTrmHardwareLabel.setStyleSheet(
             "color: #bfbfbf; font-family: Menlo, Consolas, monospace;"
         )
-        Grid.addWidget(self.RfTrmHardwareLabel, 4, 1, 1, 3)
+        Grid.addWidget(self.RfTrmHardwareLabel, 6, 1, 1, 4)
 
         Note = QtWidgets.QLabel(
             "ADC monitoring, history and spectrum are live. In SDR commissioning "
-            "mode, Apply TRM settings programs and reads back the STM32/TRM "
-            "28-bit control word. Special RF test-mode execution remains staged; "
-            "temperature is shown when STM32 A1 telemetry is published by Main."
+            "mode, Apply RF settings programs and verifies the STM32/TRM 28-bit "
+            "control word, applies Ettus RX/TX gains, and applies the selected RF test mode. TX Only inhibits "
+            "the external RX path; RX Only and Continuous RX inhibit external TX."
         )
         Note.setWordWrap(True)
         Note.setStyleSheet("color: #bfbfbf;")
-        Grid.addWidget(Note, 5, 0, 1, 4)
+        Grid.addWidget(Note, 7, 0, 1, 5)
         Layout.addWidget(Controls)
 
         Summary = QtWidgets.QWidget()
@@ -1395,6 +1465,7 @@ class RadarDisplay:
 
         self.UpdateRfEngineeringEstimates()
         self.UpdateRfDiagnostics({})
+        self.UpdateRfApplyInterlock()
         return Page
 
     def UpdateRfEngineeringEstimates(self, *_args):
@@ -1415,8 +1486,47 @@ class RadarDisplay:
                 f"Nominal TRM gain: {rx_gain_db:.1f} dB"
             )
 
+    def UpdateRfApplyInterlock(self):
+        """Enable RF/TRM Apply only when the radar is fully stopped.
+
+        The scheduler independently enforces the same condition.  This GUI
+        interlock prevents the operator from issuing a request that must be
+        rejected and makes the safe programming boundary obvious.
+        """
+        if self.RfApplyButton is None:
+            return
+
+        stopped = bool(
+            str(self.DisplayMode).upper() == "STOP"
+            and not self.ScanEnabled
+            and not self.TransmitEnabled
+        )
+        self.RfApplyButton.setEnabled(stopped)
+        if stopped:
+            self.RfApplyButton.setText("Apply RF settings")
+            self.RfApplyButton.setToolTip(
+                "Apply RF test mode, Ettus gains and TRM attenuation settings."
+            )
+        else:
+            self.RfApplyButton.setText("STOP radar to apply")
+            self.RfApplyButton.setToolTip(
+                "RF/TRM settings can only be applied while radar is STOPPED "
+                "and TX is off."
+            )
+
     def OnRfApply(self):
         """Publish an RF engineering request for Main to consume safely."""
+        if not (
+            str(self.DisplayMode).upper() == "STOP"
+            and not self.ScanEnabled
+            and not self.TransmitEnabled
+        ):
+            self.RfApplicationMessage = "Stop radar before applying RF settings"
+            if self.RfFeedbackLabel is not None:
+                self.RfFeedbackLabel.setStyleSheet("color: #ff6666;")
+                self.RfFeedbackLabel.setText(self.RfApplicationMessage)
+            self.UpdateRfApplyInterlock()
+            return
         self.RfTestMode = str(
             self.RfControlWidgets["Mode"].currentData()
         ).upper()
@@ -1426,8 +1536,14 @@ class RadarDisplay:
         self.RfRxAttenuationDb = float(
             self.RfControlWidgets["RxAttenuationDb"].value()
         )
+        self.RfEttusTxGainDb = float(
+            self.RfControlWidgets["EttusTxGainDb"].value()
+        )
+        self.RfEttusRxGainDb = float(
+            self.RfControlWidgets["EttusRxGainDb"].value()
+        )
         self.RfControlRevision += 1
-        self.RfApplicationMessage = "TRM programming request pending"
+        self.RfApplicationMessage = "RF settings request pending"
         if self.RfFeedbackLabel is not None:
             self.RfFeedbackLabel.setStyleSheet("color: #ffcc00;")
             self.RfFeedbackLabel.setText(self.RfApplicationMessage)
@@ -1439,6 +1555,39 @@ class RadarDisplay:
                 "color: #00ff66;" if Applied else "color: #ff6666;"
             )
             self.RfFeedbackLabel.setText(self.RfApplicationMessage)
+
+    def SetTrmTemperature(self, TemperatureC, Source="STM32 A1 / TMP36"):
+        """Update temperature telemetry even while the radar is stopped."""
+        self.RfTrmTemperatureC = (
+            None if TemperatureC is None else float(TemperatureC)
+        )
+        self.RfTemperatureSource = str(Source)
+        if self.RfTemperatureLabel is None:
+            return
+        if self.RfTrmTemperatureC is None:
+            self.RfTemperatureLabel.setText("--.- C\n\nWaiting for STM32 A1 telemetry")
+            self.RfTemperatureLabel.setStyleSheet(
+                "background-color: #050505; border: 1px solid #303030; "
+                "font-family: Menlo, Consolas, monospace; font-size: 16px; padding: 12px; color: #bfbfbf;"
+            )
+            return
+        temp = float(self.RfTrmTemperatureC)
+        if temp >= 80.0:
+            temp_state, colour = "SHUTOFF REGION", "#ff3333"
+        elif temp >= 65.0:
+            temp_state, colour = "ABOVE OPERATING LIMIT", "#ff6666"
+        elif temp >= 55.0:
+            temp_state, colour = "WARM", "#ffcc00"
+        else:
+            temp_state, colour = "NORMAL", "#00ff66"
+        self.RfTemperatureLabel.setText(
+            f"{temp:.1f} C\n{temp_state}\n\n{self.RfTemperatureSource}"
+        )
+        self.RfTemperatureLabel.setStyleSheet(
+            "background-color: #050505; border: 1px solid #303030; "
+            "font-family: Menlo, Consolas, monospace; font-size: 16px; padding: 12px; "
+            f"color: {colour};"
+        )
 
     def SetTrmHardwareStatus(self, Connected, Word=None, Message=""):
         """Show STM32/TRM programming/readback state on the RF page."""
@@ -1468,6 +1617,28 @@ class RadarDisplay:
 
     def UpdateRfDiagnostics(self, Diagnostics):
         """Update RF engineering displays from dwell-synchronous diagnostics."""
+        active_rf_mode = str(
+            Diagnostics.get("RfTestMode", self.RfTestMode) if Diagnostics else self.RfTestMode
+        ).upper()
+        if active_rf_mode == "TX_ONLY":
+            self.RfAdcPeakDbfs = None
+            self.RfAdcRmsDbfs = None
+            self.RfAdcHeadroomDb = None
+            self.RfAdcClippedSamples = 0
+            self.RfAdcClipFraction = 0.0
+            self.RfAdcMeanI = 0.0
+            self.RfAdcMeanQ = 0.0
+            self.RfSpectrumFrequencyMHz = np.asarray([], dtype=float)
+            self.RfSpectrumDbfs = np.asarray([], dtype=float)
+            self.RfHistoryTimes = []
+            self.RfHistoryPeakDbfs = []
+            self.RfHistoryRmsDbfs = []
+            if self.RfSpectrumCurve is not None:
+                self.RfSpectrumCurve.setData([], [])
+            if self.RfHistoryPeakCurve is not None:
+                self.RfHistoryPeakCurve.setData([], [])
+            if self.RfHistoryRmsCurve is not None:
+                self.RfHistoryRmsCurve.setData([], [])
         if Diagnostics:
             self.RfAdcPeakDbfs = Diagnostics.get("AdcPeakDbfs", self.RfAdcPeakDbfs)
             self.RfAdcRmsDbfs = Diagnostics.get("AdcRmsDbfs", self.RfAdcRmsDbfs)
@@ -1507,7 +1678,10 @@ class RadarDisplay:
 
         clipping = self.RfAdcClippedSamples > 0
         headroom = None if self.RfAdcHeadroomDb is None else float(self.RfAdcHeadroomDb)
-        if clipping or (headroom is not None and headroom < 1.0):
+        if active_rf_mode == "TX_ONLY":
+            status = "DISABLED (TX ONLY)"
+            guidance = "No Ettus RX stream commands are issued in TX Only mode."
+        elif clipping or (headroom is not None and headroom < 1.0):
             status = "CLIPPING"
             guidance = "Increase RX attenuation immediately."
         elif headroom is not None and headroom < 6.0:
@@ -2671,6 +2845,7 @@ class RadarDisplay:
 
         self.StatusLabel.setText("\n".join(Lines))
         self.UpdatePersistentOperatorHeader()
+        self.UpdateRfApplyInterlock()
 
     # ------------------------------------------------------------------
     # Detection history
@@ -2703,6 +2878,9 @@ class RadarDisplay:
     # Controls
     # ------------------------------------------------------------------
 
+    def _RfModeUsesTransmit(self):
+        return self.RfTestMode in ("RADAR_TX_RX", "TX_ONLY")
+
     def OnStartScan(self):
         # Operator pressed Start. This must always start scanning,
         # independent of the initial startup setting.
@@ -2710,7 +2888,7 @@ class RadarDisplay:
         self.ScanEnabled = True
         self.ManualControlCommandId += 1
         if self.TransmitAvailable:
-            self.TransmitEnabled = True
+            self.TransmitEnabled = self._RfModeUsesTransmit()
         self.ManualNudgeDeltaDeg = 0.0
         self.UpdateStatusPanel()
 
@@ -2722,7 +2900,7 @@ class RadarDisplay:
         self.ScanEnabled = False
         self.ManualControlCommandId += 1
         if self.TransmitAvailable:
-            self.TransmitEnabled = True
+            self.TransmitEnabled = self._RfModeUsesTransmit()
         self.ManualNudgeDeltaDeg = 0.0
         self.UpdateStatusPanel()
 
@@ -2766,7 +2944,7 @@ class RadarDisplay:
         self.ScanEnabled = False
         self.ManualControlCommandId += 1
         if self.TransmitAvailable:
-            self.TransmitEnabled = True
+            self.TransmitEnabled = self._RfModeUsesTransmit()
         self.ManualNudgeDeltaDeg = -abs(float(self.ScanStepDeg))
         self.ManualNudgeCommandId += 1
         self.UpdateStatusPanel()
@@ -2777,7 +2955,7 @@ class RadarDisplay:
         self.ScanEnabled = False
         self.ManualControlCommandId += 1
         if self.TransmitAvailable:
-            self.TransmitEnabled = True
+            self.TransmitEnabled = self._RfModeUsesTransmit()
         self.ManualNudgeDeltaDeg = abs(float(self.ScanStepDeg))
         self.ManualNudgeCommandId += 1
         self.UpdateStatusPanel()

@@ -38,6 +38,12 @@ RX_HIGH_BITS_ACTIVE_LOW = True
 class TRMStatus:
     word: int
     raw_response: str
+    temperature_c: Optional[float] = None
+    temperature_voltage_v: Optional[float] = None
+    rx_path_enabled: Optional[bool] = None
+    tx_path_enabled: Optional[bool] = None
+    rx_att_db: Optional[float] = None
+    tx_att_db: Optional[float] = None
 
 
 class TRMInterface:
@@ -141,12 +147,44 @@ class TRMInterface:
 
     def get_status(self) -> TRMStatus:
         response = self._command("STATUS")
+        fields = {}
         for token in response.split():
-            if token.startswith("WORD="):
-                word = int(token.split("=", 1)[1], 16)
-                self.last_word = word
-                return TRMStatus(word=word, raw_response=response)
-        raise RuntimeError(f"Could not parse TRM status: {response}")
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key.strip().upper()] = value.strip()
+        if "WORD" not in fields:
+            raise RuntimeError(f"Could not parse TRM status: {response}")
+        word = int(fields["WORD"], 16)
+        self.last_word = word
+
+        def optional_float(name):
+            value = fields.get(name)
+            if value is None or value.upper() == "NA":
+                return None
+            try:
+                return float(value)
+            except ValueError:
+                return None
+
+        def optional_bool(name):
+            value = fields.get(name)
+            if value is None:
+                return None
+            try:
+                return bool(int(value))
+            except ValueError:
+                return None
+
+        return TRMStatus(
+            word=word,
+            raw_response=response,
+            temperature_c=optional_float("TEMP"),
+            temperature_voltage_v=optional_float("A1V"),
+            rx_path_enabled=optional_bool("RXEN"),
+            tx_path_enabled=optional_bool("TXEN"),
+            rx_att_db=optional_float("RXATT"),
+            tx_att_db=optional_float("TXATT"),
+        )
 
     @staticmethod
     def _validate_attenuation(value_db: float) -> int:
@@ -232,13 +270,15 @@ class TRMInterface:
         rx_att_db: float,
         tx_att_db: float,
         force: bool = False,
+        rx_path_enabled: bool = True,
+        tx_path_enabled: bool = True,
     ) -> str:
-        """Set attenuation while leaving both slow path-enable bits active."""
+        """Program attenuation and the two slow TRM path-enable bits."""
         word = self.build_word(
             rx_att_db=rx_att_db,
             tx_att_db=tx_att_db,
-            rx_path_enabled=True,
-            tx_path_enabled=True,
+            rx_path_enabled=rx_path_enabled,
+            tx_path_enabled=tx_path_enabled,
         )
         return self.write_word(word, force=force)
 
@@ -263,7 +303,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Configure the Vanguard X Shinewave TRM"
     )
-    parser.add_argument("--port", default="/dev/ttyACM0")
+    parser.add_argument("--port", default=(
+            "/dev/serial/by-id/"
+            "usb-STMicroelectronics_STM32_STLink_0671FF564953856767104019-if02"
+        ))
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--rx-att", type=float, default=None)
     parser.add_argument("--tx-att", type=float, default=None)

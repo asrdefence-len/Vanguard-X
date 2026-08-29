@@ -24,7 +24,7 @@ Commands over USB serial:
     HELP
 """
 
-from machine import Pin
+from machine import Pin, ADC
 import sys
 import time
 
@@ -37,6 +37,20 @@ SEL = Pin("A10", Pin.OUT)
 CLK = Pin("B3", Pin.OUT)
 DATA = Pin("B5", Pin.OUT)
 LOAD = Pin("B4", Pin.OUT)
+
+# TRM temperature monitor. Arduino A1 on the NUCLEO-F446RE is PA1.
+# The Shinewave interface documentation identifies a TMP36-style monitor.
+# TMP36 nominal transfer: 500 mV at 0 C, 10 mV/C.
+try:
+    TEMP_ADC = ADC(Pin("A1"))
+except Exception:
+    TEMP_ADC = None
+
+ADC_REFERENCE_V = 3.3
+ADC_FULL_SCALE = 65535.0
+TMP36_ZERO_C_V = 0.500
+TMP36_VOLTS_PER_C = 0.010
+TEMP_AVERAGE_SAMPLES = 16
 
 WORD_MASK = 0x0FFFFFFF
 RX_HIGH_BITS_ACTIVE_LOW = True
@@ -105,6 +119,55 @@ def encode_rx_attenuation(value_db):
                 word |= 1 << bit_position
 
     return word
+
+
+
+def read_temperature():
+    """Return (temperature_c, adc_voltage_v) from the TRM A1 monitor.
+
+    The conversion assumes the TMP36 monitor is connected directly to A1
+    with a 3.3 V ADC reference and no external divider.  Averaging is used
+    only to reduce ADC noise; the RF timing path is independent of this read.
+    """
+    if TEMP_ADC is None:
+        return None, None
+    total = 0
+    count = max(1, int(TEMP_AVERAGE_SAMPLES))
+    for _ in range(count):
+        total += int(TEMP_ADC.read_u16())
+    raw = float(total) / float(count)
+    voltage_v = raw * ADC_REFERENCE_V / ADC_FULL_SCALE
+    temperature_c = (voltage_v - TMP36_ZERO_C_V) / TMP36_VOLTS_PER_C
+    return float(temperature_c), float(voltage_v)
+
+
+def decode_tx_attenuation(word):
+    steps = 0
+    for mask, bit_position in (
+        (1, 15), (2, 16), (4, 20),
+        (8, 17), (16, 19), (32, 18),
+    ):
+        if int(word) & (1 << bit_position):
+            steps |= mask
+    return steps / 2.0
+
+
+def decode_rx_attenuation(word):
+    word = int(word)
+    steps = 0
+    for mask, bit_position in ((1, 9), (2, 10), (8, 11)):
+        if word & (1 << bit_position):
+            steps |= mask
+    unusual = ((4, 14), (16, 13), (32, 12))
+    if RX_HIGH_BITS_ACTIVE_LOW:
+        for mask, bit_position in unusual:
+            if not (word & (1 << bit_position)):
+                steps |= mask
+    else:
+        for mask, bit_position in unusual:
+            if word & (1 << bit_position):
+                steps |= mask
+    return steps / 2.0
 
 
 def build_word(rx_enable=False, tx_enable=False,
@@ -181,12 +244,22 @@ class TRMController:
 
     def apply_raw_word(self, word):
         self.last_word = write_word(word)
+        # Decode for truthful STATUS reporting.  Linux remains authoritative
+        # for word construction; this only mirrors the latched command state.
+        self.rx_enable = bool(self.last_word & BIT_RX_ENABLE)
+        self.tx_enable = bool(self.last_word & BIT_TX_ENABLE)
+        self.rx_att_db = decode_rx_attenuation(self.last_word)
+        self.tx_att_db = decode_tx_attenuation(self.last_word)
         return self.last_word
 
     def status_text(self):
+        temperature_c, voltage_v = read_temperature()
+        temp_text = "NA" if temperature_c is None else "{:.1f}".format(temperature_c)
+        voltage_text = "NA" if voltage_v is None else "{:.4f}".format(voltage_v)
         return (
             "STATUS WORD={:07X} RXEN={} TXEN={} "
-            "RXATT={:.1f} TXATT={:.1f} RX_ACTIVE_LOW={}"
+            "RXATT={:.1f} TXATT={:.1f} RX_ACTIVE_LOW={} "
+            "TEMP={} A1V={}"
         ).format(
             self.last_word,
             int(self.rx_enable),
@@ -194,6 +267,8 @@ class TRMController:
             self.rx_att_db,
             self.tx_att_db,
             int(RX_HIGH_BITS_ACTIVE_LOW),
+            temp_text,
+            voltage_text,
         )
 
 

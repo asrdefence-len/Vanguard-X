@@ -93,6 +93,7 @@ from EttusOperatingProfiles import (
     ApplyX660OperatingProfile,
     ParseOperatingProfileArguments,
 )
+import json
 import os
 import sys
 import time
@@ -115,6 +116,85 @@ from TargetScenario import (
     build_scene_returns_for_boresight,
     print_scene_returns,
 )
+
+
+# -----------------------------------------------------------------------------
+# Persistent operator configuration
+# -----------------------------------------------------------------------------
+
+PERSISTENT_CONFIG_FILENAME = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "vanguard.config",
+)
+
+# Only operator/engineering settings are persisted. Runtime arming state such as
+# SCAN, STARE, TransmitEnabled and SystemMode is deliberately excluded so every
+# Vanguard start remains fail-safe in STOP with TX off.
+PERSISTENT_CONFIG_KEYS = (
+    "RfTestMode",
+    "EttusTxGainDb",
+    "EttusRxGainDb",
+    "RfTxAttenuationDb",
+    "RfRxAttenuationDb",
+    "SelectedPrfHz",
+    "SelectedPulsesPerCpi",
+    "SearchWaveformId",
+    "InstrumentedMaxRangeM",
+    "ScanStartDeg",
+    "ScanStopDeg",
+    "ScanStepDeg",
+    "X660ScanSlewRateDegPerSec",
+)
+
+
+def LoadPersistentConfig(Config, filename=PERSISTENT_CONFIG_FILENAME):
+    """Overlay approved saved settings onto built-in safe defaults."""
+
+    if not os.path.exists(filename):
+        print(
+            f"Persistent config not found: {filename}; "
+            "using built-in defaults"
+        )
+        return Config
+
+    try:
+        with open(filename, "r", encoding="utf-8") as file_handle:
+            saved = json.load(file_handle)
+        if not isinstance(saved, dict):
+            raise ValueError("top-level JSON value must be an object")
+    except Exception as exc:
+        print(
+            f"WARNING: could not read persistent config {filename}: {exc}; "
+            "using built-in defaults"
+        )
+        return Config
+
+    applied_keys = []
+    for key in PERSISTENT_CONFIG_KEYS:
+        if key in saved:
+            Config[key] = saved[key]
+            applied_keys.append(key)
+
+    print(
+        f"Loaded persistent config: {filename} "
+        f"({len(applied_keys)} settings)"
+    )
+    return Config
+
+
+def SavePersistentConfig(Config, filename=PERSISTENT_CONFIG_FILENAME):
+    """Atomically save approved operator/engineering settings only."""
+
+    persistent = {
+        key: Config[key]
+        for key in PERSISTENT_CONFIG_KEYS
+        if key in Config
+    }
+    temporary_filename = filename + ".tmp"
+    with open(temporary_filename, "w", encoding="utf-8") as file_handle:
+        json.dump(persistent, file_handle, indent=2, sort_keys=True)
+        file_handle.write("\n")
+    os.replace(temporary_filename, filename)
 
 
 # -----------------------------------------------------------------------------
@@ -1192,6 +1272,10 @@ def Main(CommandLineArguments=None):
         "EttusSerial": "34A0320",
         "EttusRxFrequencyHz": 1.0e9,
         "EttusRxGainDb": 10.0,
+        "EttusTxGainDb": 0.0,
+        "EttusMinimumRxGainDb": 0.0,
+        "EttusMaximumRxGainDb": 76.0,
+        "EttusMaximumStage3E1TxGainDb": 50.0,
         "EttusRxAntenna": "RX2",
         "EttusRxChannel": 0,
         "EttusSampleRateHz": 40.0e6,
@@ -1246,10 +1330,14 @@ def Main(CommandLineArguments=None):
         # Slow-control STM32/TRM serial link. RF-tab programming is allowed
         # only in stopped SDR commissioning mode and is verified by STATUS
         # readback before the setting is reported as applied.
-        "TrmControlPort": "/dev/ttyACM0",
+        "TrmControlPort": (
+            "/dev/serial/by-id/"
+            "usb-STMicroelectronics_STM32_STLink_0671FF564953856767104019-if02"
+        ),
         "TrmControlBaudrate": 115200,
         "TrmControlTimeoutSec": 0.25,
         "TrmControlDebug": False,
+        "TrmStatusPollIntervalSec": 0.5,
 
         # Detection
         "ThresholdDb": -80.0,
@@ -1538,6 +1626,11 @@ def Main(CommandLineArguments=None):
         "IMUInvertElevation": False,
     }
 
+    # Load the last successfully installed operator/engineering settings.
+    # Operating profiles and system-mode safety overrides are applied afterwards,
+    # so a saved file can never re-arm TX or bypass a guarded hardware profile.
+    Config = LoadPersistentConfig(Config)
+
     OperatingProfile = ApplyOperatingProfile(
         Config,
         OperatingArguments,
@@ -1797,6 +1890,8 @@ def Main(CommandLineArguments=None):
             print("X6-60 requested, but X660Controller.py could not be imported.")
 
     Source.Initialise()
+    if hasattr(Source, "SetRfTestMode"):
+        Source.SetRfTestMode(Config.get("RfTestMode", "RADAR_TX_RX"))
 
     # -------------------------------------------------------------------------
     # Create the 2D target / reflector scene
@@ -1934,6 +2029,7 @@ def Main(CommandLineArguments=None):
     LastAppliedTimingRevision = -1
     LastSystemModeRevision = 0
     LastRfControlRevision = 0
+    LastTrmStatusPollMonotonic = 0.0
     TrmControl = None
     RestartSystemMode = None
     InitialControlState = (
@@ -2013,6 +2109,12 @@ def Main(CommandLineArguments=None):
                         RequestedRxAttDb = float(
                             ControlState.get("RfRxAttenuationDb", 0.0)
                         )
+                        RequestedEttusTxGainDb = float(
+                            ControlState.get("RfEttusTxGainDb", Config.get("EttusTxGainDb", 0.0))
+                        )
+                        RequestedEttusRxGainDb = float(
+                            ControlState.get("RfEttusRxGainDb", Config.get("EttusRxGainDb", 10.0))
+                        )
                         IsStoppedForTrm = bool(
                             str(ControlState.get("DisplayMode", "STOP")).upper() == "STOP"
                             and not bool(ControlState.get("ScanEnabled", False))
@@ -2036,7 +2138,8 @@ def Main(CommandLineArguments=None):
                                 if TrmControl is None:
                                     TrmControl = TRMInterface(
                                         port=str(Config.get(
-                                            "TrmControlPort", "/dev/ttyACM0"
+                                            "TrmControlPort",
+                                            "/dev/serial/by-id/usb-STMicroelectronics_STM32_STLink_0671FF564953856767104019-if02"
                                         )),
                                         baudrate=int(Config.get(
                                             "TrmControlBaudrate", 115200
@@ -2051,16 +2154,29 @@ def Main(CommandLineArguments=None):
                                     TrmControl.open()
                                     TrmControl.ping()
 
+                                RequestedRfMode = Config["RfTestMode"]
+                                if RequestedRfMode == "RADAR_TX_RX":
+                                    RxPathEnabled, TxPathEnabled = True, True
+                                elif RequestedRfMode == "TX_ONLY":
+                                    RxPathEnabled, TxPathEnabled = False, True
+                                elif RequestedRfMode in ("RX_ONLY", "CONTINUOUS_RX"):
+                                    RxPathEnabled, TxPathEnabled = True, False
+                                else:
+                                    raise ValueError(
+                                        f"Unsupported RF test mode: {RequestedRfMode}"
+                                    )
                                 ExpectedWord = TRMInterface.build_word(
                                     rx_att_db=RequestedRxAttDb,
                                     tx_att_db=RequestedTxAttDb,
-                                    rx_path_enabled=True,
-                                    tx_path_enabled=True,
+                                    rx_path_enabled=RxPathEnabled,
+                                    tx_path_enabled=TxPathEnabled,
                                 )
                                 TrmControl.configure(
                                     rx_att_db=RequestedRxAttDb,
                                     tx_att_db=RequestedTxAttDb,
                                     force=False,
+                                    rx_path_enabled=RxPathEnabled,
+                                    tx_path_enabled=TxPathEnabled,
                                 )
                                 Status = TrmControl.get_status()
                                 ReadbackWord = int(Status.word)
@@ -2071,17 +2187,35 @@ def Main(CommandLineArguments=None):
                                         f"received 0x{ReadbackWord:07X}"
                                     )
 
+                                if not hasattr(Source, "SetRfGains"):
+                                    raise RuntimeError("Ettus source does not support live RF gain control")
+                                ActualRxGainDb, ActualTxGainDb = Source.SetRfGains(
+                                    rx_gain_db=RequestedEttusRxGainDb,
+                                    tx_gain_db=RequestedEttusTxGainDb,
+                                )
                                 Config["RfTxAttenuationDb"] = RequestedTxAttDb
                                 Config["RfRxAttenuationDb"] = RequestedRxAttDb
+                                Config["EttusRxGainDb"] = float(ActualRxGainDb)
+                                Config["EttusTxGainDb"] = float(ActualTxGainDb)
                                 Config["TrmControlWord"] = ReadbackWord
+                                if getattr(Status, "temperature_c", None) is not None:
+                                    Config["TrmTemperatureC"] = float(Status.temperature_c)
+                                    Config["TrmTemperatureSource"] = "STM32 A1 / TMP36"
+                                    if hasattr(Display, "SetTrmTemperature"):
+                                        Display.SetTrmTemperature(
+                                            Config["TrmTemperatureC"],
+                                            Config["TrmTemperatureSource"],
+                                        )
+                                if hasattr(Source, "SetRfTestMode"):
+                                    Source.SetRfTestMode(Config["RfTestMode"])
                                 Applied = True
+                                SavePersistentConfig(Config)
                                 Message = (
-                                    f"TRM verified: TX {RequestedTxAttDb:.1f} dB, "
-                                    f"RX {RequestedRxAttDb:.1f} dB, "
+                                    f"{Config['RfTestMode']} applied; "
+                                    f"Ettus TX/RX {Config['EttusTxGainDb']:.1f}/{Config['EttusRxGainDb']:.1f} dB; "
+                                    f"TRM TX/RX att {RequestedTxAttDb:.1f}/{RequestedRxAttDb:.1f} dB; "
                                     f"WORD 0x{ReadbackWord:07X}"
                                 )
-                                if Config["RfTestMode"] != "RADAR_TX_RX":
-                                    Message += "; selected RF test mode remains staged"
                             except Exception as exc:
                                 Message = f"TRM programming failed: {exc}"
                                 try:
@@ -2094,6 +2228,8 @@ def Main(CommandLineArguments=None):
                         print(
                             "RF engineering request: "
                             f"mode={Config['RfTestMode']}, "
+                            f"EttusTX={RequestedEttusTxGainDb:.1f} dB, "
+                            f"EttusRX={RequestedEttusRxGainDb:.1f} dB, "
                             f"TXatt={RequestedTxAttDb:.1f} dB, "
                             f"RXatt={RequestedRxAttDb:.1f} dB -> {Message}"
                         )
@@ -2105,6 +2241,57 @@ def Main(CommandLineArguments=None):
                                 ReadbackWord,
                                 "verified" if Applied else Message,
                             )
+
+                    # Poll slow STM32/TRM health independently of radar dwells so
+                    # temperature remains live while the RF page is STOPPED.
+                    if (
+                        SystemMode == "SDR"
+                        and Config.get("TrmTemperatureMonitoringEnabled", True)
+                    ):
+                        NowTrmPoll = time.monotonic()
+                        PollInterval = float(
+                            Config.get("TrmStatusPollIntervalSec", 0.5)
+                        )
+                        if (
+                            LastTrmStatusPollMonotonic <= 0.0
+                            or NowTrmPoll - LastTrmStatusPollMonotonic >= PollInterval
+                        ): 
+                            LastTrmStatusPollMonotonic = NowTrmPoll
+                            try:
+                                if TrmControl is None:
+                                    TrmControl = TRMInterface(
+                                        port=str(Config["TrmControlPort"]),
+                                        baudrate=int(Config["TrmControlBaudrate"]),
+                                        timeout_s=float(Config["TrmControlTimeoutSec"]),
+                                        debug=bool(Config["TrmControlDebug"]),
+                                    )
+                                    TrmControl.open()
+                                    TrmControl.ping()
+                                TrmStatus = TrmControl.get_status()
+                                Config["TrmControlWord"] = int(TrmStatus.word)
+                                if getattr(TrmStatus, "temperature_c", None) is not None:
+                                    Config["TrmTemperatureC"] = float(TrmStatus.temperature_c)
+                                    Config["TrmTemperatureSource"] = "STM32 A1 / TMP36"
+                                    if hasattr(Display, "SetTrmTemperature"):
+                                        Display.SetTrmTemperature(
+                                            Config["TrmTemperatureC"],
+                                            Config["TrmTemperatureSource"],
+                                        )
+                                if hasattr(Display, "SetTrmHardwareStatus"):
+                                    Display.SetTrmHardwareStatus(
+                                        True, int(TrmStatus.word), "telemetry live"
+                                    )
+                            except Exception as exc:
+                                if hasattr(Display, "SetTrmHardwareStatus"):
+                                    Display.SetTrmHardwareStatus(
+                                        False, None, f"telemetry error: {exc}"
+                                    )
+                                try:
+                                    if TrmControl is not None:
+                                        TrmControl.close()
+                                except Exception:
+                                    pass
+                                TrmControl = None
 
                     RequestedModeRevision = int(
                         ControlState.get("SystemModeRevision", 0)
@@ -2261,6 +2448,9 @@ def Main(CommandLineArguments=None):
                         )
                     if TimingApplication.Applied:
                         AppliedTiming = TimingApplication.Profile.Timing
+                        # ApplyTimingControlState updates Config with the accepted
+                        # timing selection; persist only after validation succeeds.
+                        SavePersistentConfig(Config)
                         print(
                             "Operator timing applied: "
                             f"waveform={TimingApplication.Profile.WaveformId}, "
@@ -2493,8 +2683,13 @@ def Main(CommandLineArguments=None):
                 DwellWallDtSec = NowDwellSec - LastRadarDwellTimeSec if LastRadarDwellTimeSec > 0.0 else 0.0
 
                 TransmitEnabled = True if ControlState is None else bool(ControlState.get("TransmitEnabled", True))
+                ActiveRfTestMode = str(Config.get("RfTestMode", "RADAR_TX_RX")).upper()
+                ReceiveCommissioningMode = bool(
+                    SystemMode == "SDR"
+                    and ActiveRfTestMode in ("RX_ONLY", "CONTINUOUS_RX")
+                )
                 RadarDwellEnabled = bool(
-                    TransmitEnabled or ReceiveOnlyOperation
+                    TransmitEnabled or ReceiveOnlyOperation or ReceiveCommissioningMode
                 )
 
                 if DisplayMode == "STOP" or not RadarDwellEnabled:
@@ -3077,6 +3272,14 @@ def Main(CommandLineArguments=None):
         # ---------------------------------------------------------------------
 
         try:
+            # Capture the latest non-arming operator settings (including scan
+            # limits/rate) on a normal shutdown. Runtime TX/SCAN state is never
+            # included in vanguard.config.
+            SavePersistentConfig(Config)
+        except Exception as exc:
+            print(f"WARNING: persistent config save failed: {exc}")
+
+        try:
             Logger.close()
         except Exception:
             pass
@@ -3101,6 +3304,12 @@ def Main(CommandLineArguments=None):
             pass
 
         Source.Shutdown()
+        try:
+            if TrmControl is not None:
+                TrmControl.standby(force=True)
+                TrmControl.close()
+        except Exception as exc:
+            print(f"WARNING: TRM standby/close failed during shutdown: {exc}")
 
     if RestartSystemMode is not None:
         ModeArgument = {

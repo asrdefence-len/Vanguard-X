@@ -93,6 +93,11 @@ class EttusRadarSource:
         self.TimedTransmitEnabled = bool(
             Config.get("EttusTimedTransmitEnabled", False)
         )
+        self.RfTestMode = str(
+            Config.get("RfTestMode", "RADAR_TX_RX")
+        ).strip().upper()
+        self._continuous_rx_active = False
+        self._validate_rf_test_mode(self.RfTestMode)
         if self.OperatingMode not in ("RECEIVE_ONLY", "TIMED_TX_RX"):
             raise ValueError(
                 "EttusOperatingMode must be RECEIVE_ONLY or TIMED_TX_RX"
@@ -369,6 +374,166 @@ class EttusRadarSource:
         self._initialised = False
         self._atr_configured = False
 
+    @staticmethod
+    def _validate_rf_test_mode(mode):
+        mode = str(mode).strip().upper()
+        allowed = ("RADAR_TX_RX", "TX_ONLY", "RX_ONLY", "CONTINUOUS_RX")
+        if mode not in allowed:
+            raise ValueError(
+                "RfTestMode must be one of: " + ", ".join(allowed)
+            )
+        return mode
+
+    def SetRfTestMode(self, mode):
+        """Apply a stopped-boundary RF commissioning mode.
+
+        The scheduler calls this only while the radar is STOPPED.  Fast T/R
+        ownership remains in the Ettus FPGA.  Mode changes alter which ATR
+        state is allowed to reach the external TRM and whether timed TX is
+        queued; they do not bypass the proven pulse timing path.
+        """
+        mode = self._validate_rf_test_mode(mode)
+        if mode == self.RfTestMode:
+            return
+        if self._continuous_rx_active:
+            self._stop_continuous_rx()
+        self.RfTestMode = mode
+        self.Config["RfTestMode"] = mode
+        if self.AtrGpioEnabled and self._atr_configured:
+            self._program_atr_states_for_rf_test_mode()
+        print(f"Ettus RF test mode: {self.RfTestMode}")
+
+    def SetRfGains(self, rx_gain_db=None, tx_gain_db=None):
+        """Apply stopped-boundary Ettus gain settings and verify UHD readback."""
+        if not self._initialised or self.Usrp is None:
+            raise RuntimeError("Ettus source is not initialised")
+
+        actual_rx = float(self.Usrp.get_rx_gain(self.Channel))
+        actual_tx = None
+        if rx_gain_db is not None:
+            requested_rx = float(rx_gain_db)
+            self.Usrp.set_rx_gain(requested_rx, self.Channel)
+            actual_rx = float(self.Usrp.get_rx_gain(self.Channel))
+            if not np.isclose(actual_rx, requested_rx, rtol=0.0, atol=0.26):
+                raise RuntimeError(
+                    f"UHD coerced RX gain to {actual_rx:.2f} dB; "
+                    f"requested {requested_rx:.2f} dB"
+                )
+            self.Config["EttusRxGainDb"] = actual_rx
+
+        if tx_gain_db is not None:
+            if not self.TimedTransmitEnabled or self.TxStreamer is None:
+                raise RuntimeError("Ettus TX gain is unavailable because TX is not configured")
+            requested_tx = float(tx_gain_db)
+            if not 0.0 <= requested_tx <= self.MaximumStage3E1TxGainDb:
+                raise ValueError(
+                    "Ettus TX gain must be between 0 and "
+                    f"{self.MaximumStage3E1TxGainDb:.1f} dB"
+                )
+            self.Usrp.set_tx_gain(requested_tx, self.TxChannel)
+            actual_tx = float(self.Usrp.get_tx_gain(self.TxChannel))
+            if not np.isclose(actual_tx, requested_tx, rtol=0.0, atol=0.26):
+                raise RuntimeError(
+                    f"UHD coerced TX gain to {actual_tx:.2f} dB; "
+                    f"requested {requested_tx:.2f} dB"
+                )
+            self.Config["EttusTxGainDb"] = actual_tx
+
+        return actual_rx, actual_tx
+
+    def _program_atr_states_for_rf_test_mode(self):
+        """Program external TX/RX ATR truth table for the selected RF mode."""
+        mode = self._validate_rf_test_mode(self.RfTestMode)
+        atr_rx = self.RxAtrMask if mode in ("RADAR_TX_RX", "RX_ONLY", "CONTINUOUS_RX") else 0
+        atr_tx = self.TxAtrMask if mode in ("RADAR_TX_RX", "TX_ONLY") else 0
+        atr_xx = self.OverlapAtrMask
+        if self.AtrAllowOverlapForSimulation and mode == "RADAR_TX_RX":
+            atr_xx |= self.TxAtrMask | self.RxAtrMask
+        self._set_atr_gpio_attr("ATR_0X", 0)
+        self._set_atr_gpio_attr("ATR_RX", atr_rx)
+        self._set_atr_gpio_attr("ATR_TX", atr_tx)
+        self._set_atr_gpio_attr("ATR_XX", atr_xx)
+        self._require_atr_gpio_attr("ATR_0X", 0)
+        self._require_atr_gpio_attr("ATR_RX", atr_rx)
+        self._require_atr_gpio_attr("ATR_TX", atr_tx)
+        self._require_atr_gpio_attr("ATR_XX", atr_xx)
+
+    def _start_continuous_rx(self):
+        if self._continuous_rx_active:
+            return
+        command = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
+        command.stream_now = True
+        self.RxStreamer.issue_stream_cmd(command)
+        self._continuous_rx_active = True
+
+    def _stop_continuous_rx(self):
+        if not self._continuous_rx_active or self.RxStreamer is None:
+            self._continuous_rx_active = False
+            return
+        try:
+            command = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
+            self.RxStreamer.issue_stream_cmd(command)
+        finally:
+            self._continuous_rx_active = False
+
+    def _execute_continuous_rx_dwell(self, ThisDwell):
+        sample_rate = float(ThisDwell.SampleRate)
+        num_samples = int(ThisDwell.NumSamples)
+        num_pulses = self._get_num_pulses(ThisDwell)
+        actual_sample_rate = self._configure_sample_rate(sample_rate)
+        self._start_continuous_rx()
+        iq = np.zeros((num_pulses, num_samples), dtype=np.complex64)
+        pulse_valid = np.ones(num_pulses, dtype=bool)
+        pulse_diagnostics = []
+        wall_start = time.time()
+        for pulse_index in range(num_pulses):
+            pulse_iq, diag = self._receive_scheduled_pri(num_samples)
+            copied = min(len(pulse_iq), num_samples)
+            if copied:
+                iq[pulse_index, :copied] = pulse_iq[:copied]
+            if copied != num_samples:
+                pulse_valid[pulse_index] = False
+            diag["ContinuousRx"] = True
+            pulse_diagnostics.append(diag)
+        wall_end = time.time()
+        pri_sec = float(self._get_pulse_pri_sec(ThisDwell, 0))
+        pulse_pri_sec = np.full(num_pulses, pri_sec, dtype=np.float64)
+        pulse_times_sec = np.arange(num_pulses, dtype=np.float64) * pri_sec
+        pulse_rx_start = np.zeros(num_pulses, dtype=np.float64)
+        pulse_waveforms = [self._get_pulse_waveform_id(ThisDwell, i) for i in range(num_pulses)]
+        diagnostics = {
+            "SourceType": "EttusRadarSource",
+            "OperatingMode": str(self.OperatingMode),
+            "RfTestMode": "CONTINUOUS_RX",
+            "TimedTransmitEnabled": False,
+            "ContinuousRx": True,
+            "TransmitCommandCount": 0,
+            "ReceiveCommandCount": 1,
+            "RequestedSampleRate": sample_rate,
+            "ActualSampleRate": actual_sample_rate,
+            "NumSamplesPerPulse": num_samples,
+            "NumPulses": num_pulses,
+            "RxFrequencyHz": float(self.Usrp.get_rx_freq(self.Channel)),
+            "RxGainDb": float(self.Usrp.get_rx_gain(self.Channel)),
+            "RxAntenna": str(self.Usrp.get_rx_antenna(self.Channel)),
+            "AtrGpioEnabled": bool(self.AtrGpioEnabled),
+            "PulseDiagnostics": pulse_diagnostics,
+            "CaptureElapsedSec": wall_end - wall_start,
+        }
+        return RawDwellData(
+            DwellId=int(ThisDwell.DwellId),
+            IQ=iq,
+            SampleRate=float(actual_sample_rate),
+            PRI=pri_sec,
+            TimeStamp=float(wall_end),
+            PulseTimesSec=pulse_times_sec,
+            PulsePriSec=pulse_pri_sec,
+            PulseRxStartDelaySec=pulse_rx_start,
+            PulseWaveformIds=pulse_waveforms,
+            PulseValid=pulse_valid,
+            Diagnostics=diagnostics,
+        )
+
     def Initialise(self):
         if uhd is None:
             raise RuntimeError(
@@ -502,6 +667,11 @@ class EttusRadarSource:
                 )
 
     def Shutdown(self):
+        if self._continuous_rx_active:
+            try:
+                self._stop_continuous_rx()
+            except Exception:
+                pass
         if (self.AtrGpioEnabled or self.AtrIsolationRequired) and self.Usrp is not None:
             try:
                 self._force_atr_safe_low()
@@ -533,11 +703,163 @@ class EttusRadarSource:
         """Set or clear the optional synthetic-target injection callback."""
         self.IqInjector = iq_injector
 
+    def _execute_tx_only_dwell(self, ThisDwell):
+        """Execute a finite hardware-timed TX-only pulse train.
+
+        No RX stream command is issued and no ADC samples are collected.
+        A zero-filled IQ placeholder is returned only to preserve the existing
+        RawDwellData/processor contract; diagnostics explicitly mark RX and ADC
+        monitoring unavailable for this commissioning mode.
+        """
+        if not self.TimedTransmitEnabled or self.TxStreamer is None:
+            raise RuntimeError("TX_ONLY requires the timed TX streamer")
+
+        sample_rate = float(ThisDwell.SampleRate)
+        num_samples = int(ThisDwell.NumSamples)
+        num_pulses = self._get_num_pulses(ThisDwell)
+        if sample_rate <= 0.0 or num_samples <= 0 or num_pulses <= 0:
+            raise ValueError("Invalid TX-only dwell dimensions")
+
+        actual_sample_rate = self._configure_sample_rate(sample_rate)
+        pulse_pri_sec = np.asarray(
+            [self._get_pulse_pri_sec(ThisDwell, i) for i in range(num_pulses)],
+            dtype=np.float64,
+        )
+        pulse_times_sec = np.zeros(num_pulses, dtype=np.float64)
+        if num_pulses > 1:
+            pulse_times_sec[1:] = np.cumsum(pulse_pri_sec[:-1])
+        pulse_waveform_ids = [
+            self._get_pulse_waveform_id(ThisDwell, i) for i in range(num_pulses)
+        ]
+
+        hardware_now_sec = self.Usrp.get_time_now().get_real_secs()
+        hardware_start_sec = hardware_now_sec + self.CommandLeadTimeSec
+        scheduled_pri_times_sec = hardware_start_sec + pulse_times_sec
+        queue_depth = min(self.CommandQueueDepth, num_pulses)
+        transmit_command_count = 0
+        transmit_acknowledgement_count = 0
+        transmit_event_errors = []
+        outstanding = 0
+        next_index = 0
+        wall_start = time.time()
+
+        inactive_target = {
+            "Active": False,
+            "Name": "",
+            "RangeM": 0.0,
+            "BearingDeg": float(getattr(ThisDwell, "AzimuthDeg", 0.0)),
+            "RadialVelocityMps": 0.0,
+            "AngleErrorDeg": 0.0,
+            "AmplitudeScale": 1.0,
+            "EquivalentAmplitude": 0.0,
+            "ConstituentReturnCount": 0,
+        }
+
+        def queue_one(index):
+            nonlocal transmit_command_count, outstanding
+            queued = self._queue_transmit_for_pri(
+                ThisDwell=ThisDwell,
+                pulse_index=index,
+                scheduled_pri_time_sec=float(scheduled_pri_times_sec[index]),
+                tx_time_offset_sec=0.0,
+                rf_target=inactive_target,
+            )
+            if queued:
+                transmit_command_count += 1
+                outstanding += 1
+
+        while next_index < queue_depth:
+            queue_one(next_index)
+            next_index += 1
+
+        # Replenish the bounded TX horizon from completed burst ACKs.  Hardware
+        # timestamps, not Python sleeps, continue to own PRI timing.
+        while next_index < num_pulses:
+            acknowledged, errors = self._wait_for_tx_events(
+                expected_acknowledgements=1,
+                timeout_sec=max(
+                    self.TxAsyncTimeoutSec,
+                    self.CommandLeadTimeSec + queue_depth * float(np.max(pulse_pri_sec)),
+                ),
+            )
+            transmit_acknowledgement_count += acknowledged
+            outstanding = max(0, outstanding - acknowledged)
+            transmit_event_errors.extend(errors)
+            if acknowledged <= 0:
+                transmit_event_errors.append("no TX burst acknowledgement while replenishing TX-only queue")
+                break
+            queue_one(next_index)
+            next_index += 1
+
+        if not transmit_event_errors:
+            remaining = transmit_command_count - transmit_acknowledgement_count
+            acknowledged, errors = self._wait_for_tx_events(
+                expected_acknowledgements=remaining,
+                timeout_sec=max(
+                    self.TxAsyncTimeoutSec,
+                    self.CommandLeadTimeSec + num_pulses * float(np.max(pulse_pri_sec)),
+                ),
+            )
+            transmit_acknowledgement_count += acknowledged
+            transmit_event_errors.extend(errors)
+
+        if transmit_acknowledgement_count != transmit_command_count:
+            transmit_event_errors.append(
+                f"burst acknowledgements {transmit_acknowledgement_count}/{transmit_command_count}"
+            )
+        if transmit_event_errors:
+            raise RuntimeError(
+                "Ettus TX-only dwell failed: " + "; ".join(transmit_event_errors)
+            )
+
+        wall_end = time.time()
+        diagnostics = {
+            "SourceType": "EttusRadarSource",
+            "OperatingMode": str(self.OperatingMode),
+            "RfTestMode": "TX_ONLY",
+            "TimedTransmitEnabled": True,
+            "ReceiveOnly": False,
+            "TxOnlyExternalRxInhibited": True,
+            "ReceiveCommandPerPri": False,
+            "ReceiveCommandCount": 0,
+            "AdcMonitoringAvailable": False,
+            "TransmitCommandCount": int(transmit_command_count),
+            "TransmitBurstAcknowledgementCount": int(transmit_acknowledgement_count),
+            "TransmitEventErrors": list(transmit_event_errors),
+            "RequestedSampleRate": sample_rate,
+            "ActualSampleRate": actual_sample_rate,
+            "NumSamplesPerPulse": num_samples,
+            "NumPulses": num_pulses,
+            "ScheduledPriHardwareTimesSec": scheduled_pri_times_sec.copy(),
+            "ScheduledRxHardwareTimesSec": np.full(num_pulses, np.nan),
+            "ScheduledTxHardwareTimesSec": scheduled_pri_times_sec.copy(),
+            "RxCapturePerformed": False,
+            "CaptureElapsedSec": wall_end - wall_start,
+        }
+        return RawDwellData(
+            DwellId=int(ThisDwell.DwellId),
+            IQ=np.zeros((num_pulses, num_samples), dtype=np.complex64),
+            SampleRate=float(actual_sample_rate),
+            PRI=float(pulse_pri_sec[0]),
+            TimeStamp=float(wall_end),
+            PulseTimesSec=pulse_times_sec,
+            PulsePriSec=pulse_pri_sec,
+            PulseRxStartDelaySec=np.zeros(num_pulses, dtype=np.float64),
+            PulseWaveformIds=pulse_waveform_ids,
+            PulseValid=np.zeros(num_pulses, dtype=bool),
+            Diagnostics=diagnostics,
+        )
+
     def ExecuteDwell(self, ThisDwell):
         if not self._initialised:
             raise RuntimeError(
                 "Call EttusRadarSource.Initialise() before ExecuteDwell()."
             )
+
+        if self.RfTestMode == "TX_ONLY":
+            return self._execute_tx_only_dwell(ThisDwell)
+        if self.RfTestMode == "CONTINUOUS_RX":
+            return self._execute_continuous_rx_dwell(ThisDwell)
 
         # RadarExecutor has already validated the waveform/timing solution.
         # Consume the dwell value here so the UHD rate cannot diverge from it.
@@ -836,7 +1158,9 @@ class EttusRadarSource:
         diagnostics = {
             "SourceType": "EttusRadarSource",
             "OperatingMode": str(self.OperatingMode),
-            "ReceiveOnly": not self.TimedTransmitEnabled,
+            "RfTestMode": str(self.RfTestMode),
+            "ReceiveOnly": (not self.TimedTransmitEnabled or self.RfTestMode in ("RX_ONLY", "CONTINUOUS_RX")),
+            "TxOnlyExternalRxInhibited": self.RfTestMode == "TX_ONLY",
             "ReceiveCommandPerPri": True,
             "SBandStylePerPriLoop": True,
             "AdaptiveIndividualPriPipeline": False,
@@ -986,6 +1310,8 @@ class EttusRadarSource:
         """Queue one finite waveform burst at the absolute PRI origin."""
 
         if not self.TimedTransmitEnabled:
+            return False
+        if self.RfTestMode in ("RX_ONLY", "CONTINUOUS_RX"):
             return False
         if self.OperatingMode != "TIMED_TX_RX":
             raise RuntimeError("Timed TX reached a non-transmit mode")
@@ -1253,20 +1579,9 @@ class EttusRadarSource:
             # drivers enabled.  This is the ordering proven by the CRO harness.
             self._force_atr_safe_low()
 
-            # Normal operation fails both operational outputs low during full
-            # duplex.  The explicit simulation-only target profile instead
-            # drives TX and RX high together; GPIO_3 remains the witness.
-            atr_xx_value = self.OverlapAtrMask
-            if self.AtrAllowOverlapForSimulation:
-                atr_xx_value |= self.TxAtrMask | self.RxAtrMask
-            self._set_atr_gpio_attr("ATR_0X", 0)
-            self._set_atr_gpio_attr("ATR_RX", self.RxAtrMask)
-            self._set_atr_gpio_attr("ATR_TX", self.TxAtrMask)
-            self._set_atr_gpio_attr("ATR_XX", atr_xx_value)
-            self._require_atr_gpio_attr("ATR_0X", 0)
-            self._require_atr_gpio_attr("ATR_RX", self.RxAtrMask)
-            self._require_atr_gpio_attr("ATR_TX", self.TxAtrMask)
-            self._require_atr_gpio_attr("ATR_XX", atr_xx_value)
+            # Program the external ATR truth table for the selected RF
+            # commissioning mode before handing ownership to the FPGA.
+            self._program_atr_states_for_rf_test_mode()
 
             # Hand ownership to the FPGA only after all state words and the
             # safe output direction have been established and read back.
@@ -1287,7 +1602,7 @@ class EttusRadarSource:
             f"J6 pin 4=RX (GPIO_{self.RxAtrGpioBit}), "
             f"J6 pin 5=ATR_XX witness (GPIO_{self.OverlapAtrGpioBit}), "
             "ATR_XX="
-            f"{'TX+RX+WITNESS' if self.AtrAllowOverlapForSimulation else 'WITNESS_ONLY'}"
+            f"mode={self.RfTestMode}"
         )
 
     def _require_gpio_bank(self):
